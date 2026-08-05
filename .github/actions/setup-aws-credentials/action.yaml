@@ -1,0 +1,23 @@
+name: Setup AWS Credentials
+
+inputs:
+  role-arn:
+    required: true
+    type: string
+  aws-region:
+    required: false
+    type: string
+    default: us-east-1
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: ${{ github.job }}

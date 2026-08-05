@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+.venv/
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+local/
+node_modules/
+# operator policy is per-deployment; keep it out of the shared template repo (the setup wizard writes it)
+config/config.yaml
+.env
+ui/dist/
+*.tsbuildinfo
+.DS_Store
+x.*
+y.*
+z.*
+zz*
+.claude/claude-to-codex
+.codegraph/
+CLAUDE.md

@@ -1,0 +1,10 @@
+[Unit]
+Description=watch for agent-harness cli auto-update restart requests
+
+[Path]
+# the sandboxed service (NoNewPrivileges=yes) can't restart itself; it touches this flag and we act on it
+PathExists=/run/agent-harness/restart-requested
+Unit=agent-harness-restart.service
+
+[Install]
+WantedBy=multi-user.target

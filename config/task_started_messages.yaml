@@ -1,0 +1,14 @@
+agent:
+  - "On it. Starting now."
+  - "Task started. I'll report back here as I make progress."
+  - "Picked this up — updates will land in this thread."
+  - "Working on it. I'll post progress as I go."
+  - "Started. Give me a bit and I'll have something to show."
+  - "On it now. Watch this thread for updates."
+reviewer:
+  - "{reviewer_name} is starting a PR review."
+  - "{reviewer_name} picked up a review — comments incoming."
+  - "Heads up: {reviewer_name} is reviewing a PR now."
+  - "Review underway. {reviewer_name} is reading the diff."
+  - "{reviewer_name} took this review task. Verdict soon."
+  - "PR review started — {reviewer_name} is on it."

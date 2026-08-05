@@ -1,0 +1,168 @@
+"""issues triggers: run the discovery/implementation skills on demand as the system identity.
+
+used by the dashboard's "Run discovery"/"Implement approved" buttons. recurring runs go through the
+general task scheduler (agent_harness/scheduler.py), which seeds the daily discovery/implementation jobs.
+"""
+
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
+
+from agent_harness.config import Config
+from agent_harness.models import BLOCKED, FAILED, Task, utcnow
+from agent_harness.orchestrator import accept_task
+from agent_harness.store import Store, TransitionRaced
+
+# system-owned tasks reuse the "github" identity, which the default config maps to the read/standard system role
+SYSTEM_TEAM = "github"
+SYSTEM_USER = "github"
+
+GITHUB_API = "https://api.github.com"
+PR_URL_RE = re.compile(r"^https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)/?$")
+
+# a batch this size keeps a run's PRs reviewable (also enforced by the coordinator only seeing its reserved rows)
+IMPLEMENTATION_BATCH_SIZE = 5
+STALLED_COORDINATOR_MAX_AGE_HOURS = 24
+
+
+async def start_issue_task(store: Store, config: Config, notifier, skill: str, args: str = "", *, source: str):
+    """enqueue one issues skill task as the system identity. returns (task, status) from accept_task."""
+    channel = str(((config.raw.get("issues") or {}).get("notify_channel")) or "")
+    key = f"issues:{skill}:{source}@{utcnow()}"
+    text = f"/{skill}"
+    if args.strip():
+        text += f" {args.strip()}"
+    return await accept_task(
+        store,
+        config,
+        notifier,
+        team_id=SYSTEM_TEAM,
+        channel_id=channel,
+        thread_ts=key,
+        message_ts=key,
+        user_id=SYSTEM_USER,
+        text=text,
+    )
+
+
+async def start_refine_task(store: Store, config: Config, notifier, issue_id: int, *, source: str) -> tuple[Task | None, str, str | None]:
+    """start one refine task per issue, returning the active task id when one already exists."""
+    existing = store.active_refine_task(issue_id)
+    if existing is not None:
+        return None, "already_running", existing
+    task, status = await start_issue_task(store, config, notifier, "refineissue", str(issue_id), source=source)
+    return task, status, None
+
+
+async def start_implementation_run(store: Store, config: Config, notifier, *, source: str) -> tuple[Task | None, str, str | None]:
+    """reserve up to IMPLEMENTATION_BATCH_SIZE approved issues and start the /implementapprovedissues coordinator
+    for exactly that batch. returns (task, status, active_task_id): status is "already_running" (active_task_id set
+    to the running coordinator), "no_approved_issues", or whatever accept_task reports ("created" or a refusal
+    like "paused"/"queue_full"/"duplicate").
+
+    the active-run check and the reservation are plain synchronous store calls with no `await` between them, so two
+    simultaneous calls can never both reserve the same issues or both go on to create a coordinator: the loser
+    sees zero approved rows left (or the winner's now-active run) and reports back without creating anything.
+    """
+    existing = store.active_implementation_run()
+    if existing is not None:
+        return None, "already_running", existing
+
+    marker = f"pending:{uuid.uuid4().hex[:12]}"
+    reserved = store.reserve_issues(marker, IMPLEMENTATION_BATCH_SIZE)
+    if not reserved:
+        return None, "no_approved_issues", None
+
+    channel = str(((config.raw.get("issues") or {}).get("notify_channel")) or "")
+    key = f"issues:implementapprovedissues:{source}@{utcnow()}"
+    task, status = await accept_task(
+        store,
+        config,
+        notifier,
+        team_id=SYSTEM_TEAM,
+        channel_id=channel,
+        thread_ts=key,
+        message_ts=key,
+        user_id=SYSTEM_USER,
+        text="/implementapprovedissues",
+    )
+    if status != "created" or task is None:
+        # intake itself refused (paused/queue_full/duplicate) — don't strand the reservation
+        store.release_reserved_issues(marker)
+        return task, status, None
+
+    store.assign_reservation(marker, task.task_id)
+    return task, "created", None
+
+
+def fail_stalled_implementation_run(store: Store) -> str | None:
+    """fail a coordinator left blocked for over a day and release its reserved issues."""
+    task_id = store.active_implementation_run()
+    if task_id is None:
+        return None
+    task = store.get_task(task_id)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=STALLED_COORDINATOR_MAX_AGE_HOURS)
+    if task is None or task.state != BLOCKED or datetime.fromisoformat(task.updated_at) >= cutoff:
+        return None
+    try:
+        store.transition(
+            task_id,
+            BLOCKED,
+            FAILED,
+            "recovery: implementation coordinator stalled",
+            error="implementation coordinator stalled in blocked for over 24h",
+            finished_at=utcnow(),
+        )
+    except TransitionRaced:
+        return None
+    store.release_reserved_issues(task_id)
+    store.add_event(task_id, "recovery", {"action": "failed_stalled_coordinator"})
+    return task_id
+
+
+async def _get_pr(repo: str, number: int, token: str) -> dict:
+    """the github http seam for sync_in_review — patched in unit tests."""
+    import aiohttp
+
+    from agent_harness.adapters.github_api import GitHubStatusError
+    from agent_harness.redact import redactor
+
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{GITHUB_API}/repos/{repo}/pulls/{number}", headers=headers) as response:
+            if response.status >= 300:
+                body = redactor.redact(await response.text())[:300]
+                raise GitHubStatusError(response.status, f"github api GET pulls/{number} failed: {response.status} — {body}")
+            return await response.json()
+
+
+async def sync_in_review(store: Store, broker) -> int:
+    """resolve issues whose PR has since merged (-> done) or closed unmerged (-> failed); still-open PRs
+    are left alone. called hourly from housekeeping_loop. one row's error is recorded and skipped, not raised,
+    so it never blocks the rest of the sweep."""
+    updated = 0
+    tokens: dict[str, str] = {}
+    for row in store.list_issues(status="in_review"):
+        pr_url = row.get("pr_url")
+        if not pr_url:
+            continue
+        match = PR_URL_RE.match(pr_url)
+        if not match:
+            store.add_error("issue_runs", "BadPrUrl", f"issue #{row['id']} has an unparseable pr_url: {pr_url}", context={"issue_id": row["id"]})
+            continue
+        repo, number = match.group(1), int(match.group(2))
+        try:
+            if repo not in tokens:
+                token, _ = await broker.read_token([repo], permissions={"pull_requests": "read", "metadata": "read"})
+                tokens[repo] = token
+            pr = await _get_pr(repo, number, tokens[repo])
+        except Exception as e:
+            store.add_error("issue_runs", type(e).__name__, str(e), context={"issue_id": row["id"], "repository": repo})
+            continue
+        if pr.get("merged"):
+            store.finish_issue(row["id"], "done", pr_url)
+            updated += 1
+        elif pr.get("state") == "closed":
+            store.finish_issue(row["id"], "failed", pr_url)
+            updated += 1
+    return updated

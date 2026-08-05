@@ -1,0 +1,39 @@
+name: pull request checks
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install
+        run: pip install -e '.[dev]'
+      - name: lint
+        run: flake8 agent_harness tests
+      - name: format
+        run: |
+          black --check agent_harness tests spike deploy
+          isort --check agent_harness tests spike deploy
+      - name: type
+        run: mypy agent_harness
+      - name: test
+        run: pytest --disable-pytest-warnings -vv -p no:cacheprovider --show-capture=no
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: build dashboard ui
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build

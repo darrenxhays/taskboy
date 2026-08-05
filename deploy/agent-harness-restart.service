@@ -1,0 +1,8 @@
+[Unit]
+Description=restart agent-harness after an off-peak cli auto-update
+
+[Service]
+Type=oneshot
+# clear the flag first so the .path unit re-arms for the next update, then restart the service
+ExecStartPre=/usr/bin/rm -f /run/agent-harness/restart-requested
+ExecStart=/usr/bin/systemctl restart agent-harness.service
