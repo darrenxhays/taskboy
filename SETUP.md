@@ -2,7 +2,7 @@
 
 This runbook takes a new installation from empty accounts to a running, branded agent: a Slack-driven main agent, an optional second GitHub reviewer persona, and the SSO-protected Mission Control dashboard. The names, personalities, and integrations are all yours to choose — nothing identity-shaped is hardcoded.
 
-The fast path is the interactive wizard (`agent-harness setup`, section 2). It prints the manual admin-console instructions inline and validates every credential live; the appendices in section 4 hold the full step-by-step runbooks for the parts that happen in each vendor's admin UI. Replace every `<placeholder>` locally; never put a real token, private key, or password in this repository.
+The fast path is the interactive wizard (`agent-harness setup`, section 2). It prints the manual admin-console instructions inline and validates every credential live; the appendices in section 4 hold the full step-by-step runbooks for the parts that happen in each vendor's admin UI. Prefer to edit the config files yourself instead of answering prompts? Follow [MANUAL_SETUP.md](MANUAL_SETUP.md) — it produces the same `config/config.yaml` and `.env` by hand and reuses the same appendices. Replace every `<placeholder>` locally; never put a real token, private key, or password in this repository.
 
 ## 1. Prerequisites
 
