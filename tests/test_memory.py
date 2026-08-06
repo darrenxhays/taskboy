@@ -1,5 +1,5 @@
-from agent_harness import memory
-from agent_harness.models import COMPLETED, QUEUED, RECEIVED, RUNNING
+from taskboy import memory
+from taskboy.models import COMPLETED, QUEUED, RECEIVED, RUNNING
 
 
 def _finish(store, task, summary="all done"):

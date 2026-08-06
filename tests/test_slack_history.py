@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent_harness.adapters.slack_history import HISTORY_MAX_LIMIT, SlackHistoryAdapter, build_slack_server
+from taskboy.adapters.slack_history import HISTORY_MAX_LIMIT, SlackHistoryAdapter, build_slack_server
 
 
 @pytest.mark.asyncio

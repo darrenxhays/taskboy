@@ -1,7 +1,0 @@
-config:
-  aws:region: "us-east-1"
-  agent-harness:environment: "staging"
-  agent-harness:host_account_id: "YOUR_ACCOUNT_ID"
-  # optional keys (see README.md): resource_prefix, host_environment, dashboard_domain,
-  # route53_zone, vpc_source, vpc_stack_ref, vpc_id, private_subnet_ids, public_subnet_ids,
-  # github_repo, assume_external_id, secret_name

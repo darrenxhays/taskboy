@@ -3,11 +3,11 @@ import sqlite3
 
 import pytest
 
-from agent_harness.classifier import stub_classify
-from agent_harness.config import Config, Role, SlackConfig
-from agent_harness.models import BLOCKED, CANCELLED, COMPLETED, FAILED, QUEUED, RECEIVED, REFUSED, RUNNING, Outcome
-from agent_harness.orchestrator import Orchestrator, accept_task
-from agent_harness.router import RoleRefusal
+from taskboy.classifier import stub_classify
+from taskboy.config import Config, Role, SlackConfig
+from taskboy.models import BLOCKED, CANCELLED, COMPLETED, FAILED, QUEUED, RECEIVED, REFUSED, RUNNING, Outcome
+from taskboy.orchestrator import Orchestrator, accept_task
+from taskboy.router import RoleRefusal
 
 
 async def _accept(store, config, notifier, text, n):
@@ -292,7 +292,7 @@ async def test_cancel_of_running_task_stops_it_without_requeue(store, config, no
 
 @pytest.mark.asyncio
 async def test_reconcile_releases_stale_issue_reservations(store, config, notifier):
-    row = store.record_issue("x", "example-org/agent-harness", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     store.reserve_issues("pending:abc123", 5)  # a dashboard click that died before its coordinator was created
     orchestrator = Orchestrator(store, config, classify=stub_classify, run=None, notifier=notifier)
@@ -302,7 +302,7 @@ async def test_reconcile_releases_stale_issue_reservations(store, config, notifi
 
 @pytest.mark.asyncio
 async def test_failed_coordinator_releases_its_reserved_issues(store, config, notifier, make_task, wait_until):
-    row = store.record_issue("x", "example-org/agent-harness", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     coordinator = make_task(text="/implementapprovedissues")
     store.reserve_issues(coordinator.task_id, 5)
@@ -320,7 +320,7 @@ async def test_failed_coordinator_releases_its_reserved_issues(store, config, no
 
 @pytest.mark.asyncio
 async def test_crashed_coordinator_releases_its_reserved_issues(store, config, notifier, make_task, wait_until):
-    row = store.record_issue("x", "example-org/agent-harness", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     coordinator = make_task(text="/implementapprovedissues")
     store.reserve_issues(coordinator.task_id, 5)
@@ -338,7 +338,7 @@ async def test_crashed_coordinator_releases_its_reserved_issues(store, config, n
 
 @pytest.mark.asyncio
 async def test_cancelled_coordinator_releases_its_reserved_issues(store, config, notifier, make_task, wait_until):
-    row = store.record_issue("x", "example-org/agent-harness", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     coordinator = make_task(text="/implementapprovedissues")
     store.reserve_issues(coordinator.task_id, 5)
@@ -362,7 +362,7 @@ async def test_cancelled_coordinator_releases_its_reserved_issues(store, config,
 async def test_completed_coordinator_releases_any_leftover_reservation(store, config, notifier, make_task, wait_until):
     # a coordinator that finishes without enqueuing everything it reserved (e.g. it decided some no longer applied)
     # must not leave those rows stuck in implementation_queued forever
-    row = store.record_issue("x", "example-org/agent-harness", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     coordinator = make_task(text="/implementapprovedissues")
     store.reserve_issues(coordinator.task_id, 5)

@@ -3,8 +3,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent_harness.adapters.aws_read import AwsReadAdapter
-from agent_harness.adapters.sentry import SentryAdapter
+from taskboy.adapters.aws_read import AwsReadAdapter
+from taskboy.adapters.sentry import SentryAdapter
 
 
 @pytest.fixture

@@ -6,9 +6,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agent_harness.config import Role
-from agent_harness.models import BLOCKED, COMPLETED, FAILED, QUEUED, RECEIVED, RUNNING, Outcome
-from agent_harness.runner import ClaudeRunner, ModelUnavailable, extract_final_report, extract_reply, looks_model_unavailable, looks_session_limit, record_rate_limit_event, retry_not_before, session_option_kwargs
+from taskboy.config import Role
+from taskboy.models import BLOCKED, COMPLETED, FAILED, QUEUED, RECEIVED, RUNNING, Outcome
+from taskboy.runner import ClaudeRunner, ModelUnavailable, extract_final_report, extract_reply, looks_model_unavailable, looks_session_limit, record_rate_limit_event, retry_not_before, session_option_kwargs
 
 RAW = {
     "models": {
@@ -108,7 +108,7 @@ def test_extract_reply_finds_only_reply_body():
 
 
 def test_git_identity_env():
-    from agent_harness.runner import git_identity_env
+    from taskboy.runner import git_identity_env
 
     env = git_identity_env({"commit_name": "Red", "commit_email": "red@example.com"})
     assert env["GIT_AUTHOR_NAME"] == "Red"
@@ -294,8 +294,8 @@ async def test_blue_only_broker_clones_target_repositories(store, config, make_t
     reviewer_broker.register_task.return_value = {}
     refresh = AsyncMock(return_value=True)
     clone = AsyncMock(return_value=True)
-    monkeypatch.setattr("agent_harness.runner.repocache.refresh_one", refresh)
-    monkeypatch.setattr("agent_harness.runner.repocache.clone_from_mirror", clone)
+    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", refresh)
+    monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", clone)
     runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=None, reviewer_broker=reviewer_broker)
     runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
     task = routed_task(store, make_task)
@@ -355,14 +355,14 @@ async def test_blue_session_uses_reviewer_github_adapter_and_git_identity(store,
     monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
     monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
     monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
-    monkeypatch.setattr("agent_harness.runner.build_progress_server", lambda *args: object())
-    monkeypatch.setattr("agent_harness.adapters.github_api.GitHubAdapter", github_adapter)
-    monkeypatch.setattr("agent_harness.adapters.github_api.build_github_server", lambda adapter: adapter)
-    monkeypatch.setattr("agent_harness.adapters.slack_history.SlackHistoryAdapter", slack_adapter)
-    monkeypatch.setattr("agent_harness.adapters.slack_history.build_slack_server", lambda adapter: adapter)
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
+    monkeypatch.setattr("taskboy.adapters.github_api.GitHubAdapter", github_adapter)
+    monkeypatch.setattr("taskboy.adapters.github_api.build_github_server", lambda adapter: adapter)
+    monkeypatch.setattr("taskboy.adapters.slack_history.SlackHistoryAdapter", slack_adapter)
+    monkeypatch.setattr("taskboy.adapters.slack_history.build_slack_server", lambda adapter: adapter)
     runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=red_broker, reviewer_broker=reviewer_broker, slack_client=object())
 
-    outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {"AGENT_HARNESS_BROKER_SOCKET": "blue.sock"}, [], reviewer_broker)
+    outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {"TASKBOY_BROKER_SOCKET": "blue.sock"}, [], reviewer_broker)
 
     assert outcome.state == COMPLETED
     assert captured["github_broker"] is reviewer_broker
@@ -423,7 +423,7 @@ async def test_skill_task_renders_instructions_into_prompt(store, config, make_t
     skill_path = skills_root / "review"
     skill_path.mkdir(parents=True)
     (skill_path / "SKILL.md").write_text("---\nname: review\ndescription: review\n---\n\nfollow the simplicity lens\n")
-    monkeypatch.setattr("agent_harness.settings.SKILLS_ROOT", str(skills_root))
+    monkeypatch.setattr("taskboy.settings.SKILLS_ROOT", str(skills_root))
     runner = make_runner(store, config, tmp_path)
     runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
     task = routed_task(store, make_task)
@@ -439,7 +439,7 @@ async def test_skill_task_renders_instructions_into_prompt(store, config, make_t
 
 @pytest.mark.asyncio
 async def test_missing_skill_returns_failed_outcome(store, config, make_task, tmp_path, monkeypatch):
-    monkeypatch.setattr("agent_harness.settings.SKILLS_ROOT", str(tmp_path / "missing"))
+    monkeypatch.setattr("taskboy.settings.SKILLS_ROOT", str(tmp_path / "missing"))
     runner = make_runner(store, config, tmp_path)
     runner._run_session = AsyncMock()
     task = routed_task(store, make_task)
@@ -455,7 +455,7 @@ async def test_invalid_skill_returns_specific_error(store, config, make_task, tm
     skill_path = tmp_path / "skills" / "review"
     skill_path.mkdir(parents=True)
     (skill_path / "SKILL.md").write_text("invalid")
-    monkeypatch.setattr("agent_harness.settings.SKILLS_ROOT", str(tmp_path / "skills"))
+    monkeypatch.setattr("taskboy.settings.SKILLS_ROOT", str(tmp_path / "skills"))
     runner = make_runner(store, config, tmp_path)
     runner._run_session = AsyncMock()
     task = routed_task(store, make_task)
@@ -498,11 +498,11 @@ async def test_permission_requester_rejects_unknown_and_already_held(store, conf
 async def test_permission_requester_records_same_org_repo_outside_role_scope(store, config, make_task, tmp_path):
     # issue #39: a repo outside this task's role-scoped list is recorded for operator review, not
     # auto-rejected, as long as it shares an org with an already-approved repo (the evidence case: a
-    # request for example-org/portal died blocked because example-org/agent-harness was the only scoped repo)
+    # request for example-org/portal died blocked because example-org/taskboy was the only scoped repo)
     runner = make_runner(store, config, tmp_path)
     task = routed_task(store, make_task)
     progress = AsyncMock()
-    request = runner._permission_requester(task, {}, ["Read"], ["Read", "Write"], ["example-org/agent-harness"], ["example-org/agent-harness"], None, progress)
+    request = runner._permission_requester(task, {}, ["Read"], ["Read", "Write"], ["example-org/taskboy"], ["example-org/taskboy"], None, progress)
     message = await request("repo", "example-org/portal", "need to review a PR")
     assert "recorded" in message
     requests = store.permission_requests_for(task.task_id)
@@ -514,7 +514,7 @@ async def test_permission_requester_rejects_same_org_repo_not_installed(store, c
     # when the installation's repo list is known, a same-org repo the app isn't installed on is still rejected
     runner = make_runner(store, config, tmp_path)
     task = routed_task(store, make_task)
-    request = runner._permission_requester(task, {}, ["Read"], ["Read", "Write"], ["example-org/agent-harness"], ["example-org/agent-harness"], {"agent-harness"}, AsyncMock())
+    request = runner._permission_requester(task, {}, ["Read"], ["Read", "Write"], ["example-org/taskboy"], ["example-org/taskboy"], {"taskboy"}, AsyncMock())
     assert "not an approved repository" in await request("repo", "example-org/portal", "why")
     assert store.permission_requests_for(task.task_id) == []
 
@@ -568,7 +568,7 @@ async def test_run_clones_granted_repo(store, config, make_task, tmp_path):
     async def fake_clone(_root, _repo, _dest):
         return True
 
-    import agent_harness.repocache as repocache
+    import taskboy.repocache as repocache
 
     runner_repocache = repocache
     task = routed_task(store, make_task)
@@ -587,7 +587,7 @@ async def test_run_clones_granted_repo(store, config, make_task, tmp_path):
 async def test_run_clones_granted_repo_outside_approved_list_same_org(store, config, make_task, tmp_path):
     # issue #39: a granted repo doesn't need to already be in github.approved_repos — sharing an org
     # with an approved repo (and, when known, being installed) is enough for the grant to take effect
-    config.raw = {**RAW, "github": {"approved_repos": ["example-org/agent-harness"], "protected_branch_patterns": ["main"]}}
+    config.raw = {**RAW, "github": {"approved_repos": ["example-org/taskboy"], "protected_branch_patterns": ["main"]}}
     broker = MagicMock()
     broker.register_task.return_value = {}
     broker.accessible_repos = None  # installation membership unknown — org match alone is enough
@@ -602,10 +602,10 @@ async def test_run_clones_granted_repo_outside_approved_list_same_org(store, con
     async def fake_clone(_root, _repo, _dest):
         return True
 
-    import agent_harness.repocache as repocache
+    import taskboy.repocache as repocache
 
     task = routed_task(store, make_task)
-    store.set_fields(task.task_id, classification_json='{"target_repos": ["example-org/agent-harness"]}')
+    store.set_fields(task.task_id, classification_json='{"target_repos": ["example-org/taskboy"]}')
     store.request_permission(task.task_id, "repo", "example-org/portal", "need to check it")
     store.decide_permission_request(task.task_id, "repo", "example-org/portal", "granted", "boss")
     import unittest.mock as mock
@@ -617,7 +617,7 @@ async def test_run_clones_granted_repo_outside_approved_list_same_org(store, con
 
 
 def test_build_progress_server_exposes_request_permission():
-    from agent_harness.runner import build_progress_server
+    from taskboy.runner import build_progress_server
 
     server = build_progress_server(AsyncMock(), {}, AsyncMock(return_value="ok"))
     assert server is not None
@@ -720,7 +720,7 @@ async def test_run_session_marks_session_limit_error_retryable(store, config, ma
     monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
     monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
     monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
-    monkeypatch.setattr("agent_harness.runner.build_progress_server", lambda *args: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
 
     outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
 
@@ -761,7 +761,7 @@ async def test_run_session_limit_shaped_text_without_rejected_event_is_not_retry
     monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
     monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
     monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
-    monkeypatch.setattr("agent_harness.runner.build_progress_server", lambda *args: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
 
     outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
 
@@ -806,7 +806,7 @@ async def test_run_session_non_rejected_rate_limit_event_is_not_retryable(store,
     monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
     monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
     monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
-    monkeypatch.setattr("agent_harness.runner.build_progress_server", lambda *args: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
 
     outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
 
@@ -845,7 +845,7 @@ async def test_run_session_non_limit_error_is_not_retryable(store, config, make_
     monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
     monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
     monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
-    monkeypatch.setattr("agent_harness.runner.build_progress_server", lambda *args: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
 
     outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
 
@@ -899,7 +899,7 @@ async def test_run_replays_answered_questions_into_prompt(store, config, make_ta
 
 
 def test_build_progress_server_exposes_ask_questions():
-    from agent_harness.runner import build_progress_server
+    from taskboy.runner import build_progress_server
 
     server = build_progress_server(AsyncMock(), {}, AsyncMock(return_value="ok"), AsyncMock(return_value="ok"))
     assert server is not None

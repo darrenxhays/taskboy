@@ -3,8 +3,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent_harness import repocache
-from agent_harness.redact import Redactor
+from taskboy import repocache
+from taskboy.redact import Redactor
 
 
 @pytest.mark.asyncio

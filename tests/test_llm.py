@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_harness.llm import extract_usage, structured_call
+from taskboy.llm import extract_usage, structured_call
 
 
 @pytest.mark.asyncio

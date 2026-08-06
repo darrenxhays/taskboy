@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent_harness.debug_feed import DebugFeed
+from taskboy.debug_feed import DebugFeed
 
 
 @pytest.mark.asyncio

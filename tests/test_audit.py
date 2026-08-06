@@ -2,8 +2,8 @@ from unittest.mock import patch
 
 import pytest
 
-from agent_harness import audit
-from agent_harness.models import QUEUED, RECEIVED
+from taskboy import audit
+from taskboy.models import QUEUED, RECEIVED
 
 
 def _events(store, make_task, n=3):

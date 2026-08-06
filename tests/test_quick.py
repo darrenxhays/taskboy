@@ -3,10 +3,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent_harness.config import Role
-from agent_harness.models import COMPLETED, QUEUED, RECEIVED, RUNNING
-from agent_harness.quick import QuickAnswer
-from agent_harness.slack import handle_mention
+from taskboy.config import Role
+from taskboy.models import COMPLETED, QUEUED, RECEIVED, RUNNING
+from taskboy.quick import QuickAnswer
+from taskboy.slack import handle_mention
 
 BOT = "UBOT"
 
@@ -90,7 +90,7 @@ async def test_context_contains_parent_and_referenced_task_blocks(store, config,
     store.transition(parent.task_id, QUEUED, RUNNING, "dispatched")
     parent = store.transition(parent.task_id, RUNNING, COMPLETED, "done", result_summary="parent result")
     referenced = make_task("referenced")
-    monkeypatch.setattr("agent_harness.quick.memory.read_summary", lambda root, task_id: f"summary for {task_id}")
+    monkeypatch.setattr("taskboy.quick.memory.read_summary", lambda root, task_id: f"summary for {task_id}")
     quick = make_quick(store, config)
     quick._call_model = AsyncMock(return_value=({"action": "classify", "answer": ""}, None))
     await quick.try_answer(channel_id="C1", thread_ts="1", user_id="U1", text=f"compare {referenced.task_id}", parent=parent, team_id="T1", message_ts="new")

@@ -1,0 +1,48 @@
+# slack app manifest for the agent harness.
+# create the app at https://api.slack.com/apps -> Create New App -> From an app manifest,
+# pick your workspace, and paste this file. change display_information to your agent's name.
+#
+# keep the scopes in lockstep with what the service actually uses (taskboy/slack.py):
+# intake needs app_mentions:read + the history scopes; replies need chat:write; the 👀 ack
+# needs reactions:write; long replies upload snippets via files:write; DM chat needs im:*;
+# requester display names need users:read + users:read.email.
+#
+# after creating the app:
+#   1. Socket Mode -> Enable, generate an app-level token with connections:write (xapp-...)
+#   2. Install App -> Install to Workspace, copy the bot token (xoxb-...)
+#   3. invite the bot to every channel you plan to allow
+# note: socket mode apps need no public request URL.
+
+display_information:
+  name: My Agent # <- your agent's display name
+  description: Autonomous engineering agent
+  background_color: "#0a0f16"
+features:
+  bot_user:
+    display_name: my-agent # <- shown in slack; usually a lowercase form of the name
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - chat:write
+      - channels:history
+      - groups:history # needed when any allowed channel is private
+      - reactions:write
+      - files:write
+      - im:history
+      - im:write
+      - users:read
+      - users:read.email
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im # direct-message chat
+      - message.channels # plain thread replies that answer a blocked task's follow-up questions
+      # - message.groups  # uncomment when any allowed channel is private
+  socket_mode_enabled: true
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  token_rotation_enabled: false

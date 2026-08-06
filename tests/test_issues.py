@@ -3,24 +3,24 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agent_harness.adapters.issues import EnqueueAdapter, IssuesAdapter
-from agent_harness.issue_runs import fail_stalled_implementation_run
-from agent_harness.models import BLOCKED, FAILED, RECEIVED, REFUSED
+from taskboy.adapters.issues import EnqueueAdapter, IssuesAdapter
+from taskboy.issue_runs import fail_stalled_implementation_run
+from taskboy.models import BLOCKED, FAILED, RECEIVED, REFUSED
 
 
 def rec(store, key="a", summary="s", type_="organization", details="d", priority=50):
-    return store.record_issue(key, "example-org/agent-harness", summary, type_, details, priority)
+    return store.record_issue(key, "example-org/taskboy", summary, type_, details, priority)
 
 
 def test_record_is_idempotent_while_proposed_and_frozen_after_decision(store):
     first = rec(store, key="trim-prompt", summary="trim it", priority=40)
-    again = store.record_issue("trim-prompt", "example-org/agent-harness", "trim it better", "token_efficiency", "more detail", 70)
+    again = store.record_issue("trim-prompt", "example-org/taskboy", "trim it better", "token_efficiency", "more detail", 70)
     assert again["id"] == first["id"]
     assert again["summary"] == "trim it better" and again["priority"] == 70 and again["issue_type"] == "token_efficiency"
 
     store.decide_issue(first["id"], "approved", "boss@example.com")
     # re-recording an approved proposal must not clobber the operator's decision or its content
-    after = store.record_issue("trim-prompt", "example-org/agent-harness", "sneaky rewrite", "organization", "x", 1)
+    after = store.record_issue("trim-prompt", "example-org/taskboy", "sneaky rewrite", "organization", "x", 1)
     assert after["status"] == "approved" and after["summary"] == "trim it better" and after["priority"] == 70
 
 
@@ -72,17 +72,17 @@ def test_start_and_finish_transitions(store, make_task):
     started = store.start_issue(row["id"], task.task_id, "the spec")
     assert started["status"] == "in_progress" and started["task_id"] == task.task_id and started["spec"] == "the spec"
     # finishing only works from in_progress
-    done = store.finish_issue(row["id"], "done", "https://github.com/example-org/agent-harness/pull/9")
+    done = store.finish_issue(row["id"], "done", "https://github.com/example-org/taskboy/pull/9")
     assert done["status"] == "done" and done["pr_url"].endswith("/pull/9")
     assert store.finish_issue(row["id"], "done", None) is None
 
 
 @pytest.mark.asyncio
 async def test_record_issue_tool_requires_all_fields(store, make_task):
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness"])
-    bad = await adapter.record_issue({"repo": "example-org/agent-harness", "summary": "s", "issue_type": "", "details": "d", "dedupe_key": "k"})
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
+    bad = await adapter.record_issue({"repo": "example-org/taskboy", "summary": "s", "issue_type": "", "details": "d", "dedupe_key": "k"})
     assert bad.get("isError")
-    ok = await adapter.record_issue({"repo": "example-org/agent-harness", "summary": "s", "issue_type": "organization", "details": "d", "dedupe_key": "k", "priority": 60})
+    ok = await adapter.record_issue({"repo": "example-org/taskboy", "summary": "s", "issue_type": "organization", "details": "d", "dedupe_key": "k", "priority": 60})
     assert not ok.get("isError")
     assert store.list_issues()[0]["dedupe_key"] == "k"
 
@@ -95,7 +95,7 @@ async def test_list_existing_issues_includes_every_status_without_details(store,
     denied = rec(store, key="denied-one", summary="denied one")
     store.decide_issue(denied["id"], "denied", "boss")
 
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness"])
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
     result = await adapter.list_existing_issues({})
     payload = json.loads(result["content"][0]["text"])
 
@@ -110,7 +110,7 @@ async def test_list_existing_issues_includes_every_status_without_details(store,
 async def test_list_existing_issues_pages_with_offset_status_and_keys_only(store, make_task):
     for i in range(3):
         rec(store, key=f"k{i}", summary=f"issue {i}", priority=10 + i)
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness"])
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
 
     page1 = json.loads((await adapter.list_existing_issues({"limit": 2})).get("content")[0]["text"])
     page2 = json.loads((await adapter.list_existing_issues({"limit": 2, "offset": 2})).get("content")[0]["text"])
@@ -132,27 +132,27 @@ async def test_list_existing_issues_filters_repo_at_db_level_so_paging_does_not_
     # a higher-priority row in another repo must not push a lower-priority target-repo row off page 1 —
     # repo has to be a DB-level filter (like status/task_type), not applied after limit/offset (issue #57 follow-up)
     store.record_issue("b-high", "other/repo", "high priority other repo issue", "bug", "d", 90)
-    store.record_issue("a-low", "example-org/agent-harness", "low priority target repo issue", "bug", "d", 10)
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness", "other/repo"])
+    store.record_issue("a-low", "example-org/taskboy", "low priority target repo issue", "bug", "d", 10)
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy", "other/repo"])
 
-    page = json.loads((await adapter.list_existing_issues({"repo": "example-org/agent-harness", "limit": 1})).get("content")[0]["text"])
+    page = json.loads((await adapter.list_existing_issues({"repo": "example-org/taskboy", "limit": 1})).get("content")[0]["text"])
     assert [row["dedupe_key"] for row in page] == ["a-low"]
 
 
 @pytest.mark.asyncio
 async def test_record_issue_rejects_duplicate_summary_under_different_key(store, make_task):
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness"])
-    first = await adapter.record_issue({"repo": "example-org/agent-harness", "summary": "Trim the classifier prompt", "issue_type": "token_efficiency", "details": "d", "dedupe_key": "trim-prompt"})
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
+    first = await adapter.record_issue({"repo": "example-org/taskboy", "summary": "Trim the classifier prompt", "issue_type": "token_efficiency", "details": "d", "dedupe_key": "trim-prompt"})
     assert not first.get("isError")
 
     # same summary (case/whitespace-insensitive), different dedupe_key -> rejected, nothing inserted
-    dup = await adapter.record_issue({"repo": "example-org/agent-harness", "summary": "  trim the classifier prompt  ", "issue_type": "token_efficiency", "details": "d2", "dedupe_key": "shrink-prompt"})
+    dup = await adapter.record_issue({"repo": "example-org/taskboy", "summary": "  trim the classifier prompt  ", "issue_type": "token_efficiency", "details": "d2", "dedupe_key": "shrink-prompt"})
     assert dup.get("isError")
     assert "#1" in dup["content"][0]["text"] or "trim-prompt" in dup["content"][0]["text"]
     assert len(store.list_issues()) == 1
 
     # same dedupe_key with the same summary is a refresh, not a duplicate -> still allowed
-    refresh = await adapter.record_issue({"repo": "example-org/agent-harness", "summary": "Trim the classifier prompt", "issue_type": "token_efficiency", "details": "d3", "dedupe_key": "trim-prompt", "priority": 80})
+    refresh = await adapter.record_issue({"repo": "example-org/taskboy", "summary": "Trim the classifier prompt", "issue_type": "token_efficiency", "details": "d3", "dedupe_key": "trim-prompt", "priority": 80})
     assert not refresh.get("isError")
     assert len(store.list_issues()) == 1
     assert store.list_issues()[0]["details"] == "d3"
@@ -160,13 +160,13 @@ async def test_record_issue_rejects_duplicate_summary_under_different_key(store,
 
 @pytest.mark.asyncio
 async def test_record_issue_duplicate_of_non_proposed_row_does_not_suggest_refresh(store, make_task):
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness"])
-    first = await adapter.record_issue({"repo": "example-org/agent-harness", "summary": "Trim the classifier prompt", "issue_type": "token_efficiency", "details": "d", "dedupe_key": "trim-prompt"})
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
+    first = await adapter.record_issue({"repo": "example-org/taskboy", "summary": "Trim the classifier prompt", "issue_type": "token_efficiency", "details": "d", "dedupe_key": "trim-prompt"})
     assert not first.get("isError")
     store.decide_issue(1, "approved", "boss")
 
     # a duplicate of an already-decided row can't be refreshed by re-recording (the store only upserts proposed rows)
-    dup = await adapter.record_issue({"repo": "example-org/agent-harness", "summary": "trim the classifier prompt", "issue_type": "token_efficiency", "details": "d2", "dedupe_key": "shrink-prompt"})
+    dup = await adapter.record_issue({"repo": "example-org/taskboy", "summary": "trim the classifier prompt", "issue_type": "token_efficiency", "details": "d2", "dedupe_key": "shrink-prompt"})
     assert dup.get("isError")
     text = dup["content"][0]["text"]
     assert "approved" in text and "dedupe_key" not in text
@@ -175,14 +175,14 @@ async def test_record_issue_duplicate_of_non_proposed_row_does_not_suggest_refre
 
 @pytest.mark.asyncio
 async def test_record_issue_same_dedupe_key_as_decided_row_errors_instead_of_silent_noop(store, make_task):
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness"])
-    first = await adapter.record_issue({"repo": "example-org/agent-harness", "summary": "Trim the classifier prompt", "issue_type": "token_efficiency", "details": "d", "dedupe_key": "trim-prompt"})
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
+    first = await adapter.record_issue({"repo": "example-org/taskboy", "summary": "Trim the classifier prompt", "issue_type": "token_efficiency", "details": "d", "dedupe_key": "trim-prompt"})
     assert not first.get("isError")
     store.decide_issue(1, "approved", "boss")
 
     # the store's upsert only fires while the row is still 'proposed', so re-recording under the SAME
     # dedupe_key as an already-decided row silently writes nothing -> must not be reported as success
-    again = await adapter.record_issue({"repo": "example-org/agent-harness", "summary": "Trim the classifier prompt (updated)", "issue_type": "token_efficiency", "details": "d2", "dedupe_key": "trim-prompt"})
+    again = await adapter.record_issue({"repo": "example-org/taskboy", "summary": "Trim the classifier prompt (updated)", "issue_type": "token_efficiency", "details": "d2", "dedupe_key": "trim-prompt"})
     assert again.get("isError")
     assert "approved" in again["content"][0]["text"]
     row = store.get_issue(1)
@@ -193,7 +193,7 @@ async def test_record_issue_same_dedupe_key_as_decided_row_errors_instead_of_sil
 async def test_list_recent_errors_includes_traceback_tail(store, make_task):
     store.add_error("housekeeping", "RuntimeError", "sweep failed", traceback="Traceback (most recent call last):\n" + "x" * 700 + "\nRuntimeError: sweep failed")
     store.add_error("classifier", "ValueError", "bad json")  # no traceback recorded
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness"])
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
     store.add_error("housekeeping", "RuntimeError", "sweep failed again", traceback="Traceback:\nRuntimeError: sweep failed again")
     result = await adapter.list_recent_errors({})
     payload = json.loads(result["content"][0]["text"])
@@ -209,7 +209,7 @@ async def test_list_recent_errors_filters_by_component_kind_offset_and_traceback
     store.add_error("review_poller", "RuntimeError", "first", traceback="Traceback:\nRuntimeError: first")
     store.add_error("classifier", "ValueError", "unrelated")
     store.add_error("review_poller", "RuntimeError", "second", traceback="Traceback:\nRuntimeError: second")
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness"])
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
 
     filtered = json.loads((await adapter.list_recent_errors({"component": "review_poller", "kind": "RuntimeError"})).get("content")[0]["text"])
     assert [row["message"] for row in filtered["errors"]] == ["second", "first"]
@@ -232,7 +232,7 @@ async def test_list_failed_tasks_excludes_refused(store, make_task):
     store.transition(real_failure.task_id, RECEIVED, FAILED, "crashed", error="boom")
     refusal = make_task("hi")
     store.transition(refusal.task_id, RECEIVED, REFUSED, "unsupported request", error="unsupported request")
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness"])
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
     result = await adapter.list_failed_tasks({})
     payload = json.loads(result["content"][0]["text"])
     task_ids = [row["task_id"] for row in payload]
@@ -248,7 +248,7 @@ async def test_list_failed_tasks_filters_by_task_type_query_and_offset(store, ma
     b = make_task("thing b")
     store.transition(b.task_id, RECEIVED, FAILED, "crashed", error="boom b")
     store.set_fields(b.task_id, task_type="discoverissues")
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness"])
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
 
     only_spec2pr = json.loads((await adapter.list_failed_tasks({"task_type": "spec2pr"})).get("content")[0]["text"])
     assert [row["task_id"] for row in only_spec2pr] == [a.task_id]
@@ -322,7 +322,7 @@ async def test_enqueue_spec_pr_rejects_row_reserved_by_another_task_without_crea
 
 @pytest.mark.asyncio
 async def test_finish_issue_tool_only_from_in_progress(store, make_task):
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness"])
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
     row = rec(store, key="x")
     result = await adapter.finish_issue({"id": row["id"], "status": "done", "pr_url": "u"})
     assert result.get("isError")  # still proposed, not in progress
@@ -331,12 +331,12 @@ async def test_finish_issue_tool_only_from_in_progress(store, make_task):
 @pytest.mark.asyncio
 async def test_finish_issue_tool_stores_in_review_when_pr_opened(store, make_task):
     task = make_task()
-    adapter = IssuesAdapter(store, task, ["example-org/agent-harness"])
+    adapter = IssuesAdapter(store, task, ["example-org/taskboy"])
     row = rec(store, key="x")
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "spec")
 
-    result = await adapter.finish_issue({"id": row["id"], "status": "done", "pr_url": "https://github.com/example-org/agent-harness/pull/9"})
+    result = await adapter.finish_issue({"id": row["id"], "status": "done", "pr_url": "https://github.com/example-org/taskboy/pull/9"})
     assert not result.get("isError")
     assert "in_review" in result["content"][0]["text"]
     assert store.get_issue(row["id"])["status"] == "in_review"
@@ -345,7 +345,7 @@ async def test_finish_issue_tool_stores_in_review_when_pr_opened(store, make_tas
 @pytest.mark.asyncio
 async def test_finish_issue_tool_done_without_pr_url_stays_done(store, make_task):
     task = make_task()
-    adapter = IssuesAdapter(store, task, ["example-org/agent-harness"])
+    adapter = IssuesAdapter(store, task, ["example-org/taskboy"])
     row = rec(store, key="x")
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "spec")
@@ -358,7 +358,7 @@ async def test_finish_issue_tool_done_without_pr_url_stays_done(store, make_task
 @pytest.mark.asyncio
 async def test_finish_issue_tool_failed_stays_failed(store, make_task):
     task = make_task()
-    adapter = IssuesAdapter(store, task, ["example-org/agent-harness"])
+    adapter = IssuesAdapter(store, task, ["example-org/taskboy"])
     row = rec(store, key="x")
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "spec")
@@ -493,7 +493,7 @@ async def test_list_accepted_issues_returns_only_this_runs_reservation_and_reser
     store.decide_issue(mine["id"], "approved", "boss")
     store.reserve_issues(other_coordinator.task_id, 1)  # claims "others" first, leaving only "mine" approved
 
-    adapter = IssuesAdapter(store, coordinator, ["example-org/agent-harness"])
+    adapter = IssuesAdapter(store, coordinator, ["example-org/taskboy"])
     result = await adapter.list_accepted_issues({})
     payload = json.loads(result["content"][0]["text"])
     # nothing reserved for `coordinator` yet -> it reserves the (only) remaining approved row itself
@@ -507,10 +507,10 @@ async def test_list_accepted_issues_returns_only_this_runs_reservation_and_reser
 
 @pytest.mark.asyncio
 async def test_record_issue_tool_rejects_unapproved_repo(store, make_task):
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness"])
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
     result = await adapter.record_issue({"repo": "other/repo", "summary": "s", "issue_type": "bug", "details": "d", "dedupe_key": "k", "priority": 50})
     assert result.get("isError")
-    assert "example-org/agent-harness" in result["content"][0]["text"]
+    assert "example-org/taskboy" in result["content"][0]["text"]
     assert store.list_issues() == []
 
 
@@ -535,7 +535,7 @@ def test_issue_comments_are_one_level_soft_deleted_and_resolvable(store):
 async def test_issue_comment_tools_only_edit_red_comments(store, make_task):
     issue = rec(store)
     human = store.add_issue_comment(issue["id"], "person@example.com", "human")
-    adapter = IssuesAdapter(store, make_task(), ["example-org/agent-harness"])
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
     refused = await adapter.update_issue_comment({"comment_id": human["id"], "body": "changed"})
     assert refused.get("isError")
 

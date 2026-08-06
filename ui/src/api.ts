@@ -358,7 +358,7 @@ export const api = {
     }),
 };
 
-// mirrors agent_harness.models.EFFORT_LEVELS — the sdk's reasoning-effort levels
+// mirrors taskboy.models.EFFORT_LEVELS — the sdk's reasoning-effort levels
 export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 export const MODEL_COLORS: Record<string, string> = {

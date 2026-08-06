@@ -1,0 +1,177 @@
+# taskboy operator config. copy to config.yaml (local dev) or /etc/taskboy/config.yaml (host).
+# config.yaml is gitignored in this repo template — commit it to your own private fork/repo if you want it version-controlled.
+# apply changes with a service restart — restarts are safe, running tasks are requeued and resumed.
+# tip: run `taskboy setup` for a guided walkthrough that fills this file in for you.
+
+orchestrator:
+  max_concurrency: 3 # max sub-agents running at once (ORC-005)
+  queue_max: 20 # tasks waiting beyond this are refused with a clear reply (ORC-006)
+  max_retries: 2 # restart/requeue attempts before a task is failed (REL-003)
+  progress_min_interval_seconds: 60 # per-task floor between slack progress posts (SLK-006)
+  runner: echo # echo (dev, no model calls) | claude (real sub-agent sessions; needs CLAUDE_CODE_OAUTH_TOKEN)
+
+agent: # the main agent's identity
+  name: Agent # display name used in slack, prompts, PR/Jira text, and the dashboard
+  personality_file: "" # e.g. personality_agent.md, relative to this config file; empty = neutral voice; configured files must exist at startup
+
+reviewer: # optional second GitHub-only persona that reviews the main agent's PRs (needs its own GitHub App)
+  enabled: false
+  name: Reviewer
+  personality_file: "" # e.g. personality_reviewer.md; configured files must exist at startup
+  review_agent_prs: true # auto-review PRs authored by the main agent
+  commit_name: "" # git author on the reviewer's commits; empty = defaults to reviewer name
+  # GitHub derives the commit avatar from this email; verify it on a GitHub account to give the reviewer a custom avatar (operator-side setup)
+  commit_email: "" # required when enabled
+
+classifier:
+  tier: haiku # model alias used for the single classification call
+
+cli_update: # off-peak upgrade of the claude-agent-sdk package (bundles the claude cli) + service restart, ungated by ci
+  enabled: false # the service self-restarts after a pip upgrade via the flag-file + taskboy-restart.path unit from the packaged install.sh
+  at_time: "02:00" # HH:MM, local to tzname
+  tzname: America/Los_Angeles
+
+issues: # multi-repo issue discovery, refinement, discussion, and implementation
+  notify_channel: "" # optional slack channel id for lifecycle posts on manual issue runs
+  uploads_bucket: "" # empty = comment attachments disabled (local dev)
+  # recurring discovery/implementation runs are seeded as editable schedules on the dashboard Scheduler page
+
+skills: # model + execution profile for /skill-name invocations; tier must be in the models catalog
+  tier: opus # change here to move all skill runs
+  profile: standard
+
+slack: # socket-mode intake and notifications
+  team_id: "" # non-empty enables slack intake
+  debug_channel: "" # set to a private debug channel id; empty disables the debug feed
+  task_started_messages_file: task_started_messages.yaml # relative to this config file; missing/invalid uses legacy text
+  allowed_channels: [] # channel ids, e.g. [C0123ABCDEF]
+  ack_reaction: true # 👀 reaction instead of the "On it" message; false restores the text ack
+
+roles: # use members: ["*"] on at most one role to allow anyone in an allowed channel
+  admin:
+    members: [YOUR_SLACK_USER_ID, cli]
+    allowed_profiles: [read_only, standard, deep]
+    model_override: true
+    max_budget_usd: null
+  developer:
+    members: []
+    allowed_profiles: [read_only, standard, deep]
+    model_override: false
+    max_budget_usd: 12.0
+  readonly:
+    members: []
+    allowed_profiles: [read_only]
+    model_override: false
+    max_budget_usd: 2.0
+  system:
+    members: [github]
+    allowed_profiles: [read_only, standard]
+    model_override: false
+    max_budget_usd: 12.0
+
+models: # catalog aliases -> model ids; swap here, never in code (MOD-007)
+  # the cli resolves haiku/sonnet/opus to current models; pin full ids here if you need version stability
+  haiku: { id: haiku, fallbacks: [sonnet] }
+  sonnet: { id: sonnet, fallbacks: [opus] }
+  opus: { id: opus, fallbacks: [] }
+  fable: { id: claude-fable-5, fallbacks: [opus] }
+
+routing: # first match wins; fields ANDed, values within a field ORed (MOD-002)
+  rules:
+    - { name: cheap-questions, match: { task_type: [question, investigation], complexity: [trivial] }, tier: haiku, profile: read_only }
+    - { name: critical-work, match: { complexity: [critical] }, tier: fable, profile: deep }
+    - { name: complex-work, match: { complexity: [complex] }, tier: opus, profile: deep }
+    - { name: standard-eng, match: { task_type: [bug_fix, feature, pr_review, incident_diagnosis, jira_ops] }, tier: sonnet, profile: standard }
+  default: { tier: sonnet, profile: read_only }
+
+profiles: # budgets + tool allowlists per risk level (ORC-009, §11)
+  read_only:
+    # bash is needed for investigation (clone, grep, run tests); hooks police it and read_only sessions get read-only github tokens
+    allowed_tools: [Read, Grep, Glob, Bash, WebFetch, mcp__harness__report_progress, mcp__harness__report_blocked, mcp__harness__request_permission, mcp__github__get_pull_request, mcp__github__list_pull_requests, mcp__github__list_pr_files, mcp__github__list_pr_comments, mcp__jira__search_issues, mcp__jira__search_users, mcp__jira__get_issue, mcp__jira__list_boards, mcp__jira__list_sprints, mcp__sentry__list_issues, mcp__sentry__get_issue, mcp__sentry__get_latest_event, mcp__aws__aws_read, mcp__slack__channel_history, mcp__slack__thread_replies, mcp__slack__user_info, mcp__slack__get_file, mcp__confluence__search_pages, mcp__confluence__get_page]
+    max_budget_usd: 2.0
+    max_turns: 60
+    max_runtime_minutes: 30
+    effort: low
+  standard:
+    allowed_tools: [Read, Grep, Glob, Bash, WebFetch, Write, Edit, mcp__harness__report_progress, mcp__harness__report_blocked, mcp__harness__request_permission, mcp__github__get_pull_request, mcp__github__list_pull_requests, mcp__github__list_pr_files, mcp__github__list_pr_comments, mcp__github__create_pull_request, mcp__github__comment_on_pull_request, mcp__github__create_pr_review, mcp__github__reply_to_pr_comment, mcp__github__resolve_pr_thread, mcp__github__close_pull_request, mcp__github__delete_branch, mcp__github__create_release, mcp__jira__search_issues, mcp__jira__search_users, mcp__jira__get_issue, mcp__jira__list_boards, mcp__jira__list_sprints, mcp__sentry__list_issues, mcp__sentry__get_issue, mcp__sentry__get_latest_event, mcp__aws__aws_read, mcp__jira__create_issue, mcp__jira__add_comment, mcp__jira__assign_issue, mcp__jira__transition_issue, mcp__jira__move_to_sprint, mcp__jira__set_epic, mcp__jira__set_story_points, mcp__jira__link_pr, mcp__slack__channel_history, mcp__slack__thread_replies, mcp__slack__user_info, mcp__slack__get_file, mcp__slack__send_dm, mcp__confluence__search_pages, mcp__confluence__get_page]
+    max_budget_usd: 12.0
+    max_turns: 400
+    max_runtime_minutes: 240
+  deep:
+    allowed_tools: [Read, Grep, Glob, Bash, WebFetch, Write, Edit, mcp__harness__report_progress, mcp__harness__report_blocked, mcp__harness__request_permission, mcp__github__get_pull_request, mcp__github__list_pull_requests, mcp__github__list_pr_files, mcp__github__list_pr_comments, mcp__github__create_pull_request, mcp__github__comment_on_pull_request, mcp__github__create_pr_review, mcp__github__reply_to_pr_comment, mcp__github__resolve_pr_thread, mcp__github__close_pull_request, mcp__github__delete_branch, mcp__github__create_release, mcp__jira__search_issues, mcp__jira__search_users, mcp__jira__get_issue, mcp__jira__list_boards, mcp__jira__list_sprints, mcp__sentry__list_issues, mcp__sentry__get_issue, mcp__sentry__get_latest_event, mcp__aws__aws_read, mcp__jira__create_issue, mcp__jira__add_comment, mcp__jira__assign_issue, mcp__jira__transition_issue, mcp__jira__move_to_sprint, mcp__jira__set_epic, mcp__jira__set_story_points, mcp__jira__link_pr, mcp__slack__channel_history, mcp__slack__thread_replies, mcp__slack__user_info, mcp__slack__get_file, mcp__slack__send_dm, mcp__confluence__search_pages, mcp__confluence__get_page]
+    max_budget_usd: 20.0
+    max_turns: 400
+    max_runtime_minutes: 240
+    effort: high
+    thinking: { type: adaptive }
+
+quick_answer:
+  enabled: true
+  tier: haiku
+  timeout_seconds: 20
+  max_per_user_per_hour: 30
+
+usage_limits: # total-token ceilings for dashboard remaining-capacity meters; zero disables a meter
+  five_hour_tokens: 0
+  weekly_tokens: 0
+  fable_weekly_tokens: 0
+
+conventions: # engineering conventions doc injected into repo-targeting task workspaces as CONVENTIONS.md
+  file: "" # e.g. conventions.md, relative to this config file's directory; empty = disabled
+
+github: # used from phase 4
+  approved_repos: [] # org/repo
+  self_repo: "" # org/repo of this agent's own source; must also be in approved_repos; empty = no self-repo hint
+  protected_branch_patterns: [main, develop]
+  commit_name: "" # git author/committer on commits the agent pushes; empty = defaults to agent.name
+  # GitHub derives the commit avatar from this email; verify it on a GitHub account to give the agent a custom avatar (operator-side setup)
+  commit_email: ""
+  review_requests: # poll approved repos for PRs where the agent is a requested reviewer -> run /review
+    enabled: false
+    poll_interval_seconds: 60
+    notify_channel: "" # optional slack channel id for lifecycle updates on github-triggered reviews
+
+jira: # used from phase 5
+  site: "" # e.g. https://your-org.atlassian.net
+  projects: [] # project keys the agent may touch, e.g. [ENG]
+  issue_types: [Story, Bug, Task]
+  story_points_field: "" # e.g. customfield_10016; empty = story points not set
+
+confluence:
+  site: "" # e.g. https://your-org.atlassian.net
+  spaces: [] # empty = any space the service account can read
+
+aws: # read-only diagnostics; writes are denied by IAM and by the adapter (AWS-004/005)
+  allowed_services: [] # e.g. [logs, cloudwatch, lambda, ecs, s3]
+  allowed_regions: [us-east-1]
+  # diagnostics_role_arns: # per-environment roles the agent assumes for reads; comment out for local-dev default creds
+  #   staging: arn:aws:iam::YOUR_ACCOUNT_ID:role/your-staging-diagnostics-role
+  #   production: arn:aws:iam::YOUR_ACCOUNT_ID:role/your-production-diagnostics-role
+
+sentry: # used from phase 5
+  organization: "" # sentry org slug
+  projects: []
+
+dashboard: # web ui; served behind an alb doing sso in deployed envs
+  enabled: false
+  bind: 127.0.0.1 # 0.0.0.0 on the host (the security group only admits the alb)
+  port: 8787
+  allowed_email_domain: "" # required when enabled; read-only access for any account under this domain, e.g. example.com
+  public_url: "" # e.g. https://agent.example.com; empty disables dashboard links in slack posts
+  admin_emails: [] # management surface: editing, cancel/retry
+  dev_user_email: dev@example.com # local-only stand-in identity when no alb header is present
+  auto_commit: # empty repo disables committing dashboard edits back to git
+    repo: "" # org/repo that holds this config
+    branch: main
+    committer_name: "" # git committer identity on dashboard auto-commits; empty = "<agent name> Dashboard"
+    committer_email: "" # required when repo is set
+
+audit: # hourly jsonl shipping of the hash-chained event trail (§10); empty bucket = disabled (local dev)
+  bucket: ""
+
+retention: # days (MEM-012, §12)
+  workspace_completed_days: 3
+  workspace_failed_days: 7
+  memory_days: 90
+  audit_days: 365
+  slack_events_days: 7

@@ -1,11 +1,12 @@
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=69", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-harness"
-version = "0.1.0"
-description = "Self-hosted AI engineering agent: Slack-driven orchestrator running isolated Claude sub-agents"
+name = "taskboy"
+dynamic = ["version"]
+description = "TaskBoy: self-hosted AI engineering agent — Slack-driven orchestrator running isolated Claude sub-agents"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "pyyaml>=6.0",
@@ -34,10 +35,18 @@ dev = [
 # added in later phases: claude-agent-sdk (phase 3), boto3 (phase 4+)
 
 [project.scripts]
-agent-harness = "agent_harness.cli:main"
+taskboy = "taskboy.cli:main"
 
 [tool.setuptools]
-packages = ["agent_harness", "agent_harness.adapters", "agent_harness.dashboard"]
+packages = ["taskboy", "taskboy.adapters", "taskboy.dashboard"]
+
+[tool.setuptools.package-data]
+# non-code assets shipped in the wheel: seed templates, host deploy files, built dashboard
+taskboy = ["templates/**/*", "deploy/*", "ui_dist/**/*"]
+
+[tool.setuptools_scm]
+# version comes from the vX.Y.Z git tag; fallback covers builds outside a git checkout
+fallback_version = "0.0.0"
 
 [tool.black]
 line-length = 300
@@ -49,7 +58,7 @@ line_length = 300
 
 [tool.mypy]
 ignore_missing_imports = true
-exclude = ["spike", "infrastructure"]
+exclude = ["spike"]
 
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"

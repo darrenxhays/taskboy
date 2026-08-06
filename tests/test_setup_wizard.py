@@ -1,10 +1,10 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from agent_harness import setup_checks, setup_wizard
-from agent_harness.config import load_config
+from taskboy import setup_checks, setup_wizard
+from taskboy.config import load_config
 
-EXAMPLE = Path(__file__).parents[1] / "config" / "config.example.yaml"
+EXAMPLE = Path(__file__).parents[1] / "taskboy" / "templates" / "config.example.yaml"
 
 
 def _wizard_paths(monkeypatch, tmp_path):
@@ -34,7 +34,7 @@ def test_config_round_trip_preserves_comments_and_stays_loadable(tmp_path, monke
 def test_save_rejects_and_restores_on_invalid_config(tmp_path, monkeypatch):
     import pytest
 
-    from agent_harness.config import ConfigError
+    from taskboy.config import ConfigError
 
     _wizard_paths(monkeypatch, tmp_path)
     data = setup_wizard.load_config_data()
@@ -63,7 +63,7 @@ def test_local_mode_creates_config_and_prints_next_steps(tmp_path, monkeypatch, 
     assert setup_wizard.run(args) == 0
     assert config_path.exists()
     out = capsys.readouterr().out
-    assert "agent-harness inject" in out
+    assert "taskboy inject" in out
     load_config(str(config_path))  # the copied example must be immediately runnable
 
 
@@ -87,7 +87,7 @@ def test_template_variables_derive_from_config():
     data = {
         "agent": {"name": "Scout"},
         "reviewer": {"name": "Critic"},
-        "github": {"approved_repos": ["example-org/svc-a", "example-org/svc-b"], "self_repo": "example-org/agent-harness"},
+        "github": {"approved_repos": ["example-org/svc-a", "example-org/svc-b"], "self_repo": "example-org/taskboy"},
         "jira": {"site": "https://example.atlassian.net", "projects": ["ENG"]},
         "conventions": {"file": "conventions.md"},
     }
@@ -96,7 +96,7 @@ def test_template_variables_derive_from_config():
     assert variables["reviewer_name"] == "Critic"
     assert variables["github_org"] == "example-org"
     assert variables["repo_list"] == "`svc-a`, `svc-b`"
-    assert variables["self_repo"] == "example-org/agent-harness"
+    assert variables["self_repo"] == "example-org/taskboy"
     assert variables["jira_project"] == "ENG"
     assert variables["jira_site"] == "example.atlassian.net"
     assert variables["conventions_file"] == "conventions.md"

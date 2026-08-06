@@ -1,0 +1,52 @@
+name: release
+
+# vX.Y.Z tag -> build the dashboard + wheel (setuptools-scm stamps the version from the
+# tag) and publish to PyPI via trusted publishing (no long-lived credentials).
+# deployments are owned by operator shell repos, which pin taskboy==X.Y.Z.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # pypi trusted publishing
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # setuptools-scm derives the version from the release tag
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: build dashboard ui
+        working-directory: ui
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # wheel only: the built ui is gitignored, so an sdist built from the scm file list
+      # would ship without the dashboard
+      - name: build wheel
+        run: |
+          pip install -q build
+          python -m build --wheel
+
+      - name: verify package data
+        run: python -c "import glob, zipfile; names = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist(); missing = [n for n in ['taskboy/templates/config.example.yaml', 'taskboy/templates/skills/review/SKILL.md', 'taskboy/deploy/taskboy.service', 'taskboy/deploy/install.sh', 'taskboy/deploy/remote-update.sh', 'taskboy/deploy/git-cred-helper.py', 'taskboy/ui_dist/index.html'] if n not in names]; assert not missing, f'wheel is missing package data: {missing}'"
+
+      - name: publish to pypi
+        uses: pypa/gh-action-pypi-publish@release/v1

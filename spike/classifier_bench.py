@@ -8,10 +8,10 @@ import asyncio
 import tempfile
 import time
 
-from agent_harness.classifier import extract_usage, parse_classification
-from agent_harness.config import load_config
-from agent_harness.prompts import CLASSIFICATION_SCHEMA, classifier_prompt
-from agent_harness.router import route
+from taskboy.classifier import extract_usage, parse_classification
+from taskboy.config import load_config
+from taskboy.prompts import CLASSIFICATION_SCHEMA, classifier_prompt
+from taskboy.router import route
 
 MODELS = ["haiku", "sonnet", "fable"]
 APPROVED = ["example-org/example-repo"]

@@ -1,4 +1,4 @@
-from agent_harness.prompts import CLASSIFICATION_SCHEMA, TRIAGE_SCHEMA, classifier_prompt, dm_chat_prompt, quick_answer_prompt, task_prompt, triage_prompt
+from taskboy.prompts import CLASSIFICATION_SCHEMA, TRIAGE_SCHEMA, classifier_prompt, dm_chat_prompt, quick_answer_prompt, task_prompt, triage_prompt
 
 
 def test_classifier_prompt_includes_thread_context_only_when_present():
@@ -10,21 +10,21 @@ def test_classifier_prompt_includes_thread_context_only_when_present():
 
 
 def test_classifier_prompt_treats_close_and_delete_as_supported():
-    prompt = classifier_prompt("close PR #4 and delete its branch", ["org/agent-harness"], ["github"])
+    prompt = classifier_prompt("close PR #4 and delete its branch", ["org/taskboy"], ["github"])
     assert 'classify these as "bug_fix", not "unsupported"' in prompt
 
 
 def test_classifier_prompt_treats_review_comment_response_as_bug_fix():
-    prompt = classifier_prompt("address the review comments on your PR #6", ["org/agent-harness"], ["github"])
+    prompt = classifier_prompt("address the review comments on your PR #6", ["org/taskboy"], ["github"])
     assert "review comments on a pull request are code changes" in prompt
     assert 'not "pr_review"' in prompt
 
 
 def test_classifier_prompt_self_repo_line_only_when_configured():
-    without = classifier_prompt("fix yourself", ["org/agent-harness"], ["github"])
-    with_self_repo = classifier_prompt("fix yourself", ["org/agent-harness"], ["github"], self_repo="org/agent-harness", bot_name="Ruby")
+    without = classifier_prompt("fix yourself", ["org/taskboy"], ["github"])
+    with_self_repo = classifier_prompt("fix yourself", ["org/taskboy"], ["github"], self_repo="org/taskboy", bot_name="Ruby")
     assert "own source code" not in without
-    assert 'The repository "org/agent-harness" is Ruby\'s own source code' in with_self_repo
+    assert 'The repository "org/taskboy" is Ruby\'s own source code' in with_self_repo
     assert '"you", "your code", "yourself"' in with_self_repo
 
 
@@ -39,11 +39,11 @@ def test_task_prompt_includes_thread_and_precloned_repositories(make_task):
 def test_task_prompt_self_repo_rules_only_when_present(make_task):
     task = make_task()
     without = task_prompt(task, None, [], github=True)
-    with_self_repo = task_prompt(task, None, [], github=True, self_repo="org/agent-harness")
-    without_github = task_prompt(task, None, [], self_repo="org/agent-harness")
+    with_self_repo = task_prompt(task, None, [], github=True, self_repo="org/taskboy")
+    without_github = task_prompt(task, None, [], self_repo="org/taskboy")
     assert "service you are running as" not in without
     assert "service you are running as" not in without_github
-    assert "org/agent-harness is your own source code" in with_self_repo
+    assert "org/taskboy is your own source code" in with_self_repo
     assert "never attempt to merge it yourself" in with_self_repo
 
 
@@ -128,16 +128,16 @@ def test_triage_prompt_combines_answer_context_and_classification_scope():
         "fix your own retry bug",
         "Red",
         "task t20260101-deadbeef is completed",
-        ["org/agent-harness"],
+        ["org/taskboy"],
         ["github", "jira"],
         thread_context="<@U2>: it happens on retries",
         personality="Dry and exact.",
-        self_repo="org/agent-harness",
+        self_repo="org/taskboy",
     )
     assert "fast triage path" in prompt
     assert "task t20260101-deadbeef is completed" in prompt
     assert "it happens on retries" in prompt
-    assert "org/agent-harness" in prompt
+    assert "org/taskboy" in prompt
     assert "own source code" in prompt
     assert 'classify these as "bug_fix", not "unsupported"' in prompt
     assert "review comments on a pull request are code changes" in prompt

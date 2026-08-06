@@ -1,6 +1,6 @@
 import pytest
 
-from agent_harness.hooks import TaskHooks, bash_denial, classify_tool, profile_permits_writes, repo_grantable, tool_grantable
+from taskboy.hooks import TaskHooks, bash_denial, classify_tool, profile_permits_writes, repo_grantable, tool_grantable
 
 PROTECTED = ["main", "develop"]
 
@@ -46,23 +46,23 @@ def test_tool_grantable_gates_writes_by_tier():
 
 
 def test_repo_grantable_allows_same_org_repos_outside_approved_list():
-    # the evidence case (issue #39): example-org/portal wasn't in approved_repos, but example-org/agent-harness
+    # the evidence case (issue #39): example-org/portal wasn't in approved_repos, but example-org/taskboy
     # was — same org, so it should be grantable, whether or not the installation's repo list is known
-    approved = ["example-org/agent-harness"]
+    approved = ["example-org/taskboy"]
     assert repo_grantable("example-org/portal", approved, None) is True
-    assert repo_grantable("example-org/portal", approved, {"agent-harness", "portal"}) is True
+    assert repo_grantable("example-org/portal", approved, {"taskboy", "portal"}) is True
 
 
 def test_repo_grantable_rejects_other_orgs_and_uninstalled_repos():
-    approved = ["example-org/agent-harness"]
+    approved = ["example-org/taskboy"]
     # a different org entirely is never grantable, regardless of installation knowledge
     assert repo_grantable("othercorp/secret", approved, None) is False
     # same org, but the installation's known repo list doesn't include it
-    assert repo_grantable("example-org/portal", approved, {"agent-harness"}) is False
+    assert repo_grantable("example-org/portal", approved, {"taskboy"}) is False
 
 
 def test_repo_grantable_rejects_malformed_targets():
-    approved = ["example-org/agent-harness"]
+    approved = ["example-org/taskboy"]
     assert repo_grantable("notaslug", approved, None) is False
     assert repo_grantable("example-org/", approved, None) is False
     assert repo_grantable("/portal", approved, None) is False

@@ -9,7 +9,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 
-SCANNED_DIRS = ["agent_harness", "config", "templates", "skills", "deploy", "infrastructure", ".github", "ui/src", "spike"]
+# config examples, templates, and deploy files live inside taskboy/ (shipped as package
+# data); infrastructure moved to the taskboy-shell template repo
+SCANNED_DIRS = ["taskboy", "skills", ".github", "ui/src", "spike"]
 SCANNED_SUFFIXES = {".py", ".yaml", ".yml", ".md", ".sh", ".service", ".path", ".ts", ".tsx", ".html", ".css", ".json", ".example", ""}
 
 FORBIDDEN = [
@@ -31,7 +33,7 @@ def scannable_files():
         if not base.exists():
             continue
         for path in base.rglob("*"):
-            if path.is_file() and path.suffix in SCANNED_SUFFIXES and "node_modules" not in path.parts and "dist" not in path.parts and "__pycache__" not in path.parts:
+            if path.is_file() and path.suffix in SCANNED_SUFFIXES and "node_modules" not in path.parts and "dist" not in path.parts and "ui_dist" not in path.parts and "__pycache__" not in path.parts:
                 yield path
 
 
@@ -51,6 +53,6 @@ def test_no_old_branding_in_shipped_files():
 
 
 def test_example_config_has_no_real_tenancy():
-    text = (ROOT / "config" / "config.example.yaml").read_text()
+    text = (ROOT / "taskboy" / "templates" / "config.example.yaml").read_text()
     for forbidden in ("redzone", "T2X15FK1C", "713387502796", "360112297542", "838717548546"):
         assert forbidden not in text, f"example config leaks {forbidden!r}"

@@ -2,15 +2,15 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agent_harness import scheduler
-from agent_harness.config import CliUpdateConfig, SlackConfig
-from agent_harness.scheduler import cli_update_due, fire_due, fire_schedule_now, maybe_run_cli_update, next_run_after, run_cli_update, seed_default_schedules
+from taskboy import scheduler
+from taskboy.config import CliUpdateConfig, SlackConfig
+from taskboy.scheduler import cli_update_due, fire_due, fire_schedule_now, maybe_run_cli_update, next_run_after, run_cli_update, seed_default_schedules
 from tests.conftest import RecordingNotifier, make_config
 
 UTC = timezone.utc
 
 
-def make_schedule(store, *, kind, next_run_at, model_alias=None, effort=None, interval_minutes=None, at_time=None, run_at=None, tzname=None, max_runs=None, request_text="/discoverissues example-org/agent-harness"):
+def make_schedule(store, *, kind, next_run_at, model_alias=None, effort=None, interval_minutes=None, at_time=None, run_at=None, tzname=None, max_runs=None, request_text="/discoverissues example-org/taskboy"):
     return store.create_schedule(
         name="t",
         request_text=request_text,
@@ -68,7 +68,7 @@ async def test_daily_fires_creates_task_and_advances(store):
     assert row["next_run_at"] > now.isoformat()  # advanced into the future
     assert row["last_task_id"] is not None
     task = store.get_task(row["last_task_id"])
-    assert task.request_text == "/discoverissues example-org/agent-harness" and task.slack_user_id == "cli"
+    assert task.request_text == "/discoverissues example-org/taskboy" and task.slack_user_id == "cli"
 
 
 @pytest.mark.asyncio
@@ -179,11 +179,11 @@ async def test_run_now_reports_already_running_instead_of_starting_a_second_coor
 
 def test_seed_is_idempotent(store, monkeypatch):
     monkeypatch.setattr(scheduler, "_now", lambda: datetime(2026, 7, 22, 12, 0, tzinfo=UTC))
-    seed_default_schedules(store, self_repo="example-org/agent-harness")
-    seed_default_schedules(store, self_repo="example-org/agent-harness")
+    seed_default_schedules(store, self_repo="example-org/taskboy")
+    seed_default_schedules(store, self_repo="example-org/taskboy")
     seeded = [s for s in store.list_schedules() if s["seed_key"]]
     assert {s["seed_key"] for s in seeded} == {"discoverissues-daily", "implementapprovedissues-daily", "warmup-daily"}
-    assert "/discoverissues example-org/agent-harness" in {s["request_text"] for s in seeded}
+    assert "/discoverissues example-org/taskboy" in {s["request_text"] for s in seeded}
     assert all(s["kind"] == "daily" and s["model_alias"] is None for s in seeded)
     warmup = next(s for s in seeded if s["seed_key"] == "warmup-daily")
     assert warmup["at_time"] == "04:00" and warmup["enabled"] == 1

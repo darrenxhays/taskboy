@@ -1,22 +1,23 @@
-# agent-harness
+# TaskBoy
 
-agent-harness is a self-hosted, Slack-native AI engineering agent you brand and configure as your own. It turns Slack mentions and GitHub review requests into durable, policy-controlled engineering tasks that run in isolated Claude Agent SDK sessions — under a name, personality, tool policy, and integration set that you choose at setup time.
+TaskBoy is a self-hosted, Slack-native AI engineering agent you brand and configure as your own. It turns Slack mentions and GitHub review requests into durable, policy-controlled engineering tasks that run in isolated Claude Agent SDK sessions — under a name, personality, tool policy, and integration set that you choose at setup time.
 
 Everything identity-shaped is configuration: the agent's name, an optional second reviewer persona, personalities, engineering conventions, skills, approved repositories, and integrations all live in `config/config.yaml` and operator-editable files — never in code.
 
 ## Quickstart (zero credentials, ~2 minutes)
 
 ```bash
+mkdir my-agent && cd my-agent
 python3.12 -m venv .venv && source .venv/bin/activate
-pip install -e .
-agent-harness setup --local     # copies the example config (echo runner, no integrations)
-agent-harness run               # start the service in the foreground
+pip install taskboy       # or, from a checkout of this repo: pip install -e .
+taskboy setup --local     # seeds the example config (echo runner, no integrations)
+taskboy run               # start the service in the foreground
 ```
 
 In another terminal:
 
 ```bash
-agent-harness inject "say hi" --watch
+taskboy inject "say hi" --watch
 ```
 
 You should see the task accepted, run, and complete. That's the whole lifecycle — intake, queue, runner, durable record — with no external accounts.
@@ -26,12 +27,12 @@ You should see the task accepted, run, and complete. That's the whole lifecycle 
 Run the interactive setup wizard:
 
 ```bash
-agent-harness setup
+taskboy setup
 ```
 
-It walks each step — agent identity, Claude auth, Slack app, GitHub App(s), optional Jira/Confluence/Sentry/AWS, dashboard, conventions, personalities, and the skills picker — printing the manual admin-console instructions where needed, validating every credential live, and writing `config/config.yaml` (comment-preserving) plus a sourceable `.env`. Every step is saved as you go, so you can quit and re-run anytime; `agent-harness setup --check` re-validates everything non-interactively.
+It walks each step — agent identity, Claude auth, Slack app, GitHub App(s), optional Jira/Confluence/Sentry/AWS, dashboard, conventions, personalities, and the skills picker — printing the manual admin-console instructions where needed, validating every credential live, and writing `config/config.yaml` (comment-preserving) plus a sourceable `.env`. Every step is saved as you go, so you can quit and re-run anytime; `taskboy setup --check` re-validates everything non-interactively.
 
-Deployment options and the full end-to-end verification checklist are in [SETUP.md](SETUP.md). The harness itself only needs a Linux box with systemd (`deploy/install.sh`); `infrastructure/` ships a reference AWS/Pulumi deployment.
+This repository is the **application** — a versioned package published to PyPI on every `vX.Y.Z` tag; operators never fork it. Your deployment lives in a separate **shell repository** (created from the `taskboy-shell` template) that pins `taskboy==X.Y.Z` and holds your config, personalities, skills, infrastructure, and deploy pipeline. The shell template's `SETUP.md` carries the full operator runbook: setup, host deployment, CI/CD, and end-to-end verification. Upgrades are a one-line version-bump PR in the shell.
 
 ## Features
 
@@ -43,7 +44,7 @@ Deployment options and the full end-to-end verification checklist are in [SETUP.
 - **Slack-native request handling.** The agent accepts authorized mentions over Socket Mode, acknowledges work, posts concise requester-facing replies, and links to a detailed debug thread.
 - **GitHub review automation.** Review-request polling uses the same durable intake path. An optional second **reviewer persona** (its own GitHub App identity) provides adversarial reviews of the main agent's pull requests.
 - **Mission Control dashboard.** Task exploration, audit trails, memory and usage views, redacted configuration, live updates, task controls, and in-browser editing of config, personalities, conventions, and skills.
-- **Skill template library.** Thirteen battle-tested workflows (`/review`, `/slack2pr`, `/jira2pr`, `/discoverissues`, …) ship as templates in `templates/skills/`; the setup wizard instantiates the ones you want with your org's names filled in.
+- **Skill template library.** Thirteen battle-tested workflows (`/review`, `/slack2pr`, `/jira2pr`, `/discoverissues`, …) ship as templates inside the package; the setup wizard instantiates the ones you want with your org's names filled in (`taskboy assets templates` copies them out for manual editing).
 - **Auditable operations.** Tool calls, routing, timing, usage, permission decisions, admin actions, and lifecycle changes are stored and redacted; audit records can ship to an S3 Object Lock bucket.
 
 ## How it works
@@ -56,7 +57,7 @@ Deployment options and the full end-to-end verification checklist are in [SETUP.
 
 ## Operational notes
 
-- `config/config.yaml` is your operator policy. It is gitignored in this template repo — commit it to your own private fork if you want it version-controlled (the dashboard's auto-commit feature expects that). Most changes apply on restart.
+- `config/config.yaml` is your operator policy. The application itself is a versioned pip package; your instance directory holds only config, personalities, skills, and secrets — commit those to a private repo if you want them version-controlled (the dashboard's auto-commit feature expects that). Most changes apply on restart.
 - Personalities, task-started message pools, conventions, and skills are separate operator-editable files, re-read per task and editable live from the dashboard.
 - All free-text persistence and Slack delivery pass through redaction. The GitHub credential broker mints repository-scoped installation tokens per task; sessions never see private keys.
 - AWS diagnostics are read-only at both the adapter and IAM layers.
@@ -68,25 +69,26 @@ Python 3.12+; Node.js 22+ for the dashboard; Docker for the CI-equivalent checks
 
 ```bash
 make check          # flake8 + mypy + black/isort --check + pytest, in docker (== CI)
-agent-harness run   # local service (echo or claude runner per config)
+taskboy run   # local service (echo or claude runner per config)
 cd ui && npm ci && npm run dev   # dashboard dev server, proxies /api to :8787
 ```
 
 ## Repository map
 
 ```text
-agent_harness/main.py             service wiring and housekeeping
-agent_harness/orchestrator.py     classify, queue, dispatch, recovery, and timing
-agent_harness/store.py            schema and all SQL
-agent_harness/slack.py            mention intake and requester notifications
-agent_harness/runner.py           Claude Agent SDK sessions and reply extraction
-agent_harness/setup_wizard.py     interactive first-run setup (agent-harness setup)
-agent_harness/adapters/           integration MCP servers
-agent_harness/dashboard/          Mission Control API
-ui/                               Mission Control React application
-config/                           operator policy and editable behavior (example files)
-templates/                        skill templates, conventions template, Slack app manifest
-skills/                           installed skills (empty until setup)
-deploy/                           systemd units, installer, and release updater
-infrastructure/                   reference AWS deployment (Pulumi)
+taskboy/main.py             service wiring and housekeeping
+taskboy/orchestrator.py     classify, queue, dispatch, recovery, and timing
+taskboy/store.py            schema and all SQL
+taskboy/slack.py            mention intake and requester notifications
+taskboy/runner.py           Claude Agent SDK sessions and reply extraction
+taskboy/setup_wizard.py     interactive first-run setup (taskboy setup)
+taskboy/adapters/           integration MCP servers
+taskboy/dashboard/          Mission Control API
+taskboy/templates/          packaged seed material: config example, personalities, skill templates, Slack manifest
+taskboy/deploy/             packaged host files: installer, updater, systemd units, env example, git credential helper
+ui/                               Mission Control React application (builds into taskboy/ui_dist)
+config/                           your local dev instance's operator policy (created by taskboy setup)
+skills/                           locally installed skills (empty until setup)
 ```
+
+Operator-owned pieces — pinned version, config, infrastructure (Pulumi), and the deploy workflow — live in your shell repository, created from the `taskboy-shell` template.

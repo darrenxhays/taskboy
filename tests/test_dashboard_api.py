@@ -8,11 +8,11 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from agent_harness import settings
-from agent_harness.config import DashboardConfig
-from agent_harness.dashboard import create_app
-from agent_harness.models import FAILED, QUEUED, RECEIVED, REFUSED, RUNNING
-from agent_harness.secrets import Secrets
+from taskboy import settings
+from taskboy.config import DashboardConfig
+from taskboy.dashboard import create_app
+from taskboy.models import FAILED, QUEUED, RECEIVED, REFUSED, RUNNING
+from taskboy.secrets import Secrets
 from tests.conftest import RecordingNotifier, make_config
 
 KID = "test-kid"
@@ -46,7 +46,7 @@ def dashboard(store, tmp_path, monkeypatch):
     personality_path.write_text("Red is direct and dry.")
     config = make_config(
         personality_path=str(personality_path),
-        dashboard=DashboardConfig(enabled=True, allowed_email_domain="example.com", admin_emails=[ADMIN], commit_repo="example-org/agent-harness"),
+        dashboard=DashboardConfig(enabled=True, allowed_email_domain="example.com", admin_emails=[ADMIN], commit_repo="example-org/taskboy"),
     )
     notifier = RecordingNotifier()
     app = create_app(store, config, notifier, Secrets(dashboard_github_token="pat"), orchestrator=None, ui_dist=str(tmp_path / "dist"))
@@ -266,7 +266,7 @@ async def test_manage_personality_preview_and_confirm_commits(dashboard, store):
     proposed = "Red is chipper now."
     preview = (await client.post("/api/manage/personality", headers=admin_headers(), json={"content": proposed, "base_hash": loaded["base_hash"], "action": "preview"})).json()
     assert preview["saved"] is False and "+Red is chipper now." in preview["diff"]
-    with patch("agent_harness.dashboard.api.gitops.commit_file", new=AsyncMock(return_value={"commit_sha": "abc123", "html_url": "https://github.com/x", "unchanged": False})) as committed:
+    with patch("taskboy.dashboard.api.gitops.commit_file", new=AsyncMock(return_value={"commit_sha": "abc123", "html_url": "https://github.com/x", "unchanged": False})) as committed:
         result = (await client.post("/api/manage/personality", headers=admin_headers(), json={"content": proposed, "base_hash": loaded["base_hash"], "action": "confirm"})).json()
     assert result["saved"] is True
     assert result["commit"]["commit_sha"] == "abc123"
@@ -338,9 +338,9 @@ async def test_feedback_validates_rating_and_task(dashboard, make_task):
 
 @pytest.mark.asyncio
 async def test_issues_list_ranks_actionable_only(dashboard, store):
-    store.record_issue("a", "example-org/agent-harness", "high one", "security", "d", 90)
-    store.record_issue("b", "example-org/agent-harness", "mid one", "organization", "d", 50)
-    denied = store.record_issue("c", "example-org/agent-harness", "low one", "organization", "d", 10)
+    store.record_issue("a", "example-org/taskboy", "high one", "security", "d", 90)
+    store.record_issue("b", "example-org/taskboy", "mid one", "organization", "d", 50)
+    denied = store.record_issue("c", "example-org/taskboy", "low one", "organization", "d", 10)
     store.decide_issue(denied["id"], "denied", ADMIN)
     client, _, _ = dashboard
     response = await client.get("/api/issues", headers=identity(VIEWER))
@@ -352,7 +352,7 @@ async def test_issues_list_ranks_actionable_only(dashboard, store):
 
 @pytest.mark.asyncio
 async def test_only_admin_decides_issues(dashboard, store):
-    row = store.record_issue("a", "example-org/agent-harness", "s", "security", "d", 50)
+    row = store.record_issue("a", "example-org/taskboy", "s", "security", "d", 50)
     client, _, _ = dashboard
     forbidden = await client.post(f"/api/issues/{row['id']}/decision", headers={**identity(VIEWER), "x-harness-dashboard": "1"}, json={"decision": "approved"})
     assert forbidden.status_code == 403
@@ -364,7 +364,7 @@ async def test_only_admin_decides_issues(dashboard, store):
 @pytest.mark.asyncio
 async def test_only_admin_creates_issues(dashboard, store):
     client, _, _ = dashboard
-    body = {"repo": "example-org/agent-harness", "summary": "add retries", "issue_type": "reliability", "details": "retry transient failures", "priority": 70}
+    body = {"repo": "example-org/taskboy", "summary": "add retries", "issue_type": "reliability", "details": "retry transient failures", "priority": 70}
     forbidden = await client.post("/api/issues", headers={**identity(VIEWER), "x-harness-dashboard": "1"}, json=body)
     assert forbidden.status_code == 403
     ok = await client.post("/api/issues", headers=admin_headers(), json=body)
@@ -378,13 +378,13 @@ async def test_only_admin_creates_issues(dashboard, store):
 async def test_create_issue_validates_fields(dashboard):
     client, _, _ = dashboard
     assert (await client.post("/api/issues", headers=admin_headers(), json={"summary": "s"})).status_code == 400
-    assert (await client.post("/api/issues", headers=admin_headers(), json={"repo": "example-org/agent-harness", "summary": "s", "issue_type": "t", "details": "d", "priority": 0})).status_code == 400
-    assert (await client.post("/api/issues", headers=admin_headers(), json={"repo": "example-org/agent-harness", "summary": "s", "issue_type": "t", "details": "d", "priority": "high"})).status_code == 400
+    assert (await client.post("/api/issues", headers=admin_headers(), json={"repo": "example-org/taskboy", "summary": "s", "issue_type": "t", "details": "d", "priority": 0})).status_code == 400
+    assert (await client.post("/api/issues", headers=admin_headers(), json={"repo": "example-org/taskboy", "summary": "s", "issue_type": "t", "details": "d", "priority": "high"})).status_code == 400
 
 
 @pytest.mark.asyncio
 async def test_only_admin_updates_issue(dashboard, store):
-    row = store.record_issue("a", "example-org/agent-harness", "s", "security", "d", 50)
+    row = store.record_issue("a", "example-org/taskboy", "s", "security", "d", 50)
     client, _, _ = dashboard
     body = {"summary": "better summary", "details": "better details"}
     forbidden = await client.post(f"/api/issues/{row['id']}/update", headers={**identity(VIEWER), "x-harness-dashboard": "1"}, json=body)
@@ -398,7 +398,7 @@ async def test_only_admin_updates_issue(dashboard, store):
 
 @pytest.mark.asyncio
 async def test_update_issue_validates_and_locks(dashboard, store):
-    row = store.record_issue("a", "example-org/agent-harness", "s", "security", "d", 50)
+    row = store.record_issue("a", "example-org/taskboy", "s", "security", "d", 50)
     client, _, _ = dashboard
     missing = await client.post(f"/api/issues/{row['id']}/update", headers=admin_headers(), json={"summary": "s"})
     assert missing.status_code == 400
@@ -414,10 +414,10 @@ async def test_run_issues_creates_system_task(dashboard, store):
     client, _, _ = dashboard
     bad = await client.post("/api/issues/run", headers=admin_headers(), json={"skill": "nope"})
     assert bad.status_code == 400
-    ok = await client.post("/api/issues/run", headers=admin_headers(), json={"skill": "discoverissues", "repo": "example-org/agent-harness"})
+    ok = await client.post("/api/issues/run", headers=admin_headers(), json={"skill": "discoverissues", "repo": "example-org/taskboy"})
     assert ok.status_code == 200 and ok.json()["status"] == "created"
     created = store.get_task(ok.json()["task_id"])
-    assert created is not None and created.request_text == "/discoverissues example-org/agent-harness" and created.slack_user_id == "github"
+    assert created is not None and created.request_text == "/discoverissues example-org/taskboy" and created.slack_user_id == "github"
 
 
 @pytest.mark.asyncio
@@ -434,7 +434,7 @@ async def test_implement_approved_creates_no_task_when_nothing_approved(dashboar
 async def test_implement_approved_is_idempotent_across_repeated_clicks(dashboard, store):
     client, _, _ = dashboard
     for i in range(6):
-        row = store.record_issue(f"k{i}", "example-org/agent-harness", f"summary {i}", "organization", "d", 10 + i)
+        row = store.record_issue(f"k{i}", "example-org/taskboy", f"summary {i}", "organization", "d", 10 + i)
         store.decide_issue(row["id"], "approved", ADMIN)
 
     first = await client.post("/api/issues/run", headers=admin_headers(), json={"skill": "implementapprovedissues"})
@@ -459,7 +459,7 @@ async def test_implement_approved_is_idempotent_across_repeated_clicks(dashboard
 @pytest.mark.asyncio
 async def test_issues_list_reports_implementation_active(dashboard, store):
     client, _, _ = dashboard
-    row = store.record_issue("a", "example-org/agent-harness", "s", "organization", "d", 50)
+    row = store.record_issue("a", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", ADMIN)
 
     idle = await client.get("/api/issues", headers=identity(VIEWER))
@@ -481,17 +481,17 @@ async def test_issue_repo_validation_and_list_metadata(dashboard, store):
         json={"repo": "other/repo", "summary": "s", "issue_type": "bug", "details": "d", "priority": 50},
     )
     assert invalid.status_code == 400
-    row = store.record_issue("a", "example-org/agent-harness", "s", "bug", "d", 50)
+    row = store.record_issue("a", "example-org/taskboy", "s", "bug", "d", 50)
     store.add_issue_comment(row["id"], VIEWER, "hello")
     body = (await client.get("/api/issues", headers=identity(VIEWER))).json()
-    assert body["repos"] == ["example-org/agent-harness"]
-    assert body["issues"][0]["repo"] == "example-org/agent-harness" and body["issues"][0]["comment_count"] == 1
+    assert body["repos"] == ["example-org/taskboy"]
+    assert body["issues"][0]["repo"] == "example-org/taskboy" and body["issues"][0]["comment_count"] == 1
 
 
 @pytest.mark.asyncio
 async def test_issue_comment_api_author_rules_threading_and_soft_delete(dashboard, store):
     client, _, _ = dashboard
-    issue = store.record_issue("a", "example-org/agent-harness", "s", "bug", "d", 50)
+    issue = store.record_issue("a", "example-org/taskboy", "s", "bug", "d", 50)
     viewer_headers = {**identity(VIEWER), "x-harness-dashboard": "1"}
     created = await client.post(f"/api/issues/{issue['id']}/comments", headers=viewer_headers, json={"body": "**question**"})
     assert created.status_code == 200
@@ -518,8 +518,8 @@ async def test_issue_comment_api_author_rules_threading_and_soft_delete(dashboar
 @pytest.mark.asyncio
 async def test_issue_priority_refine_and_bulk_endpoints(dashboard, store):
     client, _, _ = dashboard
-    editable = store.record_issue("editable", "example-org/agent-harness", "editable", "bug", "d", 50)
-    locked = store.record_issue("locked", "example-org/agent-harness", "locked", "bug", "d", 50)
+    editable = store.record_issue("editable", "example-org/taskboy", "editable", "bug", "d", 50)
+    locked = store.record_issue("locked", "example-org/taskboy", "locked", "bug", "d", 50)
     store.decide_issue(locked["id"], "approved", ADMIN)
     store.reserve_issues("coordinator", 1)
 
@@ -541,8 +541,8 @@ async def test_issue_priority_refine_and_bulk_endpoints(dashboard, store):
 @pytest.mark.asyncio
 async def test_delete_issue_endpoint_requires_admin_and_blocks_active_statuses(dashboard, store):
     client, _, _ = dashboard
-    deletable = store.record_issue("deletable", "example-org/agent-harness", "s", "bug", "d", 50)
-    active = store.record_issue("active", "example-org/agent-harness", "s", "bug", "d", 50)
+    deletable = store.record_issue("deletable", "example-org/taskboy", "s", "bug", "d", 50)
+    active = store.record_issue("active", "example-org/taskboy", "s", "bug", "d", 50)
     store.decide_issue(active["id"], "approved", ADMIN)
     [reserved] = store.reserve_issues("coordinator", 1)
     store.start_issue(reserved["id"], None, "spec")
@@ -564,7 +564,7 @@ async def test_delete_issue_endpoint_requires_admin_and_blocks_active_statuses(d
 @pytest.mark.asyncio
 async def test_issue_attachment_upload_download_limits_and_disabled(dashboard, store, monkeypatch):
     client, config, _ = dashboard
-    issue = store.record_issue("a", "example-org/agent-harness", "s", "bug", "d", 50)
+    issue = store.record_issue("a", "example-org/taskboy", "s", "bug", "d", 50)
     comment = store.add_issue_comment(issue["id"], VIEWER, "body")
     headers = {**identity(VIEWER), "x-harness-dashboard": "1"}
 
@@ -572,7 +572,7 @@ async def test_issue_attachment_upload_download_limits_and_disabled(dashboard, s
     assert disabled.status_code == 503
 
     config.raw["issues"]["uploads_bucket"] = "test-bucket"
-    put = patch("agent_harness.dashboard.api._put_object")
+    put = patch("taskboy.dashboard.api._put_object")
     with put as put_object:
         uploaded = await client.post(f"/api/issues/{issue['id']}/attachments", headers=headers, files={"file": ("../notes.txt", b"data", "text/plain")}, data={"comment_id": str(comment["id"])})
     assert uploaded.status_code == 200
@@ -581,11 +581,11 @@ async def test_issue_attachment_upload_download_limits_and_disabled(dashboard, s
     assert put_object.call_args.args[0] == "test-bucket" and put_object.call_args.args[1].endswith("/notes.txt")
 
     before = len(store.list_issue_attachments(issue["id"]))
-    with patch("agent_harness.dashboard.api._put_object", side_effect=RuntimeError("s3 down")):
+    with patch("taskboy.dashboard.api._put_object", side_effect=RuntimeError("s3 down")):
         failed = await client.post(f"/api/issues/{issue['id']}/attachments", headers=headers, files={"file": ("failed.txt", b"data", "text/plain")})
     assert failed.status_code == 502 and len(store.list_issue_attachments(issue["id"])) == before
 
-    monkeypatch.setattr("agent_harness.dashboard.api._presign", lambda bucket, key: "https://example.test/download")
+    monkeypatch.setattr("taskboy.dashboard.api._presign", lambda bucket, key: "https://example.test/download")
     download = await client.get(f"/api/issues/{issue['id']}/attachments/{attachment['id']}/download", headers=identity(VIEWER))
     assert download.status_code == 307 and download.headers["location"] == "https://example.test/download"
 
@@ -602,15 +602,15 @@ async def test_discovery_run_requires_approved_repo(dashboard):
 
 @pytest.mark.asyncio
 async def test_schedules_seeded_defaults_and_model_catalog(dashboard, store):
-    from agent_harness.scheduler import seed_default_schedules
+    from taskboy.scheduler import seed_default_schedules
 
-    seed_default_schedules(store, self_repo="example-org/agent-harness")
+    seed_default_schedules(store, self_repo="example-org/taskboy")
     client, _, _ = dashboard
     response = await client.get("/api/schedules", headers=identity(VIEWER))
     assert response.status_code == 200
     body = response.json()
     names = {s["request_text"] for s in body["schedules"]}
-    assert "/discoverissues example-org/agent-harness" in names and "/implementapprovedissues" in names
+    assert "/discoverissues example-org/taskboy" in names and "/implementapprovedissues" in names
     assert isinstance(body["models"], list)
 
 

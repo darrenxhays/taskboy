@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from agent_harness.config import ConfigError, Role
-from agent_harness.router import RoleRefusal, route, route_skill
+from taskboy.config import ConfigError, Role
+from taskboy.router import RoleRefusal, route, route_skill
 
 RAW = {
     "models": {
@@ -111,7 +111,7 @@ def test_fallback_cycles_terminate():
 
 
 def test_example_config_routes():
-    raw = yaml.safe_load((Path(__file__).parents[1] / "config" / "config.example.yaml").read_text())
+    raw = yaml.safe_load((Path(__file__).parents[1] / "taskboy" / "templates" / "config.example.yaml").read_text())
     trivial = route("question", "trivial", None, raw)
     complex_work = route("feature", "complex", None, raw)
     assert trivial.model_alias == "haiku"

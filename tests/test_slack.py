@@ -3,10 +3,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent_harness.config import Role, SlackConfig
-from agent_harness.debug_feed import DebugFeed
-from agent_harness.models import RECEIVED
-from agent_harness.slack import THREAD_CONTEXT_MAX_CHARS, SlackNotifier, authorization_failure, clean_text, extract_overrides, fetch_dm_transcript, fetch_thread_transcript, handle_dm, handle_mention, normalize_effort
+from taskboy.config import Role, SlackConfig
+from taskboy.debug_feed import DebugFeed
+from taskboy.models import RECEIVED
+from taskboy.slack import THREAD_CONTEXT_MAX_CHARS, SlackNotifier, authorization_failure, clean_text, extract_overrides, fetch_dm_transcript, fetch_thread_transcript, handle_dm, handle_mention, normalize_effort
 
 BOT = "UBOT"
 
@@ -153,7 +153,7 @@ async def test_known_skill_creates_task_and_skips_quick_answer(store, config, no
     path = tmp_path / "review"
     path.mkdir()
     (path / "SKILL.md").write_text("---\nname: review\ndescription: review it\n---\nbody\n")
-    monkeypatch.setattr("agent_harness.settings.SKILLS_ROOT", str(tmp_path))
+    monkeypatch.setattr("taskboy.settings.SKILLS_ROOT", str(tmp_path))
     quick = AsyncMock()
     task, status = await handle_mention(store, config, notifier, event(text="/review https://github.com/org/repo/pull/1"), "Ev1", BOT, quick=quick)
     assert status == "created"
@@ -167,7 +167,7 @@ async def test_unknown_skill_is_refused_with_available_list(store, config, notif
         path = tmp_path / name
         path.mkdir()
         (path / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {name}\n---\nbody\n")
-    monkeypatch.setattr("agent_harness.settings.SKILLS_ROOT", str(tmp_path))
+    monkeypatch.setattr("taskboy.settings.SKILLS_ROOT", str(tmp_path))
     task, status = await handle_mention(store, config, notifier, event(text="/nope args"), "Ev1", BOT)
     assert task is None
     assert status == "unknown_skill"
@@ -717,7 +717,7 @@ async def test_silent_github_completion_still_reaches_debug(store):
 
 @pytest.mark.asyncio
 async def test_mention_reply_answers_blocked_questions_and_resumes(store, config, notifier):
-    from agent_harness.models import BLOCKED, QUEUED, RUNNING
+    from taskboy.models import BLOCKED, QUEUED, RUNNING
 
     root, _ = await handle_mention(store, config, notifier, event(ts="100.1"), "Ev1", BOT)
     store.transition(root.task_id, RECEIVED, QUEUED, "classified")
@@ -738,8 +738,8 @@ async def test_mention_reply_answers_blocked_questions_and_resumes(store, config
 
 @pytest.mark.asyncio
 async def test_mention_reply_from_other_user_stays_a_follow_up_task(store, config, notifier):
-    from agent_harness.config import Role
-    from agent_harness.models import BLOCKED, QUEUED, RUNNING
+    from taskboy.config import Role
+    from taskboy.models import BLOCKED, QUEUED, RUNNING
 
     root, _ = await handle_mention(store, config, notifier, event(ts="100.1"), "Ev1", BOT)
     store.transition(root.task_id, RECEIVED, QUEUED, "classified")
@@ -755,8 +755,8 @@ async def test_mention_reply_from_other_user_stays_a_follow_up_task(store, confi
 
 @pytest.mark.asyncio
 async def test_plain_thread_reply_answers_only_blocked_questions(store, config, notifier):
-    from agent_harness.models import BLOCKED, QUEUED, RUNNING
-    from agent_harness.slack import handle_thread_reply
+    from taskboy.models import BLOCKED, QUEUED, RUNNING
+    from taskboy.slack import handle_thread_reply
 
     root, _ = await handle_mention(store, config, notifier, event(ts="100.1"), "Ev1", BOT)
     plain = {"text": "1. staging", "channel": "C1", "user": "U1", "ts": "100.2", "thread_ts": "100.1", "team": "T1"}

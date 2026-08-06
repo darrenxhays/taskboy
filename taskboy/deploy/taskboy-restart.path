@@ -1,0 +1,10 @@
+[Unit]
+Description=watch for taskboy cli auto-update restart requests
+
+[Path]
+# the sandboxed service (NoNewPrivileges=yes) can't restart itself; it touches this flag and we act on it
+PathExists=/run/taskboy/restart-requested
+Unit=taskboy-restart.service
+
+[Install]
+WantedBy=multi-user.target

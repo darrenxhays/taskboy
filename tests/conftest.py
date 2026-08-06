@@ -3,8 +3,8 @@ import itertools
 
 import pytest
 
-from agent_harness.config import Config, Role, SlackConfig
-from agent_harness.store import Store
+from taskboy.config import Config, Role, SlackConfig
+from taskboy.store import Store
 
 
 def make_config(**overrides) -> Config:
@@ -16,7 +16,7 @@ def make_config(**overrides) -> Config:
         runner="echo",
         slack=SlackConfig(team_id="T1", allowed_channels=["C1"]),
         roles={"admin": Role(name="admin", members=["U1"], allowed_profiles=["read_only", "standard", "deep"], model_override=True, max_budget_usd=None, repos=None)},
-        raw={"github": {"approved_repos": ["example-org/agent-harness"], "self_repo": "example-org/agent-harness"}, "issues": {"notify_channel": "", "uploads_bucket": ""}},
+        raw={"github": {"approved_repos": ["example-org/taskboy"], "self_repo": "example-org/taskboy"}, "issues": {"notify_channel": "", "uploads_bucket": ""}},
     )
     fields.update(overrides)
     return Config(**fields)

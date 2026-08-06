@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent_harness.adapters.confluence import ConfluenceAdapter
+from taskboy.adapters.confluence import ConfluenceAdapter
 
 
 @pytest.fixture

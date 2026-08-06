@@ -2,8 +2,8 @@ from unittest.mock import patch
 
 import pytest
 
-from agent_harness.models import BLOCKED, CANCELLED, COMPLETED, FAILED, QUEUED, RECEIVED, RUNNING
-from agent_harness.store import IllegalTransition, Store, TransitionRaced
+from taskboy.models import BLOCKED, CANCELLED, COMPLETED, FAILED, QUEUED, RECEIVED, RUNNING
+from taskboy.store import IllegalTransition, Store, TransitionRaced
 
 
 def test_create_task_is_idempotent_per_slack_message(store):
@@ -51,7 +51,7 @@ def test_task_schedule_name_persists(store):
         slack_thread_ts="schedule:1@abc",
         slack_message_ts="schedule:1@abc",
         slack_user_id="cli",
-        request_text="/discoverissues example-org/agent-harness",
+        request_text="/discoverissues example-org/taskboy",
         schedule_name="Discover issues (daily)",
     )
     assert created is True
@@ -152,7 +152,7 @@ def test_usage_and_meta(store, make_task):
 
 
 def test_rate_limit_windows_insert_and_upsert(store):
-    with patch("agent_harness.store.utcnow", side_effect=["2026-01-01T00:00:00+00:00", "2026-01-01T00:01:00+00:00", "2026-01-01T00:02:00+00:00"]):
+    with patch("taskboy.store.utcnow", side_effect=["2026-01-01T00:00:00+00:00", "2026-01-01T00:01:00+00:00", "2026-01-01T00:02:00+00:00"]):
         store.record_rate_limit("five_hour", "allowed", None, None)
         store.record_rate_limit("seven_day", "allowed_warning", 0.4, 200)
         store.record_rate_limit("five_hour", "rejected", 1.0, 100)
@@ -176,9 +176,9 @@ def test_next_queued_skips_task_gated_by_not_before(store, make_task):
     task = make_task()
     store.transition(task.task_id, RECEIVED, QUEUED, "classified")
     store.set_fields(task.task_id, not_before="2026-01-01T01:00:00+00:00")
-    with patch("agent_harness.store.utcnow", return_value="2026-01-01T00:00:00+00:00"):
+    with patch("taskboy.store.utcnow", return_value="2026-01-01T00:00:00+00:00"):
         assert store.next_queued() is None
-    with patch("agent_harness.store.utcnow", return_value="2026-01-01T02:00:00+00:00"):
+    with patch("taskboy.store.utcnow", return_value="2026-01-01T02:00:00+00:00"):
         queued = store.next_queued()
     assert queued is not None and queued.task_id == task.task_id
 
@@ -219,7 +219,7 @@ def test_latest_task_in_thread(store, make_task):
 
 
 def test_base_schema_creates_every_table_and_column(store):
-    from agent_harness.store import MIGRATIONS
+    from taskboy.store import MIGRATIONS
 
     assert store.meta_get("schema_version") == str(len(MIGRATIONS))
     store.record_intake_denial("T1", "C1", "U1", "not allowed")
@@ -233,7 +233,7 @@ def test_base_schema_creates_every_table_and_column(store):
 
 
 def test_appended_migrations_apply_to_existing_databases(tmp_path, monkeypatch):
-    import agent_harness.store as store_module
+    import taskboy.store as store_module
 
     path = str(tmp_path / "x.db")
     Store(path).close()  # base schema applied, version = len(MIGRATIONS)
@@ -252,28 +252,28 @@ def test_issues_table_accepts_implementation_queued_and_rejects_garbage_status(s
     now = "2026-01-01T00:00:00+00:00"
     store.conn.execute(
         "INSERT INTO issues (dedupe_key, repo, summary, issue_type, details, priority, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'implementation_queued', ?, ?)",
-        ("q", "example-org/agent-harness", "s", "t", "d", 50, now, now),
+        ("q", "example-org/taskboy", "s", "t", "d", 50, now, now),
     )
     store.conn.commit()
     assert store.conn.execute("SELECT status FROM issues WHERE dedupe_key = 'q'").fetchone()["status"] == "implementation_queued"
     with pytest.raises(sqlite3.IntegrityError):
         store.conn.execute(
             "INSERT INTO issues (dedupe_key, repo, summary, issue_type, details, priority, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'bogus', ?, ?)",
-            ("bad", "example-org/agent-harness", "s", "t", "d", 50, now, now),
+            ("bad", "example-org/taskboy", "s", "t", "d", 50, now, now),
         )
 
 
 def test_finish_issue_accepts_in_review_and_resolves_it(store, make_task):
     task = make_task()
-    row = store.record_issue("x", "example-org/agent-harness", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "spec")
 
-    in_review = store.finish_issue(row["id"], "in_review", "https://github.com/example-org/agent-harness/pull/9")
+    in_review = store.finish_issue(row["id"], "in_review", "https://github.com/example-org/taskboy/pull/9")
     assert in_review["status"] == "in_review" and in_review["pr_url"].endswith("/pull/9")
 
     # the sync process resolves an in_review row the same way spec2pr resolves an in_progress one
-    resolved = store.finish_issue(row["id"], "done", "https://github.com/example-org/agent-harness/pull/9")
+    resolved = store.finish_issue(row["id"], "done", "https://github.com/example-org/taskboy/pull/9")
     assert resolved["status"] == "done"
 
     with pytest.raises(ValueError):

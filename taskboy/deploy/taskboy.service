@@ -1,0 +1,22 @@
+[Unit]
+Description=taskboy orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=taskboy
+Group=taskboy
+WorkingDirectory=/opt/taskboy
+EnvironmentFile=/etc/taskboy/env
+ExecStart=/opt/taskboy/.venv/bin/python -m taskboy.main
+# restarts are safe by design: reconciliation requeues and resumes interrupted tasks
+Restart=on-failure
+RestartSec=5
+# invalid config exits 64: stop instead of crash-looping
+RestartPreventExitStatus=64
+TimeoutStopSec=90
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

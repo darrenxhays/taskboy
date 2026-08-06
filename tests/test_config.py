@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_harness.config import ConfigError, Role, load_config, role_for
+from taskboy.config import ConfigError, Role, load_config, role_for
 
 VALID = """
 orchestrator:
@@ -27,7 +27,7 @@ def test_valid_config_loads(tmp_path):
 
 
 def test_example_config_is_valid():
-    example = Path(__file__).parents[1] / "config" / "config.example.yaml"
+    example = Path(__file__).parents[1] / "taskboy" / "templates" / "config.example.yaml"
     config = load_config(str(example))
     assert config.max_concurrency >= 1
     assert "models" in config.raw
@@ -179,7 +179,7 @@ def test_role_for_prefers_explicit_membership_over_wildcard():
 def test_skills_section_validation(tmp_path, skills, match):
     import yaml
 
-    example = Path(__file__).parents[1] / "config" / "config.example.yaml"
+    example = Path(__file__).parents[1] / "taskboy" / "templates" / "config.example.yaml"
     raw = yaml.safe_load(example.read_text())
     raw["skills"] = skills
     path = tmp_path / "config.yaml"
@@ -191,7 +191,7 @@ def test_skills_section_validation(tmp_path, skills, match):
 def test_absent_skills_section_uses_defaults(tmp_path):
     import yaml
 
-    example = Path(__file__).parents[1] / "config" / "config.example.yaml"
+    example = Path(__file__).parents[1] / "taskboy" / "templates" / "config.example.yaml"
     raw = yaml.safe_load(example.read_text())
     raw.pop("skills")
     path = tmp_path / "config.yaml"

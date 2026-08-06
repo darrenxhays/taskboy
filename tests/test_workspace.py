@@ -1,5 +1,5 @@
-from agent_harness import workspace
-from agent_harness.models import COMPLETED, FAILED, QUEUED, RECEIVED, RUNNING
+from taskboy import workspace
+from taskboy.models import COMPLETED, FAILED, QUEUED, RECEIVED, RUNNING
 
 RETENTION = {"workspace_completed_days": 3, "workspace_failed_days": 7, "memory_days": 90, "slack_events_days": 7}
 

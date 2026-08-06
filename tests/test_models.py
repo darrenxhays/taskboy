@@ -1,4 +1,4 @@
-from agent_harness.models import ALLOWED_TRANSITIONS, RECEIVED, REFUSED, STATES, TERMINAL_STATES, new_task_id
+from taskboy.models import ALLOWED_TRANSITIONS, RECEIVED, REFUSED, STATES, TERMINAL_STATES, new_task_id
 
 
 def test_transitions_only_reference_known_states():

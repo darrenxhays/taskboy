@@ -12,7 +12,7 @@ import time
 import aiohttp
 import jwt
 
-from agent_harness.broker import PROFILE_PERMISSIONS
+from taskboy.broker import PROFILE_PERMISSIONS
 
 APP_ID = os.environ["GITHUB_APP_ID"]
 INSTALLATION_ID = os.environ["GITHUB_INSTALLATION_ID"]

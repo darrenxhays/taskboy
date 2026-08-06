@@ -2,12 +2,12 @@ import json
 import sys
 from types import SimpleNamespace
 
-from agent_harness.redact import redactor
-from agent_harness.secrets import Secrets, load_secrets
+from taskboy.redact import redactor
+from taskboy.secrets import Secrets, load_secrets
 
 
 def test_reviewer_github_secrets_load_from_environment_and_private_key_is_redacted(monkeypatch):
-    monkeypatch.setattr("agent_harness.settings.ENVIRONMENT", "local")
+    monkeypatch.setattr("taskboy.settings.ENVIRONMENT", "local")
     monkeypatch.setenv("REVIEWER_GITHUB_APP_ID", "123")
     monkeypatch.setenv("REVIEWER_GITHUB_INSTALLATION_ID", "456")
     monkeypatch.setenv("REVIEWER_GITHUB_APP_PRIVATE_KEY", "unique-blue-private-key-material")
@@ -25,7 +25,7 @@ def test_reviewer_github_enabled_requires_all_three_values():
 
 
 def test_reviewer_github_secrets_load_from_bundle(monkeypatch):
-    monkeypatch.setattr("agent_harness.settings.ENVIRONMENT", "staging")
+    monkeypatch.setattr("taskboy.settings.ENVIRONMENT", "staging")
     for name in ("SLACK_BOT_TOKEN", "GITHUB_APP_ID", "REVIEWER_GITHUB_APP_ID"):
         monkeypatch.delenv(name, raising=False)
     blob = {

@@ -11,7 +11,9 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: "dist",
+    // built straight into the python package so the wheel ships the dashboard
+    outDir: "../taskboy/ui_dist",
+    emptyOutDir: true,
     sourcemap: false,
   },
 });

@@ -3,8 +3,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent_harness.adapters.github_api import GitHubAdapter, GitHubStatusError, _text
-from agent_harness.models import QUEUED, RECEIVED
+from taskboy.adapters.github_api import GitHubAdapter, GitHubStatusError, _text
+from taskboy.models import QUEUED, RECEIVED
 
 APPROVED = ["org/service-a"]
 

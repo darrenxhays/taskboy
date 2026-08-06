@@ -2,8 +2,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent_harness import issue_runs
-from agent_harness.adapters.github_api import GitHubStatusError
+from taskboy import issue_runs
+from taskboy.adapters.github_api import GitHubStatusError
 
 
 class FakeBroker:
@@ -11,8 +11,8 @@ class FakeBroker:
         self.read_token = AsyncMock(return_value=("tok", 9999999999.0))
 
 
-def rec_in_review(store, make_task, key="x", pr_url="https://github.com/example-org/agent-harness/pull/9"):
-    row = store.record_issue(key, "example-org/agent-harness", "s", "organization", "d", 50)
+def rec_in_review(store, make_task, key="x", pr_url="https://github.com/example-org/taskboy/pull/9"):
+    row = store.record_issue(key, "example-org/taskboy", "s", "organization", "d", 50)
     task = make_task()
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "spec")
@@ -29,7 +29,7 @@ async def test_sync_in_review_merged_pr_marks_done(store, make_task, monkeypatch
 
     assert updated == 1
     assert store.get_issue(row["id"])["status"] == "done"
-    broker.read_token.assert_awaited_once_with(["example-org/agent-harness"], permissions={"pull_requests": "read", "metadata": "read"})
+    broker.read_token.assert_awaited_once_with(["example-org/taskboy"], permissions={"pull_requests": "read", "metadata": "read"})
 
 
 @pytest.mark.asyncio
@@ -82,13 +82,13 @@ async def test_sync_in_review_passes_unpacked_token_string_to_get_pr(store, make
     await issue_runs.sync_in_review(store, broker)
 
     assert store.get_issue(row["id"])["status"] == "done"
-    get_pr.assert_awaited_once_with("example-org/agent-harness", 9, "tok")
+    get_pr.assert_awaited_once_with("example-org/taskboy", 9, "tok")
 
 
 @pytest.mark.asyncio
 async def test_sync_in_review_reuses_token_for_same_repo(store, make_task, monkeypatch):
-    a = rec_in_review(store, make_task, key="a", pr_url="https://github.com/example-org/agent-harness/pull/1")
-    b = rec_in_review(store, make_task, key="b", pr_url="https://github.com/example-org/agent-harness/pull/2")
+    a = rec_in_review(store, make_task, key="a", pr_url="https://github.com/example-org/taskboy/pull/1")
+    b = rec_in_review(store, make_task, key="b", pr_url="https://github.com/example-org/taskboy/pull/2")
     broker = FakeBroker()
     monkeypatch.setattr(issue_runs, "_get_pr", AsyncMock(return_value={"merged": True, "state": "closed"}))
 
@@ -97,13 +97,13 @@ async def test_sync_in_review_reuses_token_for_same_repo(store, make_task, monke
     assert updated == 2
     assert store.get_issue(a["id"])["status"] == "done"
     assert store.get_issue(b["id"])["status"] == "done"
-    broker.read_token.assert_awaited_once_with(["example-org/agent-harness"], permissions={"pull_requests": "read", "metadata": "read"})
+    broker.read_token.assert_awaited_once_with(["example-org/taskboy"], permissions={"pull_requests": "read", "metadata": "read"})
 
 
 @pytest.mark.asyncio
 async def test_sync_in_review_one_row_error_does_not_abort_the_rest(store, make_task, monkeypatch):
-    broken = rec_in_review(store, make_task, key="broken", pr_url="https://github.com/example-org/agent-harness/pull/1")
-    healthy = rec_in_review(store, make_task, key="healthy", pr_url="https://github.com/example-org/agent-harness/pull/2")
+    broken = rec_in_review(store, make_task, key="broken", pr_url="https://github.com/example-org/taskboy/pull/1")
+    healthy = rec_in_review(store, make_task, key="healthy", pr_url="https://github.com/example-org/taskboy/pull/2")
     broker = FakeBroker()
 
     async def fake_get_pr(repo, number, token):

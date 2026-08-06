@@ -1,8 +1,8 @@
 import pytest
 
-from agent_harness.config import ReviewerConfig
-from agent_harness.dashboard.editors import EDITABLE_KINDS, EditorError, contains_secret_submission, target_for, validate
-from agent_harness.dashboard.render import redact_value
+from taskboy.config import ReviewerConfig
+from taskboy.dashboard.editors import EDITABLE_KINDS, EditorError, contains_secret_submission, target_for, validate
+from taskboy.dashboard.render import redact_value
 from tests.conftest import make_config
 
 CONFIG_WITH_TOKEN_LIMITS = """orchestrator: {max_concurrency: 1, queue_max: 5, max_retries: 1, progress_min_interval_seconds: 0, runner: echo}

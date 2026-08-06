@@ -1,6 +1,6 @@
 import pytest
 
-from agent_harness.mrkdwn import to_mrkdwn
+from taskboy.mrkdwn import to_mrkdwn
 
 
 @pytest.mark.parametrize(

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_harness import skills
+from taskboy import skills
 
 
 def write_skill(root: Path, name: str, body: str, requires: list[str] | None = None) -> None:
@@ -58,7 +58,7 @@ SAMPLE_TEMPLATE_VARIABLES = {
     "reviewer_name": "Critic",
     "github_org": "example-org",
     "repo_list": "`svc-a`, `svc-b`",
-    "self_repo": "example-org/agent-harness",
+    "self_repo": "example-org/taskboy",
     "pr_target_branch": "main",
     "jira_project": "ENG",
     "jira_site": "example.atlassian.net",
@@ -67,7 +67,7 @@ SAMPLE_TEMPLATE_VARIABLES = {
 
 
 def instantiate_all_templates(root: Path) -> list[str]:
-    templates = Path(__file__).parents[1] / "templates" / "skills"
+    templates = Path(__file__).parents[1] / "taskboy" / "templates" / "skills"
     names = sorted(child.name for child in templates.iterdir() if child.is_dir())
     for name in names:
         text = (templates / name / "SKILL.md").read_text()

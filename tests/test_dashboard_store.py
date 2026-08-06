@@ -3,8 +3,8 @@ from unittest.mock import patch
 
 import pytest
 
-from agent_harness.audit import ship_admin_once, verify_admin_chain
-from agent_harness.models import FAILED, QUEUED, RECEIVED
+from taskboy.audit import ship_admin_once, verify_admin_chain
+from taskboy.models import FAILED, QUEUED, RECEIVED
 
 
 def _iso(moment):
@@ -12,7 +12,7 @@ def _iso(moment):
 
 
 def test_admin_event_chain_verifies_and_detects_tampering(store):
-    store.add_admin_event("boss@example.com", "edit", "/etc/agent-harness/config.yaml", "success", {"new_hash": "abc"})
+    store.add_admin_event("boss@example.com", "edit", "/etc/taskboy/config.yaml", "success", {"new_hash": "abc"})
     store.add_admin_event("boss@example.com", "task_cancel", "t20260101-aaaaaaaa", "cancelled")
     intact, checked = verify_admin_chain(store)
     assert intact and checked == 2
@@ -83,7 +83,7 @@ def test_usage_windows_and_timeseries(store, make_task):
 async def test_ship_admin_once_uses_cursor(store):
     store.add_admin_event("boss@example.com", "edit", "config", "success")
     shipped = []
-    with patch("agent_harness.audit._put", side_effect=lambda bucket, key, body: shipped.append((bucket, key, body))):
+    with patch("taskboy.audit._put", side_effect=lambda bucket, key, body: shipped.append((bucket, key, body))):
         count = await ship_admin_once(store, "bucket")
         again = await ship_admin_once(store, "bucket")
     assert count == 1 and again == 0

@@ -1,5 +1,5 @@
-from agent_harness.models import COMPLETED, QUEUED, RECEIVED, RUNNING
-from agent_harness.redact import Redactor, redactor
+from taskboy.models import COMPLETED, QUEUED, RECEIVED, RUNNING
+from taskboy.redact import Redactor, redactor
 
 
 def test_known_token_families_are_redacted():

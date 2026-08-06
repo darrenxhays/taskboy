@@ -12,6 +12,7 @@ node_modules/
 config/config.yaml
 .env
 ui/dist/
+taskboy/ui_dist/
 *.tsbuildinfo
 .DS_Store
 x.*

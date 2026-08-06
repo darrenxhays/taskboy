@@ -5,12 +5,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent_harness import review_requests
-from agent_harness.adapters.github_api import GitHubStatusError
-from agent_harness.config import Role
-from agent_harness.main import should_start_review_poller
-from agent_harness.models import CANCELLED, RECEIVED
-from agent_harness.review_requests import DEBUG_PAGE_AFTER_CONSECUTIVE_FAILURES, ReviewRequestPoller
+from taskboy import review_requests
+from taskboy.adapters.github_api import GitHubStatusError
+from taskboy.config import Role
+from taskboy.main import should_start_review_poller
+from taskboy.models import CANCELLED, RECEIVED
+from taskboy.review_requests import DEBUG_PAGE_AFTER_CONSECUTIVE_FAILURES, ReviewRequestPoller
 
 
 def pull(sha="abc", reviewers=None, number=7, repo="org/a", author="human"):

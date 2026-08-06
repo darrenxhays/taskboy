@@ -1,7 +1,7 @@
 import pytest
 
-from agent_harness.models import BLOCKED, CANCELLED, COMPLETED, FAILED, QUEUED, RECEIVED, RUNNING
-from agent_harness.task_actions import cancel_task, decide_permission, retry_task
+from taskboy.models import BLOCKED, CANCELLED, COMPLETED, FAILED, QUEUED, RECEIVED, RUNNING
+from taskboy.task_actions import cancel_task, decide_permission, retry_task
 from tests.conftest import make_config
 
 
@@ -64,7 +64,7 @@ def test_cancel_running_task(store, make_task):
 
 
 def test_cancel_coordinator_releases_reserved_issues(store, make_task):
-    row = store.record_issue("cancelled-coordinator", "example-org/agent-harness", "summary", "organization", "details", 50)
+    row = store.record_issue("cancelled-coordinator", "example-org/taskboy", "summary", "organization", "details", 50)
     store.decide_issue(row["id"], "approved", "boss")
     task = make_task(text="/implementapprovedissues")
     store.reserve_issues(task.task_id, 1)

@@ -12,10 +12,10 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from agent_harness.adapters.github_api import GitHubStatusError
-from agent_harness.broker import PROFILE_PERMISSIONS, CredentialBroker
-from agent_harness.models import QUEUED, RECEIVED
-from agent_harness.redact import redactor
+from taskboy.adapters.github_api import GitHubStatusError
+from taskboy.broker import PROFILE_PERMISSIONS, CredentialBroker
+from taskboy.models import QUEUED, RECEIVED
+from taskboy.redact import redactor
 
 APPROVED = ["org/service-a", "org/service-b"]
 
@@ -36,7 +36,7 @@ def broker(rsa_key):
     # af_unix paths are capped at ~104 chars on macos; pytest's tmp_path is too deep
     socket_dir = tempfile.mkdtemp(prefix="ar-brk-")
     private_pem, _ = rsa_key
-    b = CredentialBroker("12345", "678", private_pem, str(Path(socket_dir) / "b.sock"), "/opt/agent-harness/bin/git-cred-helper")
+    b = CredentialBroker("12345", "678", private_pem, str(Path(socket_dir) / "b.sock"), "/opt/taskboy/bin/git-cred-helper")
     b._post_github = AsyncMock(return_value={"token": "ghs_mintedtoken000000000000000000000000", "expires_at": "2099-01-01T00:00:00Z"})
     yield b
     shutil.rmtree(socket_dir, ignore_errors=True)
@@ -53,7 +53,7 @@ def test_register_scopes_token_to_profile_and_targets(store, make_task, broker):
     grant = broker.grants[task.task_id]
     assert grant.permissions == PROFILE_PERMISSIONS["read_only"]
     assert grant.repositories == ["service-a"]
-    assert env["AGENT_HARNESS_TASK_NONCE"] == grant.nonce
+    assert env["TASKBOY_TASK_NONCE"] == grant.nonce
     assert env["GIT_CONFIG_KEY_0"] == "credential.helper"
     assert env["GIT_TERMINAL_PROMPT"] == "0"
 
@@ -150,21 +150,21 @@ async def test_socket_roundtrip_and_helper_script(store, make_task, broker, tmp_
     try:
         # raw socket round-trip
         reader, writer = await asyncio.open_unix_connection(broker.socket_path)
-        writer.write((json.dumps({"op": "git-credentials", "nonce": env["AGENT_HARNESS_TASK_NONCE"]}) + "\n").encode())
+        writer.write((json.dumps({"op": "git-credentials", "nonce": env["TASKBOY_TASK_NONCE"]}) + "\n").encode())
         await writer.drain()
         response = json.loads(await reader.readline())
         writer.close()
         assert response == {"username": "x-access-token", "password": "ghs_mintedtoken000000000000000000000000"}
 
         # the real credential helper script, exactly as git would invoke it
-        helper = Path(__file__).parents[1] / "deploy" / "git-cred-helper.py"
+        helper = Path(__file__).parents[1] / "taskboy" / "deploy" / "git-cred-helper.py"
         result = await asyncio.to_thread(
             subprocess.run,
             [sys.executable, str(helper), "get"],
             input="protocol=https\nhost=github.com\n\n",
             capture_output=True,
             text=True,
-            env={"AGENT_HARNESS_BROKER_SOCKET": broker.socket_path, "AGENT_HARNESS_TASK_NONCE": env["AGENT_HARNESS_TASK_NONCE"]},
+            env={"TASKBOY_BROKER_SOCKET": broker.socket_path, "TASKBOY_TASK_NONCE": env["TASKBOY_TASK_NONCE"]},
             timeout=10,
         )
         assert result.returncode == 0, result.stderr
@@ -178,7 +178,7 @@ async def test_socket_roundtrip_and_helper_script(store, make_task, broker, tmp_
             input="\n",
             capture_output=True,
             text=True,
-            env={"AGENT_HARNESS_BROKER_SOCKET": broker.socket_path, "AGENT_HARNESS_TASK_NONCE": "stolen-or-stale"},
+            env={"TASKBOY_BROKER_SOCKET": broker.socket_path, "TASKBOY_TASK_NONCE": "stolen-or-stale"},
             timeout=10,
         )
         assert bad.returncode == 1

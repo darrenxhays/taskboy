@@ -3,10 +3,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent_harness.classifier import FALLBACK_CLASSIFICATION, Classifier, extract_usage, parse_classification, validate_classification
-from agent_harness.config import ConfigError, Role
-from agent_harness.prompts import CLASSIFICATION_SCHEMA
-from agent_harness.router import RoleRefusal
+from taskboy.classifier import FALLBACK_CLASSIFICATION, Classifier, extract_usage, parse_classification, validate_classification
+from taskboy.config import ConfigError, Role
+from taskboy.prompts import CLASSIFICATION_SCHEMA
+from taskboy.router import RoleRefusal
 
 RAW = {
     "classifier": {"tier": "haiku"},
@@ -194,13 +194,13 @@ async def test_classifier_prompt_uses_thread_context_and_role_scoped_repos(store
 
 @pytest.mark.asyncio
 async def test_classifier_prompt_omits_self_repo_outside_role_scope(store, config, make_task):
-    config.raw = {**RAW, "github": {"approved_repos": ["org/a", "org/agent-harness"], "self_repo": "org/agent-harness"}}
+    config.raw = {**RAW, "github": {"approved_repos": ["org/a", "org/taskboy"], "self_repo": "org/taskboy"}}
     config.roles["admin"] = Role("admin", ["U1"], ["read_only"], True, None, ["org/a"])
     classifier = Classifier(store, config)
     classifier._call_model = AsyncMock(return_value=(dict(CLASSIFICATION), None))
     await classifier.classify(make_task())
     prompt = classifier._call_model.call_args.args[0]
-    assert "org/agent-harness" not in prompt
+    assert "org/taskboy" not in prompt
     assert "own source code" not in prompt
 
 
@@ -210,7 +210,7 @@ async def test_skill_classifies_without_model_call_and_routes_from_skill_config(
     path = tmp_path / "review"
     path.mkdir()
     (path / "SKILL.md").write_text("---\nname: review\ndescription: review\n---\nbody\n")
-    monkeypatch.setattr("agent_harness.settings.SKILLS_ROOT", str(tmp_path))
+    monkeypatch.setattr("taskboy.settings.SKILLS_ROOT", str(tmp_path))
     config.raw = {**RAW, "github": {"approved_repos": ["org/core", "org/risk-nextgen", "org/other"]}}
     config.reviewer.enabled = reviewer_enabled
     classifier = Classifier(store, config)
@@ -278,7 +278,7 @@ async def test_blue_persona_is_not_stamped_when_disabled_or_not_a_review(store, 
 
 @pytest.mark.asyncio
 async def test_unknown_skill_falls_through_to_model_classifier(store, config, make_task, tmp_path, monkeypatch):
-    monkeypatch.setattr("agent_harness.settings.SKILLS_ROOT", str(tmp_path))
+    monkeypatch.setattr("taskboy.settings.SKILLS_ROOT", str(tmp_path))
     classifier = make_classifier(store, config)
     classifier._call_model = AsyncMock(return_value=(dict(CLASSIFICATION), None))
     await classifier.classify(make_task("/unknown args"))
@@ -304,8 +304,8 @@ async def test_preclassified_task_routes_and_audits_without_model_call(store, co
 @pytest.mark.parametrize(
     "text",
     [
-        "address all PR comments on your PRs in the agent-harness repo",
-        "Check all of your PRs in the agent-harness repo, address review comments",
+        "address all PR comments on your PRs in the taskboy repo",
+        "Check all of your PRs in the taskboy repo, address review comments",
         "address the review comments on https://github.com/org/repo/pull/6",
         "review comments on PR #5, please resolve them",
     ],
@@ -334,7 +334,7 @@ async def test_address_review_comments_guard_audits_stored_triage_path(store, co
     classifier = make_classifier(store, config)
     review = {**CLASSIFICATION, "task_type": "pr_review", "complexity": "standard"}
     classifier._call_model = AsyncMock(side_effect=AssertionError("model should not run"))
-    task = make_task("address all PR comments on your PRs in the agent-harness repo", pre_classification=review)
+    task = make_task("address all PR comments on your PRs in the taskboy repo", pre_classification=review)
 
     fields = await classifier.classify(task)
 
@@ -406,7 +406,7 @@ async def test_skill_classification_never_sets_an_effort(store, config, make_tas
     path = tmp_path / "review"
     path.mkdir()
     (path / "SKILL.md").write_text("---\nname: review\ndescription: review\n---\nbody\n")
-    monkeypatch.setattr("agent_harness.settings.SKILLS_ROOT", str(tmp_path))
+    monkeypatch.setattr("taskboy.settings.SKILLS_ROOT", str(tmp_path))
     config.raw = {**RAW, "github": {"approved_repos": ["org/core"]}}
     classifier = Classifier(store, config)
     classifier._call_model = AsyncMock(side_effect=AssertionError("model should not run"))

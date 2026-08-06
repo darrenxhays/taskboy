@@ -4,8 +4,8 @@ from unittest.mock import patch
 
 import pytest
 
-from agent_harness.personality import load
-from agent_harness.started_messages import pick, validate_content
+from taskboy.personality import load
+from taskboy.started_messages import pick, validate_content
 
 
 def test_personality_loads_fresh_and_hashes_file_content(tmp_path):
@@ -20,8 +20,8 @@ def test_personality_loads_fresh_and_hashes_file_content(tmp_path):
 
 
 def test_started_messages_loads_shipped_pools_and_falls_back(tmp_path):
-    shipped = Path(__file__).parents[1] / "config" / "task_started_messages.yaml"
-    with patch("agent_harness.started_messages.random.choice", side_effect=lambda values: values[0]):
+    shipped = Path(__file__).parents[1] / "taskboy" / "templates" / "task_started_messages.yaml"
+    with patch("taskboy.started_messages.random.choice", side_effect=lambda values: values[0]):
         assert pick(str(shipped), "agent") == "On it. Starting now."
         assert pick(str(shipped), "reviewer") == "{reviewer_name} is starting a PR review."
     bad = tmp_path / "bad.yaml"

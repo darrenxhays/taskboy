@@ -2,8 +2,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agent_harness.adapters.jira import JiraAdapter, _adf, _adf_to_text
-from agent_harness.models import QUEUED, RECEIVED
+from taskboy.adapters.jira import JiraAdapter, _adf, _adf_to_text
+from taskboy.models import QUEUED, RECEIVED
 
 SITE = "https://example.atlassian.net"
 
@@ -23,7 +23,7 @@ async def test_create_issue_labels_footer_and_artifact(adapter, store):
     result = await adapter.create_issue({"project": "RISK", "issue_type": "Story", "summary": "Add retry logic", "description": "Retry the poller"})
     assert "RISK-101" in result["content"][0]["text"]
     payload = adapter._request.call_args.args[2]
-    assert payload["fields"]["labels"] == ["agent-harness", f"agent-task-{adapter.task.task_id}"]  # JIR-008
+    assert payload["fields"]["labels"] == ["taskboy", f"agent-task-{adapter.task.task_id}"]  # JIR-008
     assert adapter.task.task_id in _adf_to_text(payload["fields"]["description"])  # task footer
     assert "Created by Agent" in _adf_to_text(payload["fields"]["description"])
     artifacts = store.artifacts_for(adapter.task.task_id)
@@ -102,7 +102,7 @@ def test_adf_roundtrip():
 
 @pytest.mark.asyncio
 async def test_get_issue_output_is_trimmed(adapter):
-    adapter._request.side_effect = [{"key": "RISK-9", "fields": {"summary": "s", "status": {"name": "To Do"}, "issuetype": {"name": "Bug"}, "assignee": None, "labels": ["agent-harness"], "priority": {"name": "High"}, "description": _adf("body " * 2000)}}]
+    adapter._request.side_effect = [{"key": "RISK-9", "fields": {"summary": "s", "status": {"name": "To Do"}, "issuetype": {"name": "Bug"}, "assignee": None, "labels": ["taskboy"], "priority": {"name": "High"}, "description": _adf("body " * 2000)}}]
     result = await adapter.get_issue({"key": "risk-9"})
     text = result["content"][0]["text"]
     assert len(text) <= 4000
