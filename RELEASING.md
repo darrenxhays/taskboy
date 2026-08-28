@@ -18,7 +18,7 @@ Operators never install from this repo directly. They pin `taskboy==X.Y.Z` in a 
 
 ### 1.1 Push the application repository
 
-This checkout already has a remote: `https://github.com/darrenxhays/agent-harness.git`. If that's the repo you want to publish from, just push:
+This checkout already has a remote: `https://github.com/darrenxhays/taskboy.git`. If that's the repo you want to publish from, just push:
 
 ```bash
 cd taskboy            # this repository
@@ -72,7 +72,7 @@ The name `taskboy` is currently **unclaimed on PyPI**, so use the *pending publi
    |---|---|
    | PyPI project name | `taskboy` |
    | Owner | `darrenxhays` *(or the owner you chose in 1.1)* |
-   | Repository name | `agent-harness` *(or the repo you chose in 1.1)* |
+   | Repository name | `taskboy` *(or the repo you chose in 1.1)* |
    | Workflow name | `release.yaml` |
    | Environment name | *(leave blank — the workflow doesn't use one)* |
 
