@@ -13,7 +13,9 @@ as `set (…last4)`.
 
 import getpass
 import json
+import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,6 +24,8 @@ from taskboy.config import KNOWN_SERVICES, ConfigError, load_config, service_ena
 
 CONFIG_PATH = Path(settings.CONFIG_PATH)
 ENV_PATH = Path(".env")
+# the official deployment-template repo; the prompt default, editable to point at your own fork
+SHELL_TEMPLATE_URL = "https://github.com/darrenxhays/taskboy-shell"
 # packaged seed material; module-level so tests can monkeypatch
 TEMPLATES_ROOT = assets.TEMPLATES_ROOT
 EXAMPLE_PATH = TEMPLATES_ROOT / "config.example.yaml"
@@ -116,6 +120,89 @@ def service_config_path(name: str) -> Path:
     return CONFIG_PATH.parent / "services" / f"{name}.yaml"
 
 
+def scaffold_shell(target: Path, template_url: str) -> None:
+    """clone the shell template into `target` with fresh history — the cli equivalent of github's "use this template"."""
+    if shutil.which("git") is None:
+        raise RuntimeError("git is required to scaffold the shell template — install it and re-run")
+    if target.exists() and any(target.iterdir()):
+        raise RuntimeError(f"{target} already exists and is not empty")
+    clone = subprocess.run(["git", "clone", "--depth", "1", template_url, str(target)], capture_output=True, text=True)
+    if clone.returncode != 0:
+        raise RuntimeError(f"clone of {template_url} failed: {clone.stderr.strip()[:300]}")
+    shutil.rmtree(target / ".git")  # the template's history is not yours
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=target, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=target, check=True)
+    commit = subprocess.run(["git", "commit", "-q", "-m", f"scaffold from {template_url}"], cwd=target, capture_output=True, text=True)
+    if commit.returncode != 0:
+        # no git identity configured is the usual cause; the checkout is still complete and staged
+        say(f"  [--] initial commit skipped ({commit.stderr.strip().splitlines()[-1] if commit.stderr.strip() else 'git commit failed'}) — commit manually once git is configured")
+
+
+# operator-editable content templates, seeded with their final names so manual setup never copies files by hand
+CONTENT_SEEDS = [
+    ("conventions.md", "conventions.md", False),  # the fill-in guidance comments are the content — keep them
+    ("personality_agent.example.md", "personality_agent.md", True),
+    ("personality_reviewer.example.md", "personality_reviewer.md", True),
+    ("help.example.md", "help.md", True),
+]
+
+
+def _strip_instruction_header(text: str) -> str:
+    """drop the leading `#`-comment block the .example templates carry — it addresses template readers, not end users."""
+    lines = text.splitlines()
+    while lines and (lines[0].startswith("#") or not lines[0].strip()):
+        lines.pop(0)
+    return "\n".join(lines) + "\n"
+
+
+def seed_content_files() -> None:
+    """put every content template in place next to config.yaml; existing files are never touched."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    for source, destination, strip_header in CONTENT_SEEDS:
+        target = CONFIG_PATH.parent / destination
+        if target.exists():
+            continue
+        text = (TEMPLATES_ROOT / source).read_text()
+        target.write_text(_strip_instruction_header(text) if strip_header else text)
+
+
+def maybe_scaffold_shell() -> bool:
+    """fresh directory: offer to create the deployment (shell) checkout from the template and continue inside it.
+    returns False when the user chose manual setup — the guided wizard should not run."""
+    if CONFIG_PATH.exists() or CONFIG_PATH.parent.is_dir():
+        return True  # already inside a shell/instance directory
+    say("\n== Deployment directory ==")
+    say("this directory has no config/ yet. a deployment normally lives in its own 'shell' checkout —")
+    say("your config, skills, .env, and reference infrastructure — created from the taskboy-shell template.")
+    if not ask_yes("Create one from the shell template now?", default=True):
+        say("  continuing here — config/ will be created in the current directory")
+        return True
+    while True:
+        target = Path(ask("Directory to create", "my-agent")).expanduser()
+        if not target.exists() or not any(target.iterdir()):
+            break
+        say(f"  [!!] {target} already exists and is not empty — choose another directory")
+    url = ask("Template repository URL", SHELL_TEMPLATE_URL)
+    scaffold_shell(target, url)
+    os.chdir(target)
+    seed_content_files()
+    say(f"  created {target.resolve()} from {url}")
+    say("  config/ ships in the template; personalities, conventions, and help.md were seeded from the packaged templates")
+    say("  when you're ready to deploy, create a private GitHub repo and push this directory (see SETUP.md)")
+    if ask_yes("Walk through guided setup now? (choose no to edit the config files yourself)", default=True):
+        return True
+    say("")
+    say("manual setup — everything is already in place; edit the files directly:")
+    say("  config/config.yaml + config/services/<name>.yaml    operator policy, fully commented")
+    say("  config/personality_agent.md, conventions.md, help.md    content files (enable each via its config key)")
+    say("  .env                                                create it for secrets (the exact shape is in MANUAL_SETUP.md)")
+    say(f"  the key-by-key walkthrough: {(target / 'MANUAL_SETUP.md').resolve()}")
+    say("helpers that work with a hand-edited config:")
+    say("  taskboy setup --step skills     interactive skills picker (fills in template variables from your config)")
+    say("  taskboy setup --check           validate config + reachable credentials (exit 64 on config errors)")
+    return False
+
+
 def seed_config() -> None:
     """fresh instance directory: create the config dir and seed it from the packaged example."""
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -129,7 +216,8 @@ def seed_config() -> None:
     messages = CONFIG_PATH.parent / "task_started_messages.yaml"
     if not messages.exists():
         shutil.copyfile(TEMPLATES_ROOT / "task_started_messages.yaml", messages)
-    say(f"created {CONFIG_PATH} and {services_dir}/ from the packaged templates")
+    seed_content_files()
+    say(f"created {CONFIG_PATH}, {services_dir}/, and the content templates (personalities, conventions, help)")
 
 
 def load_config_data() -> dict:
@@ -453,13 +541,14 @@ def step_content(data, env) -> None:
     if ask_yes("Set up a curated /help reply? (answered instantly in Slack, no task created)", default=bool(help_section.get("file"))):
         target = CONFIG_PATH.parent / "help.md"
         if not target.exists():
-            content = (TEMPLATES_ROOT / "help.example.md").read_text()
-            # drop the instruction-comment header; it's for readers of the template, not slack users
-            content = "\n".join(line for line in content.splitlines() if not line.startswith("#")).lstrip("\n") + "\n"
+            seed_content_files()
+        # the seeded file keeps the template placeholders so this step can fill them from the config answers
+        content = target.read_text()
+        if "{{agent_name}}" in content or "{{dashboard_url}}" in content:
             content = content.replace("{{agent_name}}", str((data.get("agent") or {}).get("name") or "Agent"))
             content = content.replace("Dashboard: {{dashboard_url}}\n\n", f"Dashboard: {data['dashboard']['public_url']}\n\n" if (data.get("dashboard") or {}).get("public_url") else "")
             target.write_text(content)
-            say(f"  created {target} from the template — trim it to the skills you actually installed.")
+            say(f"  filled in the agent name and dashboard url in {target} — trim it to the skills you actually installed.")
         help_section["file"] = ask("Help file (relative to config.yaml)", str(help_section.get("file") or "help.md"))
 
 
@@ -661,6 +750,16 @@ def run(args) -> int:
 
     say("taskboy setup — answers are written to config/config.yaml, config/services/*.yaml, and .env")
     say("after every step, so you can quit (ctrl-c) and re-run anytime; existing values show as defaults.")
+    if not args.step:  # a targeted --step re-run assumes an existing checkout
+        try:
+            if not maybe_scaffold_shell():
+                return 0  # the user chose manual setup — the scaffold message points at MANUAL_SETUP.md
+        except KeyboardInterrupt:
+            say("\ninterrupted — nothing written; re-run `taskboy setup` to start over")
+            return 130
+        except RuntimeError as e:
+            say(f"  [!!] {e}")
+            return 1
     data = load_config_data()
     env = read_env()
     steps = STEPS if not args.step else [(name, fn) for name, fn in STEPS if name == args.step]

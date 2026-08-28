@@ -1,6 +1,8 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from taskboy import setup_checks, setup_wizard
 from taskboy.config import load_config
 
@@ -174,3 +176,114 @@ def test_service_sections_split_into_service_files(tmp_path, monkeypatch):
     assert merged["slack"]["team_id"] == "T123"  # later steps still see the merged view
     config = load_config(str(config_path))
     assert config.slack.enabled is True and config.services["github"] is False
+
+
+def test_scaffold_shell_clones_with_fresh_history(tmp_path, monkeypatch):
+    target = tmp_path / "my-agent"
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ["git", "clone"]:
+            (target / ".git").mkdir(parents=True)
+            (target / "SETUP.md").write_text("runbook")
+        return MagicMock(returncode=0, stderr="")
+
+    monkeypatch.setattr(setup_wizard.subprocess, "run", fake_run)
+    setup_wizard.scaffold_shell(target, "https://example.com/shell-template.git")
+
+    assert calls[0] == ["git", "clone", "--depth", "1", "https://example.com/shell-template.git", str(target)]
+    assert not (target / ".git").exists() or ["git", "init", "-q", "-b", "main"] in calls  # template history stripped before re-init
+    assert ["git", "init", "-q", "-b", "main"] in calls
+    assert ["git", "add", "-A"] in calls
+    assert any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert (target / "SETUP.md").read_text() == "runbook"
+
+
+def test_scaffold_shell_refuses_a_nonempty_target(tmp_path):
+    target = tmp_path / "taken"
+    target.mkdir()
+    (target / "keep.txt").write_text("x")
+    with pytest.raises(RuntimeError, match="not empty"):
+        setup_wizard.scaffold_shell(target, "https://example.com/shell-template.git")
+
+
+def test_maybe_scaffold_skips_inside_an_existing_instance_dir(tmp_path, monkeypatch):
+    _wizard_paths(monkeypatch, tmp_path)  # creates config/ — the marker of an existing checkout
+    asker = MagicMock()
+    monkeypatch.setattr(setup_wizard, "ask_yes", asker)
+    assert setup_wizard.maybe_scaffold_shell() is True
+    asker.assert_not_called()
+
+
+def test_maybe_scaffold_creates_target_seeds_content_and_continues_inside_it(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(setup_wizard, "CONFIG_PATH", Path("config/config.yaml"))  # relative + absent: fresh directory
+    target = tmp_path / "agent-dir"
+    scaffolded = MagicMock(side_effect=lambda t, url: t.mkdir())
+    monkeypatch.setattr(setup_wizard, "scaffold_shell", scaffolded)
+    monkeypatch.setattr(setup_wizard, "ask_yes", MagicMock(return_value=True))  # scaffold: yes, guided setup: yes
+    monkeypatch.setattr(setup_wizard, "ask", MagicMock(side_effect=[str(target), "https://example.com/tmpl.git"]))
+
+    assert setup_wizard.maybe_scaffold_shell() is True
+
+    scaffolded.assert_called_once_with(target, "https://example.com/tmpl.git")
+    assert Path.cwd() == target  # the rest of the wizard writes config/.env inside the new checkout
+    # every content template landed with its final name — nothing left to copy by hand
+    for name in ("personality_agent.md", "personality_reviewer.md", "help.md", "conventions.md"):
+        assert (target / "config" / name).is_file()
+    assert not (target / "config" / "personality_agent.md").read_text().startswith("#")  # instruction header stripped
+    assert "{{agent_name}}" in (target / "config" / "help.md").read_text()  # placeholders stay for the wizard/manual edit
+
+
+def test_maybe_scaffold_manual_choice_points_at_manual_setup_and_stops(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(setup_wizard, "CONFIG_PATH", Path("config/config.yaml"))
+    target = tmp_path / "agent-dir"
+    monkeypatch.setattr(setup_wizard, "scaffold_shell", MagicMock(side_effect=lambda t, url: t.mkdir()))
+    monkeypatch.setattr(setup_wizard, "ask_yes", MagicMock(side_effect=[True, False]))  # scaffold: yes, guided setup: no
+    monkeypatch.setattr(setup_wizard, "ask", MagicMock(side_effect=[str(target), "https://example.com/tmpl.git"]))
+
+    assert setup_wizard.maybe_scaffold_shell() is False
+
+    output = capsys.readouterr().out
+    assert "MANUAL_SETUP.md" in output
+    assert "taskboy setup --check" in output
+    assert (target / "config" / "help.md").is_file()  # manual users still get every content file seeded
+
+
+def test_maybe_scaffold_declined_stays_in_the_current_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(setup_wizard, "CONFIG_PATH", Path("config/config.yaml"))
+    scaffolded = MagicMock()
+    monkeypatch.setattr(setup_wizard, "scaffold_shell", scaffolded)
+    monkeypatch.setattr(setup_wizard, "ask_yes", MagicMock(return_value=False))
+
+    assert setup_wizard.maybe_scaffold_shell() is True  # the wizard continues, just in this directory
+
+    scaffolded.assert_not_called()
+    assert Path.cwd() == tmp_path
+
+
+def test_seed_content_files_never_overwrites_operator_edits(tmp_path, monkeypatch):
+    monkeypatch.setattr(setup_wizard, "CONFIG_PATH", tmp_path / "config" / "config.yaml")
+    setup_wizard.seed_content_files()
+    (tmp_path / "config" / "conventions.md").write_text("my house rules")
+    setup_wizard.seed_content_files()
+    assert (tmp_path / "config" / "conventions.md").read_text() == "my house rules"
+
+
+def test_content_step_fills_help_placeholders_in_the_seeded_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(setup_wizard, "CONFIG_PATH", tmp_path / "config" / "config.yaml")
+    setup_wizard.seed_content_files()
+    data = {"agent": {"name": "Scout"}, "dashboard": {"public_url": "https://dash.example.com"}, "reviewer": {}}
+    # conventions: no, personality: no, help: yes
+    monkeypatch.setattr(setup_wizard, "ask_yes", MagicMock(side_effect=[False, False, True]))
+    monkeypatch.setattr(setup_wizard, "ask", MagicMock(return_value="help.md"))
+
+    setup_wizard.step_content(data, {})
+
+    content = (tmp_path / "config" / "help.md").read_text()
+    assert "{{agent_name}}" not in content and "{{dashboard_url}}" not in content
+    assert "@Scout" in content and "https://dash.example.com" in content
+    assert data["help"]["file"] == "help.md"
