@@ -28,6 +28,7 @@ logger = logging.getLogger("taskboy.slack")
 
 THREAD_CONTEXT_MAX_MESSAGES = 30
 THREAD_CONTEXT_MAX_CHARS = 6000
+THREAD_CONTEXT_BOT_MESSAGE_MAX_CHARS = 500
 SNIPPET_THRESHOLD = 3500
 
 
@@ -82,7 +83,7 @@ def extract_overrides(text: str, model_aliases: list[str]) -> tuple[str | None, 
     return model, effort, (text[: match.start()] + text[match.end() :]).strip()
 
 
-async def fetch_thread_transcript(client, channel_id: str, thread_ts: str, exclude_ts: str, store: Store | None = None, debug=None, bot_user_id: str | None = None) -> str | None:
+async def fetch_thread_transcript(client, channel_id: str, thread_ts: str, exclude_ts: str, store: Store | None = None, debug=None, bot_user_id: str | None = None, bot_name: str = "Agent") -> str | None:
     messages: list[dict] = []
     cursor = None
     for _ in range(5):
@@ -108,9 +109,13 @@ async def fetch_thread_transcript(client, channel_id: str, thread_ts: str, exclu
     lines = []
     for message in messages:
         text = str(message.get("text") or "").strip()
-        if message.get("ts") == exclude_ts or (bot_user_id and message.get("user") == bot_user_id) or not text:
+        if message.get("ts") == exclude_ts or not text:
             continue
-        lines.append(f"<@{message.get('user', '')}>: {text}")
+        user = str(message.get("user") or "")
+        if user == bot_user_id:
+            lines.append(f"{bot_name}: {text[:THREAD_CONTEXT_BOT_MESSAGE_MAX_CHARS]}")
+        else:
+            lines.append(f"<@{user}>: {text}")
     transcript = "\n".join(lines[-THREAD_CONTEXT_MAX_MESSAGES:])
     if len(transcript) > THREAD_CONTEXT_MAX_CHARS:
         marker = "(earlier messages omitted)\n"
@@ -245,7 +250,7 @@ async def handle_mention(store: Store, config: Config, notifier, event: dict, ev
             await notifier.answer(channel_id, thread_ts, "I recorded your answers, but that task is no longer waiting on them.")
             return parent, "answer_raced"
         # no_pending_questions: the round was answered out from under us — treat as a normal follow-up
-    thread_context = await fetch_thread_transcript(client, channel_id, thread_ts, message_ts, store, debug, bot_user_id) if thread_ts != message_ts and client is not None else None
+    thread_context = await fetch_thread_transcript(client, channel_id, thread_ts, message_ts, store, debug, bot_user_id, config.agent_name) if thread_ts != message_ts and client is not None else None
     quick_attempted = quick is not None and override is None and effort is None and invocation is None
     pre_classification = None
     triage_usage = None
@@ -295,8 +300,8 @@ async def handle_mention(store: Store, config: Config, notifier, event: dict, ev
         store.add_usage(task.task_id, "triage", quick.model_id, **triage_usage)
     if quick_attempted and task is not None and status != "duplicate":
         store.add_event(task.task_id, "quick_escalated", {"escalated": True})
-    if status == "paused":
-        reason = "intake is paused right now — try again soon"
+    if status in ("paused", "queue_full"):
+        reason = "intake is paused right now — try again soon" if status == "paused" else "the task queue is full — try again later"
         if debug is not None:
             await debug.intake_refusal(debug_thread_ts, reason)
         await notifier.refuse_intake(channel_id, thread_ts, reason)
@@ -341,7 +346,7 @@ async def handle_dm(store: Store, config: Config, notifier, event: dict, event_i
 class SlackNotifier:
     """posts lifecycle updates to the originating thread (SLK-005/006/007). all outbound text is redacted."""
 
-    def __init__(self, client, progress_min_interval_seconds: int = 60, ack_reaction: bool = True, debug=None, task_started_messages_path: str | None = None, store: Store | None = None, reviewer_name: str = "Reviewer"):
+    def __init__(self, client, progress_min_interval_seconds: int = 60, ack_reaction: bool = True, debug=None, task_started_messages_path: str | None = None, store: Store | None = None, reviewer_name: str = "Reviewer", dashboard_url: str = ""):
         self.client = client
         self.progress_min_interval_seconds = progress_min_interval_seconds
         self.ack_reaction = ack_reaction
@@ -350,6 +355,7 @@ class SlackNotifier:
         self.task_started_messages_path = task_started_messages_path
         self.store = store
         self.reviewer_name = reviewer_name
+        self.dashboard_url = dashboard_url.rstrip("/")
 
     def _record_error(self, operation: str, error: Exception, task_id: str | None = None) -> None:
         if self.store is not None:
@@ -493,6 +499,19 @@ class SlackNotifier:
             return  # debug feed already threads this into the debug channel; skip the duplicate top-level post
         await self._post(task, f"*Blocked*\n{task.blocked_reason or ''}\nReply in this thread to continue.")
 
+    async def issue_blocked(self, task: Task, issue: dict) -> None:
+        """this task is cancelled and its issue reopened as `proposed` (#76); points at the issue instead of the now-inert thread reply."""
+        self._last_progress.pop(task.task_id, None)
+        if self.debug is not None:
+            await self.debug.blocked(task)
+        if task.schedule_name:
+            return  # debug feed already threads this into the debug channel; skip the duplicate top-level post
+        reason = task.blocked_reason or "the task could not continue"
+        text = f"*Blocked* — reopened issue #{issue['id']} as `proposed` so you can pick up where this left off.\n{reason}"
+        if self.dashboard_url:
+            text += f"\n{self.dashboard_url}/issues?issue={issue['id']}"
+        await self._post(task, text)
+
     async def questions(self, task: Task, questions: str) -> None:
         self._last_progress.pop(task.task_id, None)
         if self.debug is not None:
@@ -542,7 +561,7 @@ async def build(store: Store, config: Config, bot_token: str) -> tuple[AsyncApp,
     from taskboy.debug_feed import DebugFeed
 
     debug = DebugFeed(app.client, store, config.slack.debug_channel, dashboard_url=config.dashboard.public_url) if config.slack.debug_channel else None
-    notifier = SlackNotifier(app.client, config.progress_min_interval_seconds, config.slack.ack_reaction, debug=debug, task_started_messages_path=config.slack.task_started_messages_path, store=store, reviewer_name=config.reviewer.name)
+    notifier = SlackNotifier(app.client, config.progress_min_interval_seconds, config.slack.ack_reaction, debug=debug, task_started_messages_path=config.slack.task_started_messages_path, store=store, reviewer_name=config.reviewer.name, dashboard_url=config.dashboard.public_url)
     quick = None
     if (config.raw.get("quick_answer") or {}).get("enabled"):
         from taskboy.quick import QuickAnswer

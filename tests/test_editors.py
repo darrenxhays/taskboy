@@ -74,3 +74,36 @@ def test_conventions_missing_path_is_not_a_target():
     config = make_config()
     with pytest.raises(EditorError):
         target_for(config, "conventions", None)
+
+
+# -- per-service config files are editable -----------------------------------
+
+
+def test_service_config_is_editable(tmp_path, monkeypatch):
+    from taskboy import settings
+    from taskboy.config import ConfigError
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("orchestrator: {max_concurrency: 1, queue_max: 5, max_retries: 1, progress_min_interval_seconds: 0, runner: echo}\n")
+    services = tmp_path / "services"
+    services.mkdir()
+    (services / "sentry.yaml").write_text("enabled: false\norganization: ''\nprojects: []\n")
+    monkeypatch.setattr(settings, "CONFIG_PATH", str(config_path))
+    config = make_config()
+
+    assert "service" in EDITABLE_KINDS
+    target, repo_path, title = target_for(config, "service", "sentry")
+    assert target == services / "sentry.yaml" and repo_path == "config/services/sentry.yaml" and title == "sentry service"
+
+    validate("service", "sentry", "enabled: true\norganization: org\nprojects: []\n", target)  # valid in merged context
+    with pytest.raises(ConfigError):
+        validate("service", "sentry", "enabled: true\n", target)  # enabled without organization fails the loader
+    with pytest.raises(EditorError):
+        target_for(config, "service", "jira")  # no services/jira.yaml on disk
+    with pytest.raises(EditorError):
+        target_for(config, "service", "not-a-service")
+
+
+def test_service_yaml_secret_scanning_applies():
+    assert contains_secret_submission("service", "enabled: true\napi_token: ghp_secretsecretsecret\n") is True
+    assert contains_secret_submission("service", "enabled: true\norganization: org\n") is False

@@ -9,7 +9,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-from taskboy.models import ALLOWED_TRANSITIONS, QUEUED, Task, new_task_id, utcnow
+from taskboy.models import ALLOWED_TRANSITIONS, QUEUED, TERMINAL_STATES, Task, new_task_id, utcnow
 from taskboy.redact import redactor
 
 
@@ -440,6 +440,11 @@ class Store:
         row = self.conn.execute("SELECT * FROM tasks WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
         return Task(**dict(row)), False
 
+    def task_by_intake_key(self, team_id: str, channel_id: str, message_ts: str) -> Task | None:
+        """the task a given intake (team, channel, message) created, if any — the same key create_task dedups on."""
+        row = self.conn.execute("SELECT * FROM tasks WHERE idempotency_key = ?", (f"{team_id}:{channel_id}:{message_ts}",)).fetchone()
+        return Task(**dict(row)) if row else None
+
     def record_quick_answer(
         self,
         *,
@@ -556,6 +561,11 @@ class Store:
         self.conn.commit()
         task = self.get_task(task_id)
         assert task is not None
+        if to_state in TERMINAL_STATES:
+            # a coordinator holds its issue batch from before its own task existed; no terminal task keeps one
+            self.release_reserved_issues(task_id)
+            # a no-op if the issue already left in_progress on its own (e.g. finish_issue -> in_review) (#76)
+            self.reopen_linked_issue(task)
         return task
 
     def set_fields(self, task_id: str, **fields) -> None:
@@ -750,6 +760,10 @@ class Store:
         rows = self.conn.execute("SELECT * FROM permission_requests WHERE task_id = ? ORDER BY id", (task_id,)).fetchall()
         return [dict(row) for row in rows]
 
+    def has_pending_permission_request(self, task_id: str) -> bool:
+        """true while a request is awaiting a decision — the orchestrator leaves such a task BLOCKED (not cancelled) so decide_permission's resume path still works."""
+        return self.conn.execute("SELECT 1 FROM permission_requests WHERE task_id = ? AND status = 'pending' LIMIT 1", (task_id,)).fetchone() is not None
+
     def decide_permission_request(self, task_id: str, kind: str, target: str, status: str, actor: str) -> dict | None:
         """grant or deny a pending request; returns the updated row, or None when nothing was pending (already decided or unknown)."""
         if status not in ("granted", "denied"):
@@ -942,10 +956,69 @@ class Store:
         self.conn.execute("UPDATE issues SET task_id = ?, updated_at = ? WHERE id = ?", (task_id, utcnow(), issue_id))
         self.conn.commit()
 
+    def issue_for_task(self, task_id: str) -> dict | None:
+        """the issue this task is implementing, if any."""
+        row = self.conn.execute("SELECT * FROM issues WHERE task_id = ?", (task_id,)).fetchone()
+        return dict(row) if row else None
+
+    def _reopen_issue_row(self, issue_id: int, comment: str) -> dict | None:
+        """shared UPDATE behind reopen_linked_issue and the untracked-issue path in reopen_stranded_issues."""
+        cur = self.conn.execute(
+            """UPDATE issues SET status = 'proposed', task_id = NULL, spec = NULL, reserved_by = NULL,
+                   decided_by = NULL, decided_at = NULL, updated_at = ?
+               WHERE id = ? AND status = 'in_progress'""",
+            (utcnow(), issue_id),
+        )
+        self.conn.commit()
+        if cur.rowcount == 0:
+            return None
+        reopened = self.get_issue(issue_id)
+        assert reopened is not None
+        self.add_issue_comment(issue_id, "agent", comment)
+        return reopened
+
+    def reopen_linked_issue(self, task: Task) -> dict | None:
+        """hand a task's linked issue back to `proposed`, clearing its claim; a no-op if not issue-backed or already left in_progress."""
+        issue = self.issue_for_task(task.task_id)
+        if issue is None:
+            return None
+        reason = task.error or task.blocked_reason or "it never recorded an outcome"
+        parts = [f"task `{task.task_id}` did not finish: {reason}"]
+        pending = self.pending_questions_for(task.task_id)
+        if pending is not None:
+            parts.append(f"Open questions:\n{pending['questions']}")
+        return self._reopen_issue_row(issue["id"], "\n\n".join(parts))
+
+    def reopen_stranded_issues(self) -> int:
+        """startup safety net: reopens in_progress issues left behind by a task that finished terminally before transition()'s hook could catch it, or with no linked task at all."""
+        rows = self.conn.execute(
+            """SELECT issues.id AS issue_id, issues.task_id FROM issues
+               LEFT JOIN tasks ON tasks.task_id = issues.task_id
+               WHERE issues.status = 'in_progress'
+                 AND (issues.task_id IS NULL OR tasks.state IN ('failed', 'cancelled', 'refused', 'completed'))"""
+        ).fetchall()
+        count = 0
+        for row in rows:
+            if row["task_id"] is None:
+                if self._reopen_issue_row(row["issue_id"], "reopened: left in_progress with no linked task") is not None:
+                    count += 1
+                continue
+            task = self.get_task(row["task_id"])
+            if task is not None and self.reopen_linked_issue(task) is not None:
+                count += 1
+        return count
+
     def active_implementation_run(self) -> str | None:
         """the id of a not-yet-terminal /implementapprovedissues coordinator task, if one exists. used to keep the
         dashboard button disabled and repeated clicks from starting a second coordinator."""
         row = self.conn.execute("SELECT task_id FROM tasks WHERE request_text LIKE '/implementapprovedissues%' AND state IN ('received','queued','running','blocked') ORDER BY created_at DESC LIMIT 1").fetchone()
+        return row["task_id"] if row else None
+
+    def blocked_implementation_run(self) -> str | None:
+        """the least-recently-updated blocked coordinator — oldest-first so a stale one is never hidden behind a fresher one."""
+        row = self.conn.execute(
+            "SELECT task_id FROM tasks WHERE request_text LIKE '/implementapprovedissues%' AND state = 'blocked' ORDER BY updated_at ASC LIMIT 1",
+        ).fetchone()
         return row["task_id"] if row else None
 
     def active_refine_task(self, issue_id: int) -> str | None:
@@ -965,11 +1038,10 @@ class Store:
                 result.setdefault(int(match.group(1)), row["task_id"])
         return result
 
-    def has_active_main_task_referencing(self, fragment: str) -> bool:
-        """True if a non-terminal, non-reviewer task's request text references `fragment` as a bounded token (e.g. a PR URL); excludes `blocked` so a main-agent task parked on follow-up questions can't suppress reviews indefinitely."""
-        rows = self.conn.execute(
-            "SELECT request_text FROM tasks WHERE state IN ('received','queued','running') AND (persona IS NULL OR persona != 'reviewer')",
-        ).fetchall()
+    def has_active_main_task_referencing(self, fragment: str, include_reviewer: bool = False) -> bool:
+        """True if a non-terminal task's request text references `fragment` as a bounded token (e.g. a PR URL); excludes `blocked` so a main-agent task parked on follow-up questions can't suppress reviews indefinitely. reviewer-persona tasks count only when `include_reviewer` is set."""
+        persona_filter = "" if include_reviewer else " AND (persona IS NULL OR persona != 'reviewer')"
+        rows = self.conn.execute("SELECT request_text FROM tasks WHERE state IN ('received','queued','running')" + persona_filter).fetchall()
         # bounded match, not a raw substring: require a non-digit (or end of string) after the fragment so .../pull/7 doesn't match .../pull/70, and escape the fragment so any _/% in a repo/org name aren't treated as wildcards
         pattern = re.compile(re.escape(fragment) + r"(?![0-9])")
         return any(row["request_text"] and pattern.search(row["request_text"]) for row in rows)
@@ -989,6 +1061,14 @@ class Store:
     def issues_reserved_by(self, reserved_by: str) -> list[dict]:
         rows = self.conn.execute("SELECT * FROM issues WHERE status = 'implementation_queued' AND reserved_by = ? ORDER BY priority DESC, id", (reserved_by,)).fetchall()
         return [dict(row) for row in rows]
+
+    def has_ever_reserved(self, reserved_by: str) -> bool:
+        """true once anything has been reserved for this id, even after the batch is claimed."""
+        return self.conn.execute("SELECT 1 FROM issues WHERE reserved_by = ? LIMIT 1", (reserved_by,)).fetchone() is not None
+
+    def has_pending_implementation_reservation(self) -> bool:
+        """true while a pending: marker still holds a reservation not yet assigned to a coordinator task."""
+        return self.conn.execute("SELECT 1 FROM issues WHERE status = 'implementation_queued' AND reserved_by LIKE 'pending:%' LIMIT 1").fetchone() is not None
 
     def assign_reservation(self, reserved_by: str, task_id: str) -> int:
         """move a pending marker's reservation onto the real coordinator task id once accept_task creates it."""

@@ -1,4 +1,6 @@
 import json
+import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,12 +16,24 @@ def routed(store, make_task):
     return store.transition(task.task_id, RECEIVED, QUEUED, "classified", profile="standard", classification_json=json.dumps({"target_repos": APPROVED, "jira_keys": ["PROJ-9"]}))
 
 
+def slug_broker(slug):
+    broker = AsyncMock()
+    broker.app_slug.return_value = slug
+    return broker
+
+
+def broken_broker(message):
+    broker = AsyncMock()
+    broker.app_slug.side_effect = RuntimeError(message)
+    return broker
+
+
 @pytest.fixture
 def adapter(store, make_task):
     broker = AsyncMock()
     broker.token_for_task.return_value = "ghs_tok"
     task = routed(store, make_task)
-    a = GitHubAdapter(broker, store, task, APPROVED, on_milestone=AsyncMock(), bot_logins=["red[bot]", "blue[bot]"])
+    a = GitHubAdapter(broker, store, task, APPROVED, on_milestone=AsyncMock(), main_broker=slug_broker("red"), reviewer_broker=slug_broker("blue"))
     a._request = AsyncMock()
     a._graphql = AsyncMock(return_value={"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}})
     return a
@@ -72,6 +86,89 @@ async def test_review_events_are_restricted(adapter, store):
     ok = await adapter.create_pr_review({"repo": "org/service-a", "number": 3, "body": "needs tests", "event": "REQUEST_CHANGES"})
     assert "REQUEST_CHANGES" in ok["content"][0]["text"]
     assert ("pr_comment", "org/service-a#3/review/55") in {(a["kind"], a["external_id"]) for a in store.artifacts_for(adapter.task.task_id)}
+
+
+@pytest.mark.asyncio
+async def test_approve_is_permitted_only_for_the_reviewing_persona(store, make_task):
+    broker = AsyncMock()
+    broker.token_for_task.return_value = "ghs_tok"
+    task = routed(store, make_task)
+    reviewer = GitHubAdapter(broker, store, task, APPROVED, main_broker=slug_broker("red"), reviewer_broker=slug_broker("blue"), can_approve=True)
+    reviewer._request = AsyncMock(side_effect=[{"user": {"login": "red[bot]"}}, {"id": 56, "html_url": "u"}])
+    ok = await reviewer.create_pr_review({"repo": "org/service-a", "number": 3, "body": "looks good", "event": "APPROVE"})
+    assert "APPROVE" in ok["content"][0]["text"]
+
+    author = GitHubAdapter(broker, store, task, APPROVED, main_broker=slug_broker("red"), reviewer_broker=slug_broker("blue"), can_approve=False)
+    author._request = AsyncMock()
+    result = await author.create_pr_review({"repo": "org/service-a", "number": 3, "body": "looks good", "event": "APPROVE"})
+    assert result.get("isError") is True
+    author._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_approve_is_refused_on_a_pull_request_not_authored_by_red(store, make_task):
+    """APPROVE is the red<->blue review loop's exit signal, not a general human-pr approval —
+    can_approve alone would let blue approve human-authored prs too and satisfy branch-protection review counts."""
+    broker = AsyncMock()
+    broker.token_for_task.return_value = "ghs_tok"
+    task = routed(store, make_task)
+    reviewer = GitHubAdapter(broker, store, task, APPROVED, main_broker=slug_broker("red"), reviewer_broker=slug_broker("blue"), can_approve=True)
+    reviewer._request = AsyncMock(return_value={"user": {"login": "a-human"}})
+    result = await reviewer.create_pr_review({"repo": "org/service-a", "number": 3, "body": "lgtm", "event": "APPROVE"})
+    assert result.get("isError") is True
+    assert reviewer._request.await_count == 1  # only the authorship GET, never posts the review
+
+
+@pytest.mark.asyncio
+async def test_comment_review_is_refused_on_a_red_authored_pr_for_the_reviewing_persona(store, make_task):
+    """a COMMENT review on a red-authored pr is a silent dead end — the follow-up poller only acts on
+    REQUEST_CHANGES/APPROVE, so the tool enforces the rule instead of trusting prompt wording."""
+    broker = AsyncMock()
+    broker.token_for_task.return_value = "ghs_tok"
+    task = routed(store, make_task)
+    reviewer = GitHubAdapter(broker, store, task, APPROVED, main_broker=slug_broker("red"), reviewer_broker=slug_broker("blue"), can_approve=True)
+    reviewer._request = AsyncMock(return_value={"user": {"login": "red[bot]"}})
+    result = await reviewer.create_pr_review({"repo": "org/service-a", "number": 3, "body": "notes", "event": "COMMENT"})
+    assert result.get("isError") is True
+    assert reviewer._request.await_count == 1  # only the authorship GET, never posts the review
+
+    # a pr not authored by red still takes COMMENT from the reviewing persona
+    reviewer._request = AsyncMock(side_effect=[{"user": {"login": "a-human"}}, {"id": 57, "html_url": "u"}])
+    ok = await reviewer.create_pr_review({"repo": "org/service-a", "number": 3, "body": "notes", "event": "COMMENT"})
+    assert "posted COMMENT review" in ok["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_comment_review_fails_open_when_red_identity_lookup_is_unavailable(store, make_task):
+    # blocking every COMMENT on a lookup blip would stop blue reviewing human prs entirely
+    broker = AsyncMock()
+    broker.token_for_task.return_value = "ghs_tok"
+    task = routed(store, make_task)
+    reviewer = GitHubAdapter(broker, store, task, APPROVED, main_broker=broken_broker("boom"), reviewer_broker=slug_broker("blue"), can_approve=True)
+    reviewer._request = AsyncMock(side_effect=[{"id": 59, "html_url": "u"}])
+    ok = await reviewer.create_pr_review({"repo": "org/service-a", "number": 3, "body": "notes", "event": "COMMENT"})
+    assert "posted COMMENT review" in ok["content"][0]["text"]
+    assert reviewer._request.await_count == 1  # straight to the POST — no authorship gate without an identity to compare
+
+
+@pytest.mark.asyncio
+async def test_comment_review_skips_the_authorship_lookup_for_the_authoring_persona(adapter):
+    adapter._request.side_effect = [{"id": 58, "html_url": "u"}]
+    ok = await adapter.create_pr_review({"repo": "org/service-a", "number": 3, "body": "fyi", "event": "COMMENT"})
+    assert "posted COMMENT review" in ok["content"][0]["text"]
+    assert adapter._request.await_count == 1  # just the review POST — no authorship GET when the persona can't approve
+
+
+@pytest.mark.asyncio
+async def test_approve_is_refused_when_red_identity_lookup_is_unavailable(store, make_task):
+    broker = AsyncMock()
+    broker.token_for_task.return_value = "ghs_tok"
+    task = routed(store, make_task)
+    reviewer = GitHubAdapter(broker, store, task, APPROVED, main_broker=broken_broker("boom"), reviewer_broker=slug_broker("blue"), can_approve=True)
+    reviewer._request = AsyncMock()
+    result = await reviewer.create_pr_review({"repo": "org/service-a", "number": 3, "body": "lgtm", "event": "APPROVE"})
+    assert result.get("isError") is True
+    reviewer._request.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -134,39 +231,276 @@ def test_shared_text_marks_truncation_and_stays_bounded():
 async def test_list_pr_comments_includes_timestamp_and_kind(adapter):
     adapter._request.side_effect = [
         [{"id": 1, "created_at": "2026-01-01T00:00:00Z", "user": {"login": "dev"}, "body": "issue body"}],
-        [{"id": 2, "created_at": "2026-01-02T00:00:00Z", "user": {"login": "agent"}, "body": "review body"}],
+        [{"id": 2, "created_at": "2026-01-02T00:00:00Z", "user": {"login": "agent"}, "body": "review body", "path": "src/foo.py", "line": 42}],
     ]
     text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
     assert "[1] [2026-01-01T00:00:00Z] dev (issue): issue body" in text
-    assert "[2] [2026-01-02T00:00:00Z] agent (review): review body" in text
+    assert "[2] [2026-01-02T00:00:00Z] agent (review, src/foo.py:42): review body" in text
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_marks_replies_with_the_root_comment_id(adapter):
+    adapter._request.side_effect = [
+        [],
+        [{"id": 2, "created_at": "t1", "user": {"login": "agent"}, "body": "root finding", "path": "src/foo.py", "line": 42}, {"id": 3, "created_at": "t2", "user": {"login": "reviewer"}, "body": "on it", "path": "src/foo.py", "line": 42, "in_reply_to_id": 2}],
+    ]
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
+    assert "[2] [t1] agent (review, src/foo.py:42): root finding" in text
+    assert "[3] [t2] reviewer (review, src/foo.py:42, reply-to 2): on it" in text
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_falls_back_to_original_line_when_line_is_stale(adapter):
+    adapter._request.side_effect = [
+        [],
+        [{"id": 2, "created_at": "t1", "user": {"login": "agent"}, "body": "finding", "path": "src/foo.py", "line": None, "original_line": 17}],
+    ]
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
+    assert "(review, src/foo.py:17): finding" in text
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_sorts_issue_and_review_comments_by_created_at(adapter):
+    # issue comments and review comments come from separate endpoints; a newer issue comment must
+    # still print after an older review comment so "newest-appearing-last" holds across both kinds
+    adapter._request.side_effect = [
+        [{"id": 1, "created_at": "2026-01-03T00:00:00Z", "user": {"login": "dev"}, "body": "later issue comment"}],
+        [{"id": 2, "created_at": "2026-01-01T00:00:00Z", "user": {"login": "agent"}, "body": "earlier review comment", "path": "src/foo.py", "line": 1}],
+    ]
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
+    assert text.index("earlier review comment") < text.index("later issue comment")
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_offset_skips_most_recently_shown_comments(adapter):
+    # _tail_fit always favors the newest lines, so offset must skip from the newest end too, or a
+    # caller paging past a truncated response would keep landing back on the same tail-fitted chunk
+    adapter._request.side_effect = [
+        [{"id": 1, "created_at": "t1", "user": {"login": "dev"}, "body": "first"}],
+        [{"id": 2, "created_at": "t2", "user": {"login": "agent"}, "body": "second", "path": "src/foo.py", "line": 1}],
+    ]
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "offset": 1}))["content"][0]["text"]
+    assert "second" not in text
+    assert "first" in text
+
+    adapter._request.side_effect = [[{"id": 1, "created_at": "t1", "user": {"login": "dev"}, "body": "first"}], []]
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "offset": 5}))["content"][0]["text"]
+    assert "no comments past offset 5" in text
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_offset_reaches_comments_dropped_by_tail_fit(adapter):
+    # the marker's suggested offset must surface the comments it dropped, not re-return the same tail-fitted chunk
+    comments = [{"id": i, "created_at": f"2026-01-{i:02d}T00:00:00Z", "user": {"login": "reviewer"}, "body": f"comment-{i:02d} " + "x" * 380, "path": "src/foo.py", "line": i} for i in range(1, 25)]
+    adapter._request.side_effect = [[], comments]
+    first_page = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
+    first_marker_offset = int(first_page.split("pass offset=", 1)[1].split(" ")[0])
+
+    # paging must keep advancing past the second page too, not stall on a repeated chunk
+    adapter._request.side_effect = [[], comments]
+    second_page = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "offset": first_marker_offset}))["content"][0]["text"]
+    assert "comment-24" not in second_page
+    assert "pass offset=" in second_page
+    second_marker_offset = int(second_page.split("pass offset=", 1)[1].split(" ")[0])
+    assert second_marker_offset > first_marker_offset
+
+    adapter._request.side_effect = [[], comments]
+    third_page = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "offset": second_marker_offset}))["content"][0]["text"]
+    assert "comment-01" in third_page
+    assert "comment-24" not in third_page
+    assert third_page != second_page
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_keeps_newest_when_output_exceeds_cap(adapter):
+    # a default call (no offset) must keep the newest comments when the joined output exceeds the
+    # shared 4000-char cap, not the oldest — silently dropping the latest round is the exact failure #81 describes
+    comments = [{"id": i, "created_at": f"2026-01-{i:02d}T00:00:00Z", "user": {"login": "reviewer"}, "body": f"comment-{i:02d} " + "x" * 380, "path": "src/foo.py", "line": i} for i in range(1, 13)]
+    adapter._request.side_effect = [[], comments]
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
+    assert "comment-12" in text
+    assert "comment-01" not in text
+    assert "earlier comment(s) not shown" in text
 
 
 @pytest.mark.asyncio
 async def test_list_pr_comments_annotates_review_thread_resolution(adapter):
-    adapter._request.side_effect = [[], [{"id": 2, "created_at": "2026-01-02T00:00:00Z", "user": {"login": "agent"}, "body": "open"}, {"id": 3, "created_at": "2026-01-03T00:00:00Z", "user": {"login": "reviewer"}, "body": "done"}]]
+    adapter._request.side_effect = [[], [{"id": 2, "created_at": "2026-01-02T00:00:00Z", "user": {"login": "agent"}, "body": "open", "path": "src/foo.py", "line": 1}, {"id": 3, "created_at": "2026-01-03T00:00:00Z", "user": {"login": "reviewer"}, "body": "done", "path": "src/foo.py", "line": 2}]]
     adapter._graphql.return_value = {
         "repository": {"pullRequest": {"reviewThreads": {"nodes": [{"id": "T1", "isResolved": False, "comments": {"nodes": [{"databaseId": 2, "author": {"login": "red[bot]"}}]}}, {"id": "T2", "isResolved": True, "comments": {"nodes": [{"databaseId": 3, "author": {"login": "blue[bot]"}}]}}]}}}
     }
 
     text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
 
-    assert "(review): open (unresolved)" in text
-    assert "(review): done (resolved)" in text
+    assert "(review, src/foo.py:1): open (unresolved)" in text
+    assert "(review, src/foo.py:2): done (resolved)" in text
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_paginates_review_threads_past_100(adapter):
+    adapter._request.side_effect = [[], [{"id": 2, "created_at": "t2", "user": {"login": "reviewer"}, "body": "in page two", "path": "src/foo.py", "line": 1}]]
+    page_one = {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": "CURSOR1"}}
+    page_two = {
+        "nodes": [{"id": "T1", "isResolved": False, "comments": {"nodes": [{"databaseId": 2, "author": {"login": "blue[bot]"}}]}}],
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+    }
+    adapter._graphql.side_effect = [
+        {"repository": {"pullRequest": {"reviewThreads": page_one}}},
+        {"repository": {"pullRequest": {"reviewThreads": page_two}}},
+    ]
+
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
+
+    assert "(review, src/foo.py:1): in page two (unresolved)" in text
+    assert adapter._graphql.call_args_list[1].args[1]["after"] == "CURSOR1"
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_review_threads_stops_on_null_end_cursor(adapter):
+    # a malformed hasNextPage=True with a null endCursor must not spin forever re-requesting the same page
+    adapter._request.side_effect = [[], [{"id": 2, "created_at": "t2", "user": {"login": "reviewer"}, "body": "in page one", "path": "src/foo.py", "line": 1}]]
+    adapter._graphql.return_value = {
+        "repository": {
+            "pullRequest": {
+                "reviewThreads": {
+                    "nodes": [{"id": "T1", "isResolved": False, "comments": {"nodes": [{"databaseId": 2, "author": {"login": "blue[bot]"}}]}}],
+                    "pageInfo": {"hasNextPage": True, "endCursor": None},
+                }
+            }
+        }
+    }
+
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
+
+    assert "(review, src/foo.py:1): in page one (unresolved)" in text
+    assert adapter._graphql.call_count == 1
 
 
 @pytest.mark.asyncio
 async def test_list_pr_comments_degrades_when_thread_query_fails(adapter):
-    adapter._request.side_effect = [[], [{"id": 2, "created_at": "now", "user": {"login": "agent"}, "body": "finding"}]]
+    adapter._request.side_effect = [[], [{"id": 2, "created_at": "now", "user": {"login": "agent"}, "body": "finding", "path": "src/foo.py", "line": 1}]]
     adapter._graphql.side_effect = RuntimeError("graphql unavailable")
 
     text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
 
-    assert "agent (review): finding" in text
+    assert "agent (review, src/foo.py:1): finding" in text
     assert "(resolved)" not in text
     assert "(unresolved)" not in text
 
 
-def review_threads(*, root_login="red[bot]", resolved=False):
+@pytest.mark.asyncio
+async def test_list_pr_comments_filters_by_author(adapter):
+    adapter._request.side_effect = [
+        [{"id": 1, "created_at": "t1", "user": {"login": "dev"}, "body": "from dev"}],
+        [{"id": 2, "created_at": "t2", "user": {"login": "Reviewer"}, "body": "from the reviewer", "path": "src/foo.py", "line": 1}],
+    ]
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "author": "reviewer"}))["content"][0]["text"]
+    assert "from the reviewer" in text
+    assert "from dev" not in text
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_author_me_resolves_to_the_acting_personas_login(adapter):
+    adapter.broker.app_slug.return_value = "example-agent-app"
+    adapter._request.side_effect = [
+        [{"id": 1, "created_at": "t1", "user": {"login": "dev"}, "body": "from dev"}],
+        [{"id": 2, "created_at": "t2", "user": {"login": "example-agent-app[bot]"}, "body": "from me", "path": "src/foo.py", "line": 1}],
+    ]
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "author": "me"}))["content"][0]["text"]
+    assert "from me" in text
+    assert "from dev" not in text
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_author_me_surfaces_the_login_lookup_error(adapter):
+    adapter.broker.app_slug.side_effect = RuntimeError("boom")
+    result = await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "author": "me"})
+    assert result.get("isError") is True
+    assert "boom" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_marks_previews_that_were_truncated(adapter):
+    adapter._request.side_effect = [[], [{"id": 2, "created_at": "t2", "user": {"login": "reviewer"}, "body": "x" * 500, "path": "src/foo.py", "line": 1}]]
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
+    assert "…(truncated)" in text
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_reports_filtered_count_when_nothing_matches(adapter):
+    adapter._request.side_effect = [
+        [{"id": 1, "created_at": "t1", "user": {"login": "dev"}, "body": "from dev"}],
+        [{"id": 2, "created_at": "t2", "user": {"login": "dev"}, "body": "also from dev"}],
+    ]
+    result = await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "author": "reviewer"})
+    text = result["content"][0]["text"]
+    assert "no comments matched the filters (there are 2 in total)" in text
+    assert result.get("isError") is not True
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_reports_no_comments_when_pr_truly_has_none(adapter):
+    adapter._request.side_effect = [[], []]
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
+    assert text == "no comments"
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_comment_id_returns_full_review_comment_body_ignoring_other_filters(adapter):
+    adapter._request.side_effect = [
+        [{"id": 1, "created_at": "t1", "user": {"login": "dev"}, "body": "an issue comment"}],
+        [{"id": 9, "created_at": "t9", "user": {"login": "reviewer"}, "body": "x" * 500}],
+    ]
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "comment_id": 9, "author": "someone-else"}))["content"][0]["text"]
+    assert "x" * 500 in text
+    assert "(review)" in text
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_comment_id_falls_back_to_issue_comment(adapter):
+    adapter._request.side_effect = [
+        [{"id": 9, "created_at": "t9", "user": {"login": "dev"}, "body": "an issue comment body"}],
+        [],
+    ]
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "comment_id": 9}))["content"][0]["text"]
+    assert "an issue comment body" in text
+    assert "(issue)" in text
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_comment_id_errors_when_not_found(adapter):
+    adapter._request.side_effect = [[], []]
+    result = await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "comment_id": 404})
+    assert result.get("isError") is True
+    assert "404" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_comment_id_pages_a_long_body_by_char_offset(adapter):
+    body = "y" * 5000
+    adapter._request.side_effect = [[], [{"id": 9, "created_at": "t9", "user": {"login": "reviewer"}, "body": body}]]
+    first = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "comment_id": 9}))["content"][0]["text"]
+    assert "pass offset=" in first
+    marker_offset = int(first.rsplit("pass offset=", 1)[1].split(" ")[0].rstrip(")"))
+    assert 0 < marker_offset < len(body)
+
+    adapter._request.side_effect = [[], [{"id": 9, "created_at": "t9", "user": {"login": "reviewer"}, "body": body}]]
+    rest = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "comment_id": 9, "offset": marker_offset}))["content"][0]["text"]
+    assert body[marker_offset:][:50] in rest
+
+
+@pytest.mark.asyncio
+async def test_list_pr_comments_comment_id_reports_out_of_range_offset(adapter):
+    # an offset past the body's end must return an explicit out-of-range message, not an empty-looking header line
+    body = "y" * 50
+    adapter._request.side_effect = [[], [{"id": 9, "created_at": "t9", "user": {"login": "reviewer"}, "body": body}]]
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, "comment_id": 9, "offset": 999}))["content"][0]["text"]
+    assert "no content past offset 999" in text
+    assert "50 chars" in text
+
+
+def review_threads(*, root_login="red", resolved=False):
+    # graphql reports a bot author as the bare app slug, not "{slug}[bot]"
     return {
         "repository": {
             "pullRequest": {
@@ -213,7 +547,7 @@ async def test_resolve_pr_thread_refusal_uses_configured_names(store, make_task)
     broker = AsyncMock()
     broker.token_for_task.return_value = "ghs_tok"
     task = routed(store, make_task)
-    a = GitHubAdapter(broker, store, task, APPROVED, on_milestone=AsyncMock(), bot_logins=["crimson[bot]", "cyan[bot]"], bot_name="Crimson", other_bot_name="Cyan")
+    a = GitHubAdapter(broker, store, task, APPROVED, on_milestone=AsyncMock(), main_broker=slug_broker("crimson"), reviewer_broker=slug_broker("cyan"), bot_name="Crimson", other_bot_name="Cyan")
     a._graphql = AsyncMock(return_value=review_threads(root_login="human"))
 
     result = await a.resolve_pr_thread({"repo": "org/service-a", "number": 4, "comment_id": 10})
@@ -242,13 +576,52 @@ async def test_resolve_pr_thread_rejects_unknown_comment_id(adapter):
 
 
 @pytest.mark.asyncio
-async def test_resolve_pr_thread_refuses_without_bot_logins(adapter):
-    adapter.bot_logins = []
+async def test_resolve_pr_thread_refuses_without_any_persona_broker(adapter):
+    adapter.bot_brokers = []
 
     result = await adapter.resolve_pr_thread({"repo": "org/service-a", "number": 4, "comment_id": 10})
 
     assert result["isError"] is True
     assert "cannot verify thread authorship" in result["content"][0]["text"]
+    adapter._graphql.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_pr_thread_resolves_counterpart_persona_thread(adapter):
+    adapter._graphql.side_effect = [review_threads(root_login="blue"), {"resolveReviewThread": {"thread": {"isResolved": True}}}]
+
+    result = await adapter.resolve_pr_thread({"repo": "org/service-a", "number": 4, "comment_id": 11})
+
+    assert result.get("isError") is not True
+    assert "resolved review thread for comment 11" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_pr_thread_names_the_broker_failure_when_only_one_persona_resolves(adapter):
+    # red resolves, blue doesn't: a blue-started thread is still refused, so the refusal has to say identity was degraded (issue #72)
+    adapter.bot_brokers = [slug_broker("red"), broken_broker("github /app request failed: 503")]
+    adapter._graphql.side_effect = [review_threads(root_login="blue")]
+
+    result = await adapter.resolve_pr_thread({"repo": "org/service-a", "number": 4, "comment_id": 11})
+
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    # pin the refusal path too: an empty known_logins would take the "cannot verify" branch and still carry the 503
+    assert "only review threads started by Agent or Reviewer can be resolved" in text
+    assert "github /app request failed: 503" in text
+
+
+@pytest.mark.asyncio
+async def test_resolve_pr_thread_surfaces_degraded_identity_distinctly_from_foreign_thread(adapter):
+    adapter.bot_brokers = [broken_broker("github /app request failed: 503")]
+
+    result = await adapter.resolve_pr_thread({"repo": "org/service-a", "number": 4, "comment_id": 10})
+
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert "cannot verify thread authorship" in text
+    assert "github /app request failed: 503" in text
+    assert "only review threads started by" not in text
     adapter._graphql.assert_not_awaited()
 
 
@@ -391,3 +764,83 @@ async def test_create_review_accepts_inline_comments_json_and_rejects_malformed(
     malformed = await adapter.create_pr_review({"repo": "org/service-a", "number": 3, "event": "COMMENT", "comments_json": "not json"})
     assert malformed["isError"] is True
     adapter._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_raises_status_error_with_body_and_retry_after_on_failure(monkeypatch, store, make_task):
+    class Response:
+        status = 422
+        headers = {"Retry-After": "7"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def text(self):
+            return "Validation Failed: comment path 'missing.py' is not part of the diff"
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def request(self, method, url, json, headers):
+            return Response()
+
+    monkeypatch.setitem(sys.modules, "aiohttp", SimpleNamespace(ClientSession=Session))
+    broker = AsyncMock()
+    broker.token_for_task.return_value = "ghs_tok"
+    task = routed(store, make_task)
+    adapter = GitHubAdapter(broker, store, task, APPROVED, on_milestone=AsyncMock())
+
+    with pytest.raises(GitHubStatusError) as exc_info:
+        await adapter._request("POST", "/repos/org/service-a/pulls/3/reviews", {"body": "x"})
+
+    assert exc_info.value.status == 422
+    assert exc_info.value.retry_after == "7"
+    assert "missing.py" in str(exc_info.value)
+    assert "422" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_request_bounds_and_redacts_the_body_on_failure(monkeypatch, store, make_task):
+    class Response:
+        status = 403
+        headers = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def text(self):
+            return "token ghs_" + "a" * 40 + " is missing the pull_requests:write permission" + "!" * 400
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def request(self, method, url, json, headers):
+            return Response()
+
+    monkeypatch.setitem(sys.modules, "aiohttp", SimpleNamespace(ClientSession=Session))
+    broker = AsyncMock()
+    broker.token_for_task.return_value = "ghs_tok"
+    task = routed(store, make_task)
+    adapter = GitHubAdapter(broker, store, task, APPROVED, on_milestone=AsyncMock())
+
+    with pytest.raises(GitHubStatusError) as exc_info:
+        await adapter._request("POST", "/repos/org/service-a/pulls", {"title": "x"})
+
+    message = str(exc_info.value)
+    assert "[redacted]" in message
+    assert "ghs_" + "a" * 40 not in message
+    assert len(message) < 400  # bounded to ~300 chars of body plus the status prefix

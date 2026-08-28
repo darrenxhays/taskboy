@@ -2,7 +2,7 @@
 
 edits apply to the live host files immediately; this pushes the same change to git so
 the repo stays the source of truth and the next deploy re-ships what is already live.
-dashboard commits go straight to main; red's app tokens are for task sessions, which
+dashboard commits go straight to main; the agent's app tokens are for task sessions, which
 are blocked from pushing to protected branches, so the dashboard uses its own contents-only pat.
 """
 

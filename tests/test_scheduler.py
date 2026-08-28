@@ -4,10 +4,18 @@ import pytest
 
 from taskboy import scheduler
 from taskboy.config import CliUpdateConfig, SlackConfig
+from taskboy.models import BLOCKED, RECEIVED
 from taskboy.scheduler import cli_update_due, fire_due, fire_schedule_now, maybe_run_cli_update, next_run_after, run_cli_update, seed_default_schedules
 from tests.conftest import RecordingNotifier, make_config
 
 UTC = timezone.utc
+
+
+def approve_an_issue(store, key="k"):
+    """an approved issue for the implementation schedule to reserve — with none, no coordinator is started at all."""
+    row = store.record_issue(key, "example-org/taskboy", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss@example.com")
+    return row
 
 
 def make_schedule(store, *, kind, next_run_at, model_alias=None, effort=None, interval_minutes=None, at_time=None, run_at=None, tzname=None, max_runs=None, request_text="/discoverissues example-org/taskboy"):
@@ -142,6 +150,9 @@ async def test_not_due_does_not_fire(store):
 
 @pytest.mark.asyncio
 async def test_implementation_schedule_skips_while_a_coordinator_is_active(store):
+    # an approved issue in the queue, so a missing active-coordinator guard would actually start a second
+    # coordinator here instead of merely finding nothing to reserve
+    issue = approve_an_issue(store)
     # an in-flight /implementapprovedissues coordinator (e.g. dashboard-started, or still running from a prior fire)
     store.create_task(slack_team_id="github", slack_channel_id="", slack_thread_ts="prior", slack_message_ts="prior", slack_user_id="github", request_text="/implementapprovedissues")
     now = datetime(2026, 7, 22, 20, 0, 30, tzinfo=UTC)
@@ -152,16 +163,59 @@ async def test_implementation_schedule_skips_while_a_coordinator_is_active(store
     assert row["last_task_id"] is None  # no second coordinator task was created
     assert row["next_run_at"] > now.isoformat()
     assert len(store.list_tasks(limit=50)) == 1  # only the pre-existing coordinator task exists
+    assert store.get_issue(issue["id"])["status"] == "approved"  # left untouched, not reserved by a second run
 
 
 @pytest.mark.asyncio
 async def test_implementation_schedule_fires_normally_with_no_active_coordinator(store):
+    approve_an_issue(store)
     now = datetime(2026, 7, 22, 20, 0, 30, tzinfo=UTC)
     sched = make_schedule(store, kind="daily", at_time="13:00", tzname="America/Los_Angeles", next_run_at="2026-07-22T20:00:00+00:00", request_text="/implementapprovedissues")
     fired = await fire_due(store, make_config(), RecordingNotifier(), now)
     assert fired == 1
     row = store.get_schedule(sched["id"])
     assert row["last_task_id"] is not None
+    # reserved before the coordinator task exists; active_implementation_run() finds it by task state whether or
+    # not it still holds the reservation
+    assert store.issues_reserved_by(row["last_task_id"]) != []
+    store.transition(row["last_task_id"], RECEIVED, BLOCKED, "needs permission")
+    assert store.active_implementation_run() == row["last_task_id"]
+
+
+@pytest.mark.asyncio
+async def test_implementation_schedule_starts_no_coordinator_when_nothing_is_approved(store):
+    now = datetime(2026, 7, 22, 20, 0, 30, tzinfo=UTC)
+    sched = make_schedule(store, kind="daily", at_time="13:00", tzname="America/Los_Angeles", next_run_at="2026-07-22T20:00:00+00:00", request_text="/implementapprovedissues")
+    fired = await fire_due(store, make_config(), RecordingNotifier(), now)
+    assert fired == 1  # the schedule still advances
+    row = store.get_schedule(sched["id"])
+    assert row["last_task_id"] is None
+    assert store.list_tasks(limit=50) == []
+
+
+@pytest.mark.asyncio
+async def test_implementation_schedule_preserves_request_text_arguments(store):
+    # a schedule's request_text can carry arguments after the bare skill name; the coordinator task must keep
+    # them rather than being started with a hardcoded "/implementapprovedissues".
+    approve_an_issue(store)
+    now = datetime(2026, 7, 22, 20, 0, 30, tzinfo=UTC)
+    sched = make_schedule(store, kind="daily", at_time="13:00", tzname="America/Los_Angeles", next_run_at="2026-07-22T20:00:00+00:00", request_text="/implementapprovedissues --team frontend", model_alias="fable", effort="high")
+    await fire_due(store, make_config(), RecordingNotifier(), now)
+    row = store.get_schedule(sched["id"])
+    task = store.get_task(row["last_task_id"])
+    assert task.request_text == "/implementapprovedissues --team frontend"
+    assert task.model_override == "fable"
+    assert task.effort_override == "high"
+    assert task.schedule_name == "t"
+
+
+@pytest.mark.asyncio
+async def test_run_now_reserves_the_batch_for_the_coordinator_it_starts(store):
+    approve_an_issue(store)
+    sched = make_schedule(store, kind="daily", at_time="13:00", tzname="America/Los_Angeles", next_run_at="2026-07-22T20:00:00+00:00", request_text="/implementapprovedissues")
+    task, status = await fire_schedule_now(store, make_config(), RecordingNotifier(), store.get_schedule(sched["id"]))
+    assert status == "created"
+    assert store.issues_reserved_by(task.task_id) != []
 
 
 @pytest.mark.asyncio
@@ -172,6 +226,20 @@ async def test_run_now_reports_already_running_instead_of_starting_a_second_coor
     assert task is None
     assert status == "already_running"
     assert len(store.list_tasks(limit=50)) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_now_refuses_while_a_pending_reservation_has_not_yet_become_a_coordinator(store):
+    # a dashboard click landing mid-fire must not reserve a second batch
+    approve_an_issue(store, key="a")
+    second = approve_an_issue(store, key="b")
+    store.reserve_issues("pending:already-in-flight", 1)
+    sched = make_schedule(store, kind="daily", at_time="13:00", tzname="America/Los_Angeles", next_run_at="2026-07-22T20:00:00+00:00", request_text="/implementapprovedissues")
+    task, status = await fire_schedule_now(store, make_config(), RecordingNotifier(), store.get_schedule(sched["id"]))
+    assert task is None
+    assert status == "already_running"
+    assert store.list_tasks(limit=50) == []  # no coordinator was created
+    assert store.get_issue(second["id"])["status"] == "approved"  # not swept into a second reservation
 
 
 # -- seeding ----------------------------------------------------------------

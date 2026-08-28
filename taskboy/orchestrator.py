@@ -39,6 +39,14 @@ async def accept_task(
     """shared intake for slack and the cli. returns (task, status): created | duplicate | paused | queue_full."""
     if store.meta_get("intake_paused") == "1":
         return None, "paused"
+    existing = store.task_by_intake_key(team_id, channel_id, message_ts)
+    if existing is not None:
+        return existing, "duplicate"
+    if store.count_tasks(QUEUED) + store.count_tasks(RECEIVED) >= config.queue_max:
+        # refuse before creating the row so the dedup key survives for a retry once the queue drains;
+        # no task row exists, so record the refusal here to keep the audit trail (ORC-006)
+        store.add_error("intake", "queue_full", f"queue full — refused intake from {user_id}", context={"team_id": team_id, "channel_id": channel_id, "message_ts": message_ts, "text": text[:200]})
+        return None, "queue_full"
     task, created = store.create_task(
         slack_team_id=team_id,
         slack_channel_id=channel_id,
@@ -57,7 +65,7 @@ async def accept_task(
         debug_permalink=debug_permalink,
     )
     if not created:
-        return task, "duplicate"
+        return task, "duplicate"  # raced with a concurrent intake of the same message
     ensure_debug = getattr(notifier, "ensure_debug", None)
     if ensure_debug is not None:
         try:
@@ -65,13 +73,29 @@ async def accept_task(
         except Exception as e:
             store.add_error("debug_feed", type(e).__name__, str(e), task_id=task.task_id, traceback=traceback.format_exc(), context={"operation": "ensure_debug"})
             logger.warning("debug thread setup failed for %s", task.task_id, exc_info=True)
-    if store.count_tasks(QUEUED) + store.count_tasks(RECEIVED) > config.queue_max:
-        # refuse clearly rather than drop silently, and keep the audit trail (ORC-006)
-        task = store.transition(task.task_id, RECEIVED, FAILED, "queue full", error="queue_full", finished_at=utcnow())
-        await notifier.refused(task, "the task queue is full — try again later")
-        return task, "queue_full"
     await notifier.ack(task)
     return task, "created"
+
+
+async def _notify_safe(fn, *args) -> None:
+    # a notifier outage must never take a task down with it
+    try:
+        await fn(*args)
+    except Exception:
+        logger.exception("notifier call failed")
+
+
+async def reopen_issue_and_cancel(store: Store, notifier, blocked: Task) -> bool:
+    """cancel a blocked, issue-backed task; `store.transition` reopens its issue only once the cancel itself lands, so a raced/resumed task never leaves a live task plus a re-approvable issue (#76)."""
+    issue = store.issue_for_task(blocked.task_id)
+    if issue is None or issue["status"] != "in_progress":
+        return False
+    try:
+        cancelled = store.transition(blocked.task_id, BLOCKED, CANCELLED, "issue reopened: implementation could not finish", finished_at=utcnow())
+    except TransitionRaced:
+        return False
+    await _notify_safe(notifier.issue_blocked, cancelled, issue)
+    return True
 
 
 class Orchestrator:
@@ -94,15 +118,18 @@ class Orchestrator:
         released = self.store.release_stale_reservations()
         if released:
             logger.info("released %d stale issue reservation(s) at startup", released)
+        reopened = self.store.reopen_stranded_issues()
+        if reopened:
+            logger.info("reopened %d issue(s) stranded behind an already-terminal task", reopened)
         for task in self.store.tasks_in_state(RUNNING):
             if task.attempt >= self.config.max_retries:
                 failed = self.store.transition(task.task_id, RUNNING, FAILED, "recovery: retry attempts exhausted", error="task was interrupted too many times", finished_at=utcnow())
                 self.store.add_event(task.task_id, "recovery", {"action": "failed", "attempt": task.attempt})
-                await self._notify_safe(self.notifier.failed, failed, failed.error or "")
+                await _notify_safe(self.notifier.failed, failed, failed.error or "")
             else:
                 requeued = self.store.transition(task.task_id, RUNNING, QUEUED, "recovery: orchestrator restarted", resume_session_id=task.session_id, attempt=task.attempt + 1)
                 self.store.add_event(task.task_id, "recovery", {"action": "requeued", "attempt": task.attempt + 1, "resume_session_id": task.session_id})
-                await self._notify_safe(self.notifier.recovered, requeued)
+                await _notify_safe(self.notifier.recovered, requeued)
 
     async def dispatcher_loop(self) -> None:
         while not self.stopping:
@@ -157,7 +184,7 @@ class Orchestrator:
                 self.store.add_error("classifier", type(e).__name__, str(e), task_id=task.task_id)
                 try:
                     failed = self.store.transition(task.task_id, RECEIVED, FAILED, "role refused routing", error=str(e), finished_at=utcnow())
-                    await self._notify_safe(self.notifier.refused, failed, str(e))
+                    await _notify_safe(self.notifier.refused, failed, str(e))
                 except TransitionRaced:
                     pass
             except Exception as e:
@@ -165,7 +192,7 @@ class Orchestrator:
                 self.store.add_error("classifier", type(e).__name__, str(e), task_id=task.task_id, traceback=traceback.format_exc())
                 try:
                     failed = self.store.transition(task.task_id, RECEIVED, FAILED, "classification failed", error=str(e), finished_at=utcnow())
-                    await self._notify_safe(self.notifier.failed, failed, str(e))
+                    await _notify_safe(self.notifier.failed, failed, str(e))
                 except TransitionRaced:
                     pass
             else:
@@ -175,14 +202,14 @@ class Orchestrator:
                         # failure listings/metrics — it was refused on purpose, not a failure (issue #16)
                         try:
                             refused = self.store.transition(task.task_id, RECEIVED, REFUSED, "unsupported request", error="unsupported request", finished_at=utcnow(), **{k: v for k, v in fields.items() if k in ("classification_json", "task_type", "complexity", "routing_rationale")})
-                            await self._notify_safe(self.notifier.refused, refused, "this doesn't look like an engineering task I can take on — try asking for an investigation, a fix, a PR review, or a Jira operation")
+                            await _notify_safe(self.notifier.refused, refused, "this doesn't look like an engineering task I can take on — try asking for an investigation, a fix, a PR review, or a Jira operation")
                         except sqlite3.IntegrityError as e:
                             # stale schema whose tasks.state CHECK predates REFUSED (issue #58); record it and fall back to FAILED
                             logger.exception("refusal transition failed for %s", task.task_id)
                             self.store.add_error("orchestrator", type(e).__name__, str(e), task_id=task.task_id, traceback=traceback.format_exc(), context={"stage": "refuse"})
                             try:
                                 failed = self.store.transition(task.task_id, RECEIVED, FAILED, "refusal transition failed", error=f"refusal transition failed: {e}", finished_at=utcnow())
-                                await self._notify_safe(self.notifier.failed, failed, str(e))
+                                await _notify_safe(self.notifier.failed, failed, str(e))
                             except (TransitionRaced, sqlite3.IntegrityError):
                                 pass
                     else:
@@ -196,7 +223,7 @@ class Orchestrator:
 
     async def _run_supervised(self, task: Task) -> None:
         """one task's lifetime; nothing that happens in here may take down the loop or sibling tasks (REL-005)."""
-        await self._notify_safe(self.notifier.started, task)
+        await _notify_safe(self.notifier.started, task)
         # snapshot grants at run start; a grant that lands mid-run makes this differ (see the BLOCKED branch) (§8.4)
         grants_before = self.store.granted_permissions_for(task.task_id)
         try:
@@ -208,9 +235,7 @@ class Orchestrator:
                     self.store.transition(task.task_id, RUNNING, QUEUED, "requeued: orchestrator shutting down", resume_session_id=task.session_id, attempt=task.attempt + 1)
                 except TransitionRaced:
                     pass
-            else:
-                # a user cancel already moved the row to cancelled before this coroutine was torn down
-                self._release_reservations(task.task_id)
+            # a user cancel needs nothing here — it already moved the row to cancelled, which released the batch
             self._release(task.task_id)
             raise
         except Exception as e:
@@ -219,10 +244,9 @@ class Orchestrator:
             try:
                 failed = self.store.transition(task.task_id, RUNNING, FAILED, "runner crashed", error=str(e), finished_at=utcnow())
                 self._record_terminal_timing(failed)
-                await self._notify_safe(self.notifier.failed, failed, str(e))
+                await _notify_safe(self.notifier.failed, failed, str(e))
             except TransitionRaced:
                 pass
-            self._release_reservations(task.task_id)
             self._release(task.task_id)
             return
         try:
@@ -230,8 +254,7 @@ class Orchestrator:
                 done = self.store.transition(task.task_id, RUNNING, COMPLETED, "runner finished", result_summary=outcome.result_summary, reply=outcome.reply, session_id=outcome.session_id, cost_usd=outcome.cost_usd, num_turns=outcome.num_turns, finished_at=utcnow())
                 self._record_terminal_timing(done)
                 self._write_memory(done)
-                self._release_reservations(done.task_id)
-                await self._notify_safe(self.notifier.completed, done)
+                await _notify_safe(self.notifier.completed, done)
             elif outcome.state == BLOCKED:
                 blocked = self.store.transition(task.task_id, RUNNING, BLOCKED, "runner blocked", blocked_reason=outcome.blocked_reason, session_id=outcome.session_id, cost_usd=outcome.cost_usd, num_turns=outcome.num_turns)
                 self._record_terminal_timing(blocked)
@@ -245,40 +268,40 @@ class Orchestrator:
                         self.store.add_event(task.task_id, "permission_decision", {"actor": "orchestrator", "decision": "resume", "note": "grant landed while session was running"})
                     except TransitionRaced:
                         pass
-                else:
-                    pending = self.store.pending_questions_for(task.task_id)
-                    ask = getattr(self.notifier, "questions", None)
-                    if pending is not None and ask is not None:
-                        await self._notify_safe(ask, blocked, pending["questions"])
-                    else:
-                        await self._notify_safe(self.notifier.blocked, blocked)
+                elif self.store.has_pending_permission_request(task.task_id):
+                    # leave it BLOCKED: decide_permission's resume path needs this exact task_id still BLOCKED, and
+                    # grants are keyed to it (§8.4) — reopening the issue would spawn a task with no grants and re-block
+                    await self._notify_blocked(blocked)
+                elif not await reopen_issue_and_cancel(self.store, self.notifier, blocked):
+                    # not issue-backed, or the issue already left a reopenable status (raced with a delete/refine)
+                    await self._notify_blocked(blocked)
             elif outcome.retryable and task.attempt < self.config.max_retries:
                 # transient claude usage/session limit: come back after the recorded reset instead of failing outright
                 requeued = self.store.transition(task.task_id, RUNNING, QUEUED, "requeued: session hit a usage limit", resume_session_id=outcome.session_id, attempt=task.attempt + 1, not_before=outcome.retry_not_before)
                 self.store.add_event(task.task_id, "recovery", {"action": "requeued_rate_limit", "attempt": task.attempt + 1, "not_before": outcome.retry_not_before})
-                await self._notify_safe(self.notifier.recovered, requeued)
+                await _notify_safe(self.notifier.recovered, requeued)
             else:
                 failed = self.store.transition(task.task_id, RUNNING, FAILED, "runner reported failure", error=outcome.error, session_id=outcome.session_id, cost_usd=outcome.cost_usd, num_turns=outcome.num_turns, finished_at=utcnow())
                 self.store.add_error("runner", "session_failure", outcome.error, task_id=task.task_id)
                 self._record_terminal_timing(failed)
                 self._write_memory(failed)
-                self._release_reservations(failed.task_id)
-                await self._notify_safe(self.notifier.failed, failed, outcome.error)
+                await _notify_safe(self.notifier.failed, failed, outcome.error)
         except TransitionRaced:
             pass  # cancelled out from under us; the cancel transition already recorded it
         finally:
             self._release(task.task_id)
 
+    async def _notify_blocked(self, blocked: Task) -> None:
+        pending = self.store.pending_questions_for(blocked.task_id)
+        ask = getattr(self.notifier, "questions", None)
+        if pending is not None and ask is not None:
+            await _notify_safe(ask, blocked, pending["questions"])
+        else:
+            await _notify_safe(self.notifier.blocked, blocked)
+
     def _release(self, task_id: str) -> None:
         self.running.pop(task_id, None)
         self.wake.set()
-
-    def _release_reservations(self, task_id: str) -> None:
-        # a no-op for ordinary tasks; restores an implementation_queued batch to approved if task_id was its
-        # coordinator and it just died or finished without processing all of its reserved rows
-        released = self.store.release_reserved_issues(task_id)
-        if released:
-            logger.info("released %d reserved issue(s) held by %s", released, task_id)
 
     def _record_terminal_timing(self, task: Task) -> None:
         end = task.finished_at or utcnow()
@@ -294,13 +317,6 @@ class Orchestrator:
             memory.write_summary(self.memory_root, task, self.store.artifacts_for(task.task_id))
         except Exception:
             logger.exception("memory summary write failed for %s", task.task_id)
-
-    async def _notify_safe(self, fn, *args) -> None:
-        # a notifier outage must never take a task down with it
-        try:
-            await fn(*args)
-        except Exception:
-            logger.exception("notifier call failed")
 
 
 def _seconds_between(start: str | None, end: str | None) -> float:

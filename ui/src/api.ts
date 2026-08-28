@@ -304,7 +304,7 @@ export const api = {
     }),
   refineIssue: (id: number) => request<{ status: string; task_id: string | null }>(`/api/issues/${id}/refine`, { method: "POST", headers: { "x-harness-dashboard": "1" } }),
   deleteIssue: (id: number) => request<{ status: string }>(`/api/issues/${id}`, { method: "DELETE", headers: { "x-harness-dashboard": "1" } }),
-  bulkIssues: (ids: number[], action: "approve" | "deny" | "refine") =>
+  bulkIssues: (ids: number[], action: "approve" | "deny" | "refine" | "delete") =>
     request<{ results: { id: number; status: string; task_id?: string | null }[] }>("/api/issues/bulk", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-harness-dashboard": "1" },
@@ -347,7 +347,7 @@ export const api = {
   memory: (q: string) => request<{ records: { task_id: string; modified: string; size: number; preview: string }[] }>(`/api/memory${q ? `?q=${encodeURIComponent(q)}` : ""}`),
   memoryDetail: (taskId: string) => request<{ task_id: string; content: string; state: string | null }>(`/api/memory/${taskId}`),
   usage: () => request<Usage>("/api/usage"),
-  config: () => request<{ runtime: Record<string, string>; policy: Record<string, unknown>; dashboard: Record<string, unknown>; secret_presence: Record<string, boolean>; skills: string[] }>("/api/config"),
+  config: () => request<{ runtime: Record<string, string>; policy: Record<string, unknown>; dashboard: Record<string, unknown>; secret_presence: Record<string, boolean>; skills: string[]; services: Record<string, { enabled: boolean; editable: boolean }> }>("/api/config"),
   adminEvents: () => request<{ events: Record<string, unknown>[] }>("/api/admin-events"),
   manageRead: (kind: string, name?: string) => request<ManageTarget>(`/api/manage/${kind}${name ? `?name=${encodeURIComponent(name)}` : ""}`),
   manageWrite: (kind: string, body: { name?: string | null; content: string; base_hash: string; action: "preview" | "confirm" }) =>

@@ -1,10 +1,11 @@
 """interactive first-run setup: `taskboy setup`.
 
 walks each integration step by step: prints the manual admin-ui instructions, prompts for the
-resulting ids/tokens, validates them live, and writes config/config.yaml (comment-preserving,
-via ruamel) plus a sourceable .env for local secrets. every completed step is written
-immediately and every write must pass load_config, so quitting mid-run and re-running resumes
-naturally — there is no separate state file.
+resulting ids/tokens, validates them live, and writes config/config.yaml plus one
+config/services/<name>.yaml per connected service (comment-preserving, via ruamel) and a
+sourceable .env for local secrets. every completed step is written immediately and every write
+must pass load_config, so quitting mid-run and re-running resumes naturally — there is no
+separate state file.
 
 secrets are read with getpass or from a file path, never from argv, and are echoed back only
 as `set (…last4)`.
@@ -17,7 +18,7 @@ import sys
 from pathlib import Path
 
 from taskboy import assets, settings, setup_checks, skills
-from taskboy.config import ConfigError, load_config
+from taskboy.config import KNOWN_SERVICES, ConfigError, load_config, service_enabled_in
 
 CONFIG_PATH = Path(settings.CONFIG_PATH)
 ENV_PATH = Path(".env")
@@ -111,36 +112,70 @@ def _yaml():
     return yaml
 
 
+def service_config_path(name: str) -> Path:
+    return CONFIG_PATH.parent / "services" / f"{name}.yaml"
+
+
 def seed_config() -> None:
     """fresh instance directory: create the config dir and seed it from the packaged example."""
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(EXAMPLE_PATH, CONFIG_PATH)
+    services_dir = CONFIG_PATH.parent / "services"
+    services_dir.mkdir(exist_ok=True)
+    for file in sorted((TEMPLATES_ROOT / "services").glob("*.yaml")):
+        target = services_dir / file.name
+        if not target.exists():
+            shutil.copyfile(file, target)
     messages = CONFIG_PATH.parent / "task_started_messages.yaml"
     if not messages.exists():
         shutil.copyfile(TEMPLATES_ROOT / "task_started_messages.yaml", messages)
-    say(f"created {CONFIG_PATH} from the packaged {EXAMPLE_PATH.name}")
+    say(f"created {CONFIG_PATH} and {services_dir}/ from the packaged templates")
 
 
 def load_config_data() -> dict:
+    """one merged mapping for the steps to mutate; save_config_data splits service sections back out."""
     if not CONFIG_PATH.exists():
         seed_config()
-    return _yaml().load(CONFIG_PATH.read_text())
+    data = _yaml().load(CONFIG_PATH.read_text())
+    for name in KNOWN_SERVICES:
+        target = service_config_path(name)
+        if target.exists():
+            data[name] = _yaml().load(target.read_text())
+    return data
 
 
 def save_config_data(data) -> None:
-    """write config.yaml, but only if the result still passes load_config (exit-64 guard)."""
+    """write config.yaml + services/*.yaml, but only if the result still passes load_config (exit-64 guard)."""
     import io
 
-    buffer = io.StringIO()
-    _yaml().dump(data, buffer)
-    content = buffer.getvalue()
-    previous = CONFIG_PATH.read_text() if CONFIG_PATH.exists() else None
-    CONFIG_PATH.write_text(content)
+    def dump(value) -> str:
+        buffer = io.StringIO()
+        _yaml().dump(value, buffer)
+        return buffer.getvalue()
+
+    # sections whose service file exists are written there; everything else stays in config.yaml
+    writes: list[tuple[Path, str]] = []
+    split_out: dict[str, object] = {}
+    for name in KNOWN_SERVICES:
+        target = service_config_path(name)
+        if name in data and target.exists():
+            split_out[name] = data.pop(name)
+            writes.append((target, dump(split_out[name])))
+    writes.append((CONFIG_PATH, dump(data)))
+    for name, section in split_out.items():
+        data[name] = section  # restore the merged in-memory view for later steps
+    previous = {path: path.read_text() if path.exists() else None for path, _ in writes}
+    for path, content in writes:
+        path.write_text(content)
     try:
         load_config(str(CONFIG_PATH))
     except ConfigError:
-        if previous is not None:
-            CONFIG_PATH.write_text(previous)
+        for path, _ in writes:
+            original = previous[path]
+            if original is not None:
+                path.write_text(original)
+            else:
+                path.unlink(missing_ok=True)
         raise
 
 
@@ -223,7 +258,9 @@ def step_claude(data, env) -> None:
 
 def step_slack(data, env) -> None:
     say("\n== Slack ==")
+    slack = data.setdefault("slack", {})
     if not ask_yes("Configure Slack intake?", default=True):
+        slack["enabled"] = False
         return
     say("  1. Create the app from the manifest: https://api.slack.com/apps -> From an app manifest")
     say(f"     manifest file: {TEMPLATES_ROOT / 'slack_app_manifest.yaml'}")
@@ -232,8 +269,10 @@ def step_slack(data, env) -> None:
     say("  4. Invite the bot to every channel you plan to allow.")
     env["SLACK_BOT_TOKEN"] = ask_secret("Bot token (xoxb-…)", env.get("SLACK_BOT_TOKEN", ""))
     env["SLACK_APP_TOKEN"] = ask_secret("App-level token (xapp-…)", env.get("SLACK_APP_TOKEN", ""))
-    slack = data.setdefault("slack", {})
     slack["team_id"] = ask("Workspace team id (T…)", str(slack.get("team_id") or ""))
+    slack["enabled"] = bool(slack["team_id"])
+    if not slack["enabled"]:
+        say("  slack left disabled — set the team id and re-run `taskboy setup --step slack`")
     if env["SLACK_BOT_TOKEN"]:
         ok, detail = setup_checks.check_slack(env["SLACK_BOT_TOKEN"], slack["team_id"])
         status(ok, "slack", detail)
@@ -254,8 +293,11 @@ def step_slack(data, env) -> None:
 
 def step_github(data, env) -> None:
     say("\n== GitHub App (main agent) ==")
+    github = data.setdefault("github", {})
     if not ask_yes("Configure GitHub?", default=True):
+        github["enabled"] = False
         return
+    github["enabled"] = True
     say("  Create a GitHub App (org Settings -> Developer settings -> GitHub Apps -> New):")
     say("    permissions: Contents read/write, Metadata read, Pull requests read/write; no webhook.")
     say("    install it on every repository the agent may touch, then note the App ID and the")
@@ -263,7 +305,6 @@ def step_github(data, env) -> None:
     env["GITHUB_APP_ID"] = ask("App ID", env.get("GITHUB_APP_ID", ""))
     env["GITHUB_INSTALLATION_ID"] = ask("Installation id", env.get("GITHUB_INSTALLATION_ID", ""))
     env["GITHUB_APP_PRIVATE_KEY"] = ask_pem("Private key", env.get("GITHUB_APP_PRIVATE_KEY", ""))
-    github = data.setdefault("github", {})
     github["approved_repos"] = ask_list("Approved repositories (owner/repo)", list(github.get("approved_repos") or []))
     self_repo = ask("This agent's own repo, if it may work on itself (owner/repo, empty = none)", str(github.get("self_repo") or ""))
     github["self_repo"] = self_repo
@@ -302,12 +343,14 @@ def step_reviewer(data, env) -> None:
 
 def step_jira(data, env) -> None:
     say("\n== Jira + Confluence (optional) ==")
+    jira = data.setdefault("jira", {})
     if not ask_yes("Configure Jira?", default=False):
+        jira["enabled"] = False
         return
     say("  Use a dedicated service account with a scoped project role; create an API token at")
     say("  https://id.atlassian.com/manage-profile/security/api-tokens")
-    jira = data.setdefault("jira", {})
     jira["site"] = ask("Jira site url (https://your-org.atlassian.net)", str(jira.get("site") or ""))
+    jira["enabled"] = bool(jira["site"])
     env["JIRA_EMAIL"] = ask("Service account email", env.get("JIRA_EMAIL", ""))
     env["JIRA_API_TOKEN"] = ask_secret("API token", env.get("JIRA_API_TOKEN", ""))
     ok, detail = setup_checks.check_jira(jira["site"], env["JIRA_EMAIL"], env["JIRA_API_TOKEN"])
@@ -317,20 +360,25 @@ def step_jira(data, env) -> None:
         ok, detail = setup_checks.check_jira_project(jira["site"], env["JIRA_EMAIL"], env["JIRA_API_TOKEN"], key)
         status(ok, "project", detail)
     jira["story_points_field"] = ask("Story points custom field (e.g. customfield_10016, empty = unused)", str(jira.get("story_points_field") or ""))
+    confluence = data.setdefault("confluence", {})
     if ask_yes("Configure Confluence with the same account?", default=False):
-        confluence = data.setdefault("confluence", {})
         confluence["site"] = ask("Confluence site url", str(confluence.get("site") or jira["site"]))
+        confluence["enabled"] = bool(confluence["site"])
         ok, detail = setup_checks.check_confluence(confluence["site"], env["JIRA_EMAIL"], env["JIRA_API_TOKEN"])
         status(ok, "confluence", detail)
+    else:
+        confluence["enabled"] = False
 
 
 def step_sentry(data, env) -> None:
     say("\n== Sentry (optional) ==")
+    sentry = data.setdefault("sentry", {})
     if not ask_yes("Configure Sentry?", default=False):
+        sentry["enabled"] = False
         return
     say("  Create an internal integration with read-only Project / Issue & Event / Organization scopes.")
-    sentry = data.setdefault("sentry", {})
     sentry["organization"] = ask("Organization slug", str(sentry.get("organization") or ""))
+    sentry["enabled"] = bool(sentry["organization"])
     env["SENTRY_TOKEN"] = ask_secret("Integration token", env.get("SENTRY_TOKEN", ""))
     ok, detail = setup_checks.check_sentry(sentry["organization"], env["SENTRY_TOKEN"])
     status(ok, "sentry", detail)
@@ -339,10 +387,12 @@ def step_sentry(data, env) -> None:
 
 def step_aws(data, env) -> None:
     say("\n== AWS diagnostics (optional) ==")
-    if not ask_yes("Configure read-only AWS diagnostics?", default=False):
-        return
     aws = data.setdefault("aws", {})
+    if not ask_yes("Configure read-only AWS diagnostics?", default=False):
+        aws["enabled"] = False
+        return
     aws["allowed_services"] = ask_list("Allowed services (e.g. logs, cloudwatch, lambda, s3)", list(aws.get("allowed_services") or []))
+    aws["enabled"] = bool(aws["allowed_services"])
     aws["allowed_regions"] = ask_list("Allowed regions", list(aws.get("allowed_regions") or ["us-east-1"]))
     roles = dict(aws.get("diagnostics_role_arns") or {})
     while ask_yes("Add a per-environment diagnostics role?", default=not roles):
@@ -432,8 +482,8 @@ def step_skills(data, env) -> None:
         return
     variables = template_variables(data)
     github = data.get("github") or {}
-    jira_configured = bool((data.get("jira") or {}).get("site"))
-    self_repo = bool(github.get("self_repo"))
+    jira_configured = service_enabled_in(data, "jira")
+    self_repo = service_enabled_in(data, "github") and bool(github.get("self_repo"))
     say("  Available templates (× = needs an integration you haven't configured):")
     disabled: dict[str, str] = {}
     for name in available:
@@ -556,10 +606,10 @@ def run_checks(no_network: bool = False) -> int:
         if env.get("SLACK_BOT_TOKEN"):
             report("slack", setup_checks.check_slack(env["SLACK_BOT_TOKEN"], config.slack.team_id))
         else:
-            status(False, "slack", "slack.team_id set but SLACK_BOT_TOKEN missing")
+            status(False, "slack", "slack is enabled but SLACK_BOT_TOKEN missing")
             failures += 1
     github = config.raw.get("github") or {}
-    if env.get("GITHUB_APP_ID"):
+    if config.service_enabled("github") and env.get("GITHUB_APP_ID"):
         report("github app", setup_checks.check_github_app(env["GITHUB_APP_ID"], env.get("GITHUB_INSTALLATION_ID", ""), env.get("GITHUB_APP_PRIVATE_KEY", ""), list(github.get("approved_repos") or [])))
     if config.reviewer.enabled:
         if env.get("REVIEWER_GITHUB_APP_ID"):
@@ -568,10 +618,10 @@ def run_checks(no_network: bool = False) -> int:
             status(False, "reviewer", "reviewer.enabled but REVIEWER_GITHUB_APP_ID missing")
             failures += 1
     jira = config.raw.get("jira") or {}
-    if jira.get("site") and env.get("JIRA_API_TOKEN"):
+    if config.service_enabled("jira") and env.get("JIRA_API_TOKEN"):
         report("jira", setup_checks.check_jira(str(jira["site"]), env.get("JIRA_EMAIL", ""), env["JIRA_API_TOKEN"]))
     sentry = config.raw.get("sentry") or {}
-    if sentry.get("organization") and env.get("SENTRY_TOKEN"):
+    if config.service_enabled("sentry") and env.get("SENTRY_TOKEN"):
         report("sentry", setup_checks.check_sentry(str(sentry["organization"]), env["SENTRY_TOKEN"]))
     if config.dashboard.auto_commit_enabled and env.get("DASHBOARD_GITHUB_TOKEN"):
         report("dashboard pat", setup_checks.check_github_pat_repo(env["DASHBOARD_GITHUB_TOKEN"], config.dashboard.commit_repo))
@@ -597,8 +647,8 @@ def run(args) -> int:
         say("then run `taskboy setup` for the full guided setup.")
         return 0
 
-    say("taskboy setup — answers are written to config/config.yaml and .env after every")
-    say("step, so you can quit (ctrl-c) and re-run anytime; existing values show as defaults.")
+    say("taskboy setup — answers are written to config/config.yaml, config/services/*.yaml, and .env")
+    say("after every step, so you can quit (ctrl-c) and re-run anytime; existing values show as defaults.")
     data = load_config_data()
     env = read_env()
     steps = STEPS if not args.step else [(name, fn) for name, fn in STEPS if name == args.step]

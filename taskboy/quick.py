@@ -59,7 +59,7 @@ class QuickAnswer:
                 return None, None
             context = self._task_context(text, parent)
             personality = load_personality(self.config.personality_path)
-            github = self.config.raw.get("github") or {}
+            github = (self.config.raw.get("github") or {}) if self.config.service_enabled("github") else {}
             approved_repos = github.get("approved_repos") or []
             role = role_for(self.config.roles, user_id)
             if role is not None and role.repos is not None:
@@ -70,7 +70,7 @@ class QuickAnswer:
                 self.config.agent_name,
                 context,
                 approved_repos,
-                ["github", "aws", "sentry", "jira", "confluence"],
+                self.config.enabled_integrations(),
                 trim_context(thread_context),
                 personality[0] if personality else None,
                 self_repo if self_repo in approved_repos else None,

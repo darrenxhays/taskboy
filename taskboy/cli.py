@@ -42,7 +42,7 @@ def main() -> None:
     sub.add_parser("run", help="run the service in the foreground")
 
     extract = sub.add_parser("assets", help="copy a packaged asset tree out of the installed package")
-    extract.add_argument("name", choices=["templates", "deploy"], help="templates = config example, personalities, skill templates, slack manifest; deploy = systemd units, env example, git credential helper")
+    extract.add_argument("name", choices=["templates", "deploy"], help="templates = config example, per-service configs, personalities, skill templates, slack manifest; deploy = systemd units, env example, git credential helper")
     extract.add_argument("dest", nargs="?", default=".", help="directory to copy into (default: current directory)")
 
     from taskboy import setup_wizard
@@ -74,7 +74,7 @@ def main() -> None:
         elif args.command == "permissions":
             _permissions(store, args.task_id)
         elif args.command in ("grant", "deny"):
-            _decide_permission(store, args.command, args.task_id, args.kind, args.target)
+            asyncio.run(_decide_permission(store, args.command, args.task_id, args.kind, args.target))
         elif args.command == "pause-intake":
             store.meta_set("intake_paused", "1")
             print("intake paused")
@@ -134,11 +134,11 @@ def _permissions(store: Store, task_id: str) -> None:
         print(f"{row['status']:8} {row['kind']:4} {row['target']}{decided}  ({row['reason'][:80]})")
 
 
-def _decide_permission(store: Store, decision_verb: str, task_id: str, kind: str, target: str) -> None:
+async def _decide_permission(store: Store, decision_verb: str, task_id: str, kind: str, target: str) -> None:
     from taskboy.task_actions import decide_permission
 
     decision = "granted" if decision_verb == "grant" else "denied"
-    task, status = decide_permission(store, task_id, kind, target, decision, "cli")
+    task, status = await decide_permission(store, StdoutNotifier(), task_id, kind, target, decision, "cli")
     print(f"{task_id}: {status}" + (f" (now {task.state})" if task else ""))
 
 

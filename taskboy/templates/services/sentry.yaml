@@ -1,0 +1,4 @@
+# sentry service — read-only issue and event lookups.
+enabled: false # true requires organization below plus SENTRY_TOKEN in the environment
+organization: "" # sentry org slug
+projects: []

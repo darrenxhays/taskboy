@@ -1,0 +1,9 @@
+# slack service — socket-mode intake and notifications.
+# each connected service lives in its own file under services/ so it can be turned on or off here
+# without touching config.yaml. apply changes with a service restart.
+enabled: false # true requires team_id below plus SLACK_BOT_TOKEN / SLACK_APP_TOKEN in the environment
+team_id: "" # workspace id (T…)
+debug_channel: "" # set to a private debug channel id; empty disables the debug feed
+task_started_messages_file: task_started_messages.yaml # relative to config.yaml; missing/invalid uses legacy text
+allowed_channels: [] # channel ids, e.g. [C0123ABCDEF]; empty = any channel the bot is invited to
+ack_reaction: true # 👀 reaction instead of the "On it" message; false restores the text ack

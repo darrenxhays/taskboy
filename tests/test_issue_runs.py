@@ -1,9 +1,11 @@
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
 
 from taskboy import issue_runs
 from taskboy.adapters.github_api import GitHubStatusError
+from tests.conftest import RecordingNotifier, make_config
 
 
 class FakeBroker:
@@ -17,6 +19,33 @@ def rec_in_review(store, make_task, key="x", pr_url="https://github.com/example-
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "spec")
     return store.finish_issue(row["id"], "in_review", pr_url)
+
+
+@pytest.mark.asyncio
+async def test_start_implementation_run_releases_the_batch_when_accept_task_raises(store, monkeypatch):
+    # a stranded pending: marker makes has_pending_implementation_reservation() refuse every later run until a restart
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    monkeypatch.setattr(issue_runs, "accept_task", AsyncMock(side_effect=RuntimeError("slack ack exploded")))
+
+    with pytest.raises(RuntimeError):
+        await issue_runs.start_implementation_run(store, make_config(), RecordingNotifier(), thread_key="k")
+
+    assert store.get_issue(row["id"])["status"] == "approved"
+    assert store.has_pending_implementation_reservation() is False
+
+
+@pytest.mark.asyncio
+async def test_start_implementation_run_releases_the_batch_when_the_call_is_cancelled(store, monkeypatch):
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    monkeypatch.setattr(issue_runs, "accept_task", AsyncMock(side_effect=asyncio.CancelledError()))
+
+    with pytest.raises(asyncio.CancelledError):
+        await issue_runs.start_implementation_run(store, make_config(), RecordingNotifier(), thread_key="k")
+
+    assert store.get_issue(row["id"])["status"] == "approved"
+    assert store.has_pending_implementation_reservation() is False
 
 
 @pytest.mark.asyncio

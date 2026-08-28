@@ -395,7 +395,7 @@ async def test_thread_transcript_formats_excludes_and_caps():
 
 
 @pytest.mark.asyncio
-async def test_thread_transcript_paginates_to_newest_messages_and_skips_bot():
+async def test_thread_transcript_paginates_to_newest_messages_and_labels_bot():
     client = AsyncMock()
     pages = [
         {"messages": [{"ts": str(i), "user": f"U{i}", "text": f"message {i}"} for i in range(200)], "response_metadata": {"next_cursor": "page-2"}},
@@ -411,9 +411,30 @@ async def test_thread_transcript_paginates_to_newest_messages_and_skips_bot():
 
     assert "message 497" in transcript
     assert "message 199" not in transcript
-    assert "message 498" not in transcript
+    assert "Agent: message 498" in transcript
+    assert f"<@{BOT}>: message 498" not in transcript
     assert client.conversations_replies.call_args_list[1].kwargs["cursor"] == "page-2"
     assert client.conversations_replies.call_args_list[2].kwargs["cursor"] == "page-3"
+
+
+@pytest.mark.asyncio
+async def test_thread_transcript_includes_bot_messages_labeled_and_truncated():
+    client = FakeSlackClient()
+    client.replies = [
+        {"ts": "1", "user": "U1", "text": "expand on that"},
+        {"ts": "2", "user": BOT, "text": "here is my answer"},
+        {"ts": "3", "user": "U1", "text": "do what you suggested"},
+        {"ts": "4", "user": BOT, "text": "x" * 600},
+        {"ts": "5", "bot_id": "B1", "text": "some other bot's message"},
+        {"ts": "trigger", "user": "U1", "text": "follow up"},
+    ]
+    transcript = await fetch_thread_transcript(client, "C1", "1", "trigger", bot_user_id=BOT, bot_name="Red")
+    assert "Red: here is my answer" in transcript
+    assert "<@U1>: expand on that" in transcript
+    assert "<@U1>: do what you suggested" in transcript
+    assert f"Red: {'x' * 500}" in transcript
+    assert "x" * 600 not in transcript
+    assert "Red: some other bot's message" not in transcript
 
 
 @pytest.mark.asyncio
@@ -685,6 +706,25 @@ async def test_requester_lifecycle_messages_omit_task_id(make_task):
     assert client.posts[1]["text"] == "*Failed*\nit broke"
     assert client.posts[3]["text"] == "The orchestrator restarted; this task was requeued and will resume."
     assert client.posts[4]["text"] == "Can't take this task: unsupported"
+
+
+@pytest.mark.asyncio
+async def test_issue_blocked_links_to_the_reopened_issue(make_task):
+    task = make_task()
+    task.blocked_reason = "needs repo access"
+    issue = {"id": 42}
+    client = FakeSlackClient()
+    notifier = SlackNotifier(client, dashboard_url="https://dash.example.test")
+
+    await notifier.issue_blocked(task, issue)
+
+    text = client.posts[0]["text"]
+    assert "needs repo access" in text
+    assert "https://dash.example.test/issues?issue=42" in text
+
+    client.posts.clear()
+    await SlackNotifier(client).issue_blocked(task, issue)  # no dashboard_url configured
+    assert "issues?issue=42" not in client.posts[0]["text"]
 
 
 @pytest.mark.asyncio

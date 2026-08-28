@@ -14,17 +14,18 @@ class ConfigError(Exception):
     pass
 
 
+# connected services an operator can turn on/off, each configurable in its own services/<name>.yaml file
+KNOWN_SERVICES = ("slack", "github", "jira", "confluence", "sentry", "aws")
+
+
 @dataclass
 class SlackConfig:
     team_id: str
     allowed_channels: list[str]  # empty = any channel the bot is invited to (the invite is the gate)
+    enabled: bool = False
     ack_reaction: bool = True
     debug_channel: str = ""
     task_started_messages_path: str | None = None
-
-    @property
-    def enabled(self) -> bool:
-        return bool(self.team_id)
 
 
 @dataclass
@@ -94,6 +95,14 @@ class Config:
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     reviewer: ReviewerConfig = field(default_factory=ReviewerConfig)
     cli_update: CliUpdateConfig = field(default_factory=CliUpdateConfig)
+    services: dict[str, bool] = field(default_factory=dict)  # KNOWN_SERVICES name -> enabled
+
+    def service_enabled(self, name: str) -> bool:
+        return bool(self.services.get(name, False))
+
+    def enabled_integrations(self) -> list[str]:
+        # the classifier's integration vocabulary (prompts.CLASSIFICATION_SCHEMA), narrowed to services that are on
+        return [name for name in ("github", "aws", "sentry", "jira", "confluence") if self.service_enabled(name)]
 
 
 def load_config(path: str) -> Config:
@@ -112,7 +121,9 @@ def load_config(path: str) -> Config:
     runner = orchestrator.get("runner", "echo")
     if runner not in ("echo", "claude"):
         raise ConfigError(f"orchestrator.runner must be 'echo' or 'claude', got {runner!r}")
-    slack = _slack_config(raw.get("slack") or {}, path)
+    _merge_service_files(raw, path)
+    services = _services_config(raw)
+    slack = _slack_config(raw.get("slack") or {}, path, enabled=services["slack"])
     github = raw.get("github") or {}
     if not isinstance(github, dict):
         raise ConfigError("github section must be a mapping")
@@ -144,7 +155,77 @@ def load_config(path: str) -> Config:
         dashboard=dashboard,
         reviewer=reviewer,
         cli_update=cli_update,
+        services=services,
     )
+
+
+def _merge_service_files(raw: dict, config_path: str) -> None:
+    """fold services/<name>.yaml files (next to config.yaml) into their top-level sections."""
+    services_dir = Path(config_path).resolve().parent / "services"
+    if not services_dir.is_dir():
+        return
+    for file in sorted(services_dir.glob("*.yaml")):
+        if file.name.startswith("."):
+            continue  # editor/os droppings must not brick a restart
+        name = file.stem
+        if name not in KNOWN_SERVICES:
+            raise ConfigError(f"services/{file.name} is not a known service config (known services: {', '.join(KNOWN_SERVICES)})")
+        if name in raw:
+            raise ConfigError(f"{name} is configured in both config.yaml and services/{file.name} — keep only services/{file.name}")
+        try:
+            section = yaml.safe_load(file.read_text())
+        except OSError as e:
+            raise ConfigError(f"services/{file.name} could not be read: {e}")
+        except yaml.YAMLError as e:
+            raise ConfigError(f"services/{file.name} is not valid yaml: {e}")
+        if not isinstance(section, dict):
+            raise ConfigError(f"services/{file.name} must be a yaml mapping")
+        if not isinstance(section.get("enabled"), bool):
+            raise ConfigError(f"services/{file.name} must set enabled: true or false")
+        raw[name] = section
+
+
+def service_enabled_in(raw: dict, name: str) -> bool:
+    """resolved enabled flag for one service section: the explicit key, else legacy inference."""
+    section = raw.get(name) or {}
+    enabled = section.get("enabled") if isinstance(section, dict) else None
+    if isinstance(enabled, bool):
+        return enabled
+    return _legacy_enabled(name, section if isinstance(section, dict) else {})
+
+
+def _legacy_enabled(name: str, section: dict) -> bool:
+    # configs from before the enabled flag signal "on" by filling in a key; github was gated by secrets alone
+    if name == "slack":
+        return bool(section.get("team_id"))
+    if name in ("jira", "confluence"):
+        return bool(section.get("site"))
+    if name == "sentry":
+        return bool(section.get("organization"))
+    if name == "aws":
+        return bool(section.get("allowed_services"))
+    return name == "github"
+
+
+def _services_config(raw: dict) -> dict[str, bool]:
+    services: dict[str, bool] = {}
+    for name in KNOWN_SERVICES:
+        section = raw.get(name)
+        if section is None:
+            section = {}
+        if not isinstance(section, dict):
+            raise ConfigError(f"{name} section must be a mapping")
+        enabled = section.get("enabled")
+        if enabled is None:
+            enabled = _legacy_enabled(name, section)
+        if not isinstance(enabled, bool):
+            raise ConfigError(f"{name}.enabled must be a boolean, got {enabled!r}")
+        if enabled:
+            required = {"slack": "team_id", "jira": "site", "confluence": "site", "sentry": "organization", "aws": "allowed_services"}.get(name)
+            if required and not section.get(required):
+                raise ConfigError(f"{name}.{required} is required when {name} is enabled")
+        services[name] = enabled
+    return services
 
 
 def _cli_update_config(section: object) -> CliUpdateConfig:
@@ -269,7 +350,7 @@ def _dashboard_config(section: object, agent_name: str) -> DashboardConfig:
     )
 
 
-def _slack_config(section: dict, config_path: str) -> SlackConfig:
+def _slack_config(section: dict, config_path: str, enabled: bool = False) -> SlackConfig:
     if not isinstance(section, dict):
         raise ConfigError("slack section must be a mapping")
     legacy = [key for key in ("allowed_users", "admins") if key in section]
@@ -293,6 +374,7 @@ def _slack_config(section: dict, config_path: str) -> SlackConfig:
     return SlackConfig(
         team_id=team_id,
         allowed_channels=_str_list(section, "allowed_channels"),
+        enabled=enabled,
         ack_reaction=ack_reaction,
         debug_channel=debug_channel,
         task_started_messages_path=messages_path,
@@ -320,7 +402,7 @@ def _roles_config(raw: dict, slack: SlackConfig) -> dict[str, Role]:
     section = raw.get("roles") or {}
     if not isinstance(section, dict):
         raise ConfigError("roles section must be a mapping")
-    if slack.team_id and not section:
+    if slack.enabled and not section:
         raise ConfigError("roles must contain at least one role when Slack intake is enabled")
     profiles = raw.get("profiles") or {}
     approved_repos = set((raw.get("github") or {}).get("approved_repos") or [])

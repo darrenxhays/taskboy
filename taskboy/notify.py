@@ -1,6 +1,6 @@
 """notifier interface (duck-typed) + stdout implementation, used before slack lands and by `inject --no-slack`.
 
-any notifier must provide: ack, started, completed, failed, blocked, recovered, refused, refuse_intake, answer.
+any notifier must provide: ack, started, completed, failed, blocked, issue_blocked, recovered, refused, refuse_intake, answer.
 """
 
 from taskboy.models import Task
@@ -21,6 +21,9 @@ class StdoutNotifier:
 
     async def blocked(self, task: Task) -> None:
         print(f"[{task.task_id}] blocked: {task.blocked_reason}")
+
+    async def issue_blocked(self, task: Task, issue: dict) -> None:
+        print(f"[{task.task_id}] blocked: {task.blocked_reason} (reopened issue #{issue['id']})")
 
     async def recovered(self, task: Task) -> None:
         print(f"[{task.task_id}] requeued after restart")

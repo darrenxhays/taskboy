@@ -107,6 +107,29 @@ def test_task_prompt_uses_configured_names_instead_of_hardcoded_red_blue(make_ta
     assert "Do not request" not in blue_prompt
 
 
+def test_task_prompt_uses_full_report_reply_rule_for_report_style_task_types(make_task):
+    for task_type in ("question", "investigation", "incident_diagnosis"):
+        task = make_task()
+        task.task_type = task_type
+        prompt = task_prompt(task, None, [])
+        assert "the deliverable is information, not a code" in prompt, task_type
+        assert "TLDR at the top" in prompt, task_type
+        assert 'never say "see below"' in prompt, task_type
+        assert "`## Reply`: 2–6 human sentences" not in prompt, task_type
+
+
+def test_task_prompt_keeps_short_reply_rule_for_non_report_task_types(make_task):
+    task = make_task()
+    task.task_type = "bug_fix"
+    prompt = task_prompt(task, None, [])
+    assert "`## Reply`: 2–6 human sentences" in prompt
+    assert "the deliverable is information, not a code" not in prompt
+
+    unclassified = make_task()
+    assert unclassified.task_type is None
+    assert "`## Reply`: 2–6 human sentences" in task_prompt(unclassified, None, [])
+
+
 def test_personality_shapes_reply_but_not_internal_report(make_task):
     task = make_task()
     prompt = task_prompt(task, None, [], personality="Dry, concise, exact.")

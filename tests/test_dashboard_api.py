@@ -536,6 +536,34 @@ async def test_issue_priority_refine_and_bulk_endpoints(dashboard, store):
     assert bulk.status_code == 200
     assert {row["id"]: row["status"] for row in bulk.json()["results"]} == {editable["id"]: "approved", locked["id"]: "skipped", 9999: "skipped"}
     assert (await client.post("/api/issues/bulk", headers=admin_headers(), json={"ids": [], "action": "approve"})).status_code == 400
+    assert (await client.post("/api/issues/bulk", headers=admin_headers(), json={"ids": [editable["id"]], "action": "bogus"})).status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_bulk_issues_delete_action_skips_active_and_missing(dashboard, store):
+    client, _, _ = dashboard
+    first = store.record_issue("bulk-delete-1", "redzone-co/agent-red", "s", "bug", "d", 50)
+    second = store.record_issue("bulk-delete-2", "redzone-co/agent-red", "s", "bug", "d", 50)
+    active = store.record_issue("bulk-delete-active", "redzone-co/agent-red", "s", "bug", "d", 50)
+    store.decide_issue(active["id"], "approved", ADMIN)
+    [reserved] = store.reserve_issues("coordinator", 1)
+    store.start_issue(reserved["id"], None, "spec")
+
+    bulk = await client.post(
+        "/api/issues/bulk",
+        headers=admin_headers(),
+        json={"ids": [first["id"], second["id"], active["id"], 9999], "action": "delete"},
+    )
+    assert bulk.status_code == 200
+    assert {row["id"]: row["status"] for row in bulk.json()["results"]} == {
+        first["id"]: "deleted",
+        second["id"]: "deleted",
+        active["id"]: "skipped",
+        9999: "skipped",
+    }
+    assert store.get_issue(first["id"]) is None
+    assert store.get_issue(second["id"]) is None
+    assert store.get_issue(active["id"]) is not None
 
 
 @pytest.mark.asyncio

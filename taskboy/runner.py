@@ -13,7 +13,7 @@ import shutil
 from datetime import datetime, timedelta, timezone
 
 from taskboy import memory, repocache, settings, skills, workspace
-from taskboy.config import Config, role_for
+from taskboy.config import KNOWN_SERVICES, Config, role_for
 from taskboy.hooks import TOOL_CLASSIFICATION, TaskHooks, repo_grantable, tool_grantable
 from taskboy.models import BLOCKED, COMPLETED, FAILED, Outcome, Task
 from taskboy.personality import load as load_personality
@@ -78,6 +78,12 @@ def record_rate_limit_event(store: Store, task: Task, message) -> int | None:
             logger.exception("failed to record rate-limit event for %s", task.task_id)
         return None
     return detail["resets_at"]  # type: ignore[return-value]
+
+
+def strip_disabled_service_tools(tools: list[str], config: Config) -> list[str]:
+    """drop mcp tools belonging to services the operator turned off, so allowlists and prompts never advertise dead tools."""
+    disabled = [name for name in KNOWN_SERVICES if not config.service_enabled(name)]
+    return [tool for tool in tools if not any(tool.startswith(f"mcp__{name}__") for name in disabled)]
 
 
 def session_option_kwargs(task: Task, model_id: str, ws, profile: dict) -> dict:
@@ -147,7 +153,7 @@ class ClaudeRunner:
         # operator-granted permissions widen this run's scope: extra tools go to the allowlist, extra repos get cloned.
         # grants are gated exactly like the original request — recognized tools within the profile tier; a granted repo
         # either was already role-scoped, or is an org/installation-grantable escalation (repo_grantable, issue #39)
-        profile_tools = list(((self.config.raw.get("profiles") or {}).get(task.profile or "", {})).get("allowed_tools") or [])
+        profile_tools = strip_disabled_service_tools(list(((self.config.raw.get("profiles") or {}).get(task.profile or "", {})).get("allowed_tools") or []), self.config)
         granted = self.store.granted_permissions_for(task.task_id)
         granted_tools = [tool_name for tool_name in granted["tools"] if tool_grantable(tool_name, profile_tools)]
         accessible_repos = task_broker.accessible_repos if task_broker is not None else None
@@ -184,8 +190,7 @@ class ClaudeRunner:
         personality = load_personality(personality_path)
         if personality:
             self.store.add_event(task.task_id, "personality", {"hash": personality[1], "path": personality_path})
-        jira_config = self.config.raw.get("jira") or {}
-        jira_available = bool(self.secrets is not None and self.secrets.jira_enabled and jira_config.get("site"))
+        jira_available = bool(self.config.service_enabled("jira") and self.secrets is not None and self.secrets.jira_enabled and (self.config.raw.get("jira") or {}).get("site"))
         prompt = task_prompt(
             task,
             memory.parent_context(self.store, self.memory_root, task),
@@ -242,6 +247,7 @@ class ClaudeRunner:
             allowed_tools += [name for name in ISSUES_TOOLS if name not in allowed_tools]
         if "enqueue" in internal:
             allowed_tools += [name for name in ENQUEUE_TOOLS if name not in allowed_tools]
+        allowed_tools = strip_disabled_service_tools(allowed_tools, self.config)
         profile = {**profile, "allowed_tools": allowed_tools}
         hooks = TaskHooks(self.store, task, github.get("protected_branch_patterns") or [], allowed_tools=allowed_tools or None)
         # metadata-disabled is the sdk-level courtesy layer; the real imds block is the per-uid iptables rule on the host (§8.3)
@@ -261,19 +267,11 @@ class ClaudeRunner:
         if task_broker is not None:
             from taskboy.adapters.github_api import GitHubAdapter, build_github_server
 
-            bot_logins = []
-            for broker in (self.broker, self.reviewer_broker):
-                if broker is None:
-                    continue
-                try:
-                    login = f"{await broker.app_slug()}[bot]"
-                    if login not in bot_logins:
-                        bot_logins.append(login)
-                except Exception as exc:
-                    logger.warning("could not determine github app login for %s: %s", task.task_id, exc)
-            mcp_servers["github"] = build_github_server(GitHubAdapter(task_broker, self.store, task, scoped_repos, on_milestone=self._on_artifact_milestone(task), bot_logins=bot_logins, bot_name=bot_name, other_bot_name=other_bot_name))
+            mcp_servers["github"] = build_github_server(
+                GitHubAdapter(task_broker, self.store, task, scoped_repos, on_milestone=self._on_artifact_milestone(task), main_broker=self.broker, reviewer_broker=self.reviewer_broker, bot_name=bot_name, other_bot_name=other_bot_name, can_approve=is_reviewer)
+            )
         jira_config = self.config.raw.get("jira") or {}
-        if self.secrets is not None and self.secrets.jira_enabled and jira_config.get("site"):
+        if self.config.service_enabled("jira") and self.secrets is not None and self.secrets.jira_enabled and jira_config.get("site"):
             from taskboy.adapters.jira import JiraAdapter, build_jira_server
 
             mcp_servers["jira"] = build_jira_server(
@@ -291,17 +289,17 @@ class ClaudeRunner:
                 )
             )
         confluence_config = self.config.raw.get("confluence") or {}
-        if self.secrets is not None and self.secrets.jira_enabled and confluence_config.get("site"):
+        if self.config.service_enabled("confluence") and self.secrets is not None and self.secrets.jira_enabled and confluence_config.get("site"):
             from taskboy.adapters.confluence import ConfluenceAdapter, build_confluence_server
 
             mcp_servers["confluence"] = build_confluence_server(ConfluenceAdapter(self.store, task, confluence_config["site"], self.secrets.jira_email, self.secrets.jira_api_token, confluence_config.get("spaces") or []))
         sentry_config = self.config.raw.get("sentry") or {}
-        if self.secrets is not None and self.secrets.sentry_token and sentry_config.get("organization"):
+        if self.config.service_enabled("sentry") and self.secrets is not None and self.secrets.sentry_token and sentry_config.get("organization"):
             from taskboy.adapters.sentry import SentryAdapter, build_sentry_server
 
             mcp_servers["sentry"] = build_sentry_server(SentryAdapter(self.store, task, sentry_config["organization"], self.secrets.sentry_token, sentry_config.get("projects") or []))
         aws_config = self.config.raw.get("aws") or {}
-        if aws_config.get("allowed_services"):
+        if self.config.service_enabled("aws") and aws_config.get("allowed_services"):
             from taskboy.adapters.aws_read import AwsReadAdapter, build_aws_server
 
             mcp_servers["aws"] = build_aws_server(AwsReadAdapter(self.store, task, aws_config["allowed_services"], aws_config.get("allowed_regions") or [], role_arns=aws_config.get("diagnostics_role_arns") or {}))
@@ -429,6 +427,8 @@ class ClaudeRunner:
             self.store.ask_questions(task.task_id, questions)
             self.store.add_event(task.task_id, "questions_asked", {"questions": questions[:1000]})
             blocked["reason"] = "waiting for the requester to answer follow-up questions"
+            if self.store.issue_for_task(task.task_id) is not None:
+                return "recorded; this task is tracked as an issue, so it will be reopened as 'proposed' with these questions posted there instead of asked in the Slack thread. stop working now."
             return "recorded; the requester will be asked in the Slack thread and this task resumes automatically with their answers. stop working now."
 
         return ask

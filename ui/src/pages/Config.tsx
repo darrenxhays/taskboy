@@ -196,6 +196,9 @@ export function ConfigPage({ admin }: { admin: boolean }) {
         <Panel title="Management — edits apply live and auto-commit to git">
           <div className="flex flex-wrap gap-2">
             {editButton("config", "⚙ config.yaml")}
+            {Object.entries(data.services ?? {})
+              .filter(([, service]) => service.editable)
+              .map(([name, service]) => editButton("service", `${service.enabled ? "●" : "○"} services/${name}.yaml`, name))}
             {personalityEnabled && editButton("personality", "◈ personality")}
             {reviewerEnabled && editButton("reviewer_personality", "◈ reviewer personality")}
             {conventionsEnabled && editButton("conventions", "§ conventions")}
@@ -251,7 +254,7 @@ export function ConfigPage({ admin }: { admin: boolean }) {
         </Panel>
       </div>
 
-      <Panel title="Operator policy — config.yaml (redacted)">
+      <Panel title="Operator policy — config.yaml + services/*.yaml merged (redacted)">
         <pre className="mono max-h-[480px] overflow-auto rounded-md border p-3 text-[11px] leading-relaxed" style={{ borderColor: "var(--hairline)", background: "var(--surface-2)", color: "var(--text-secondary)" }}>
           {JSON.stringify(data.policy, null, 2)}
         </pre>

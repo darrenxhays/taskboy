@@ -1,0 +1,6 @@
+# jira service — issue reads and writes through the jira mcp tools.
+enabled: false # true requires site below plus JIRA_EMAIL / JIRA_API_TOKEN in the environment
+site: "" # e.g. https://your-org.atlassian.net
+projects: [] # project keys the agent may touch, e.g. [ENG]
+issue_types: [Story, Bug, Task]
+story_points_field: "" # e.g. customfield_10016; empty = story points not set

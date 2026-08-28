@@ -14,6 +14,7 @@ from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from taskboy.config import Config
+from taskboy.issue_runs import start_implementation_run
 from taskboy.models import utcnow
 from taskboy.orchestrator import accept_task
 from taskboy.store import Store
@@ -78,12 +79,20 @@ async def fire_due(store: Store, config: Config, notifier, now: datetime) -> int
         try:
             # key the task to the slot that triggered it so a double-tick can't create two tasks for one slot
             slot = str(schedule["next_run_at"])
-            if _is_implementation_run(schedule["request_text"]) and store.active_implementation_run() is not None:
-                # the single-coordinator invariant applies here too: a scheduled implementation run firing
-                # while one is still active (dashboard-started or a still-running prior scheduled run) would
-                # otherwise skip the dashboard's active_implementation_run() guard entirely
-                task, status = None, "already_running"
-                logger.info("schedule %s skipped: an implementation coordinator is already active", schedule["id"])
+            if _is_implementation_run(schedule["request_text"]):
+                # reserve the batch before the coordinator exists so an empty queue never starts one
+                task, status, _active = await start_implementation_run(
+                    store,
+                    config,
+                    notifier,
+                    request_text=schedule["request_text"],
+                    user_id=SCHEDULE_USER,
+                    channel_id=config.slack.debug_channel,
+                    thread_key=f"schedule:{schedule['id']}@{slot}",
+                    model_override=schedule["model_alias"] or None,
+                    effort_override=schedule["effort"] or None,
+                    schedule_name=schedule["name"],
+                )
             else:
                 task, status = await accept_task(
                     store,
@@ -118,9 +127,21 @@ async def fire_due(store: Store, config: Config, notifier, now: datetime) -> int
 
 async def fire_schedule_now(store: Store, config: Config, notifier, schedule: dict):
     """fire a schedule immediately without advancing its next_run_at (a manual run-now from the dashboard)."""
-    if _is_implementation_run(schedule["request_text"]) and store.active_implementation_run() is not None:
-        return None, "already_running"
     slot = utcnow()
+    if _is_implementation_run(schedule["request_text"]):
+        task, status, _active = await start_implementation_run(
+            store,
+            config,
+            notifier,
+            request_text=schedule["request_text"],
+            user_id=SCHEDULE_USER,
+            channel_id=config.slack.debug_channel,
+            thread_key=f"schedule:{schedule['id']}:manual@{slot}",
+            model_override=schedule["model_alias"] or None,
+            effort_override=schedule["effort"] or None,
+            schedule_name=schedule["name"],
+        )
+        return task, status
     return await accept_task(
         store,
         config,
@@ -231,14 +252,17 @@ SEED_SCHEDULES = [
 SEED_TIMEZONE = "America/Los_Angeles"
 
 
-def seed_default_schedules(store: Store, self_repo: str = "") -> None:
+def seed_default_schedules(store: Store, self_repo: str = "", github_enabled: bool = True) -> None:
     """install the shipped issues schedules exactly once, so an operator can later edit or delete them."""
     if store.meta_get("schedules_seeded") == "1":
         return
     now = _now()
     seeds = list(SEED_SCHEDULES)
+    if not github_enabled:
+        # the issues pipeline needs github; a github-less install only gets the warm-up
+        seeds = [seed for seed in seeds if seed["seed_key"] == "warmup-daily"]
     # daily issue discovery only makes sense against a repo; default to the agent's own when configured
-    if self_repo:
+    if self_repo and github_enabled:
         seeds.insert(0, {"seed_key": "discoverissues-daily", "name": "Discover issues (daily)", "request_text": f"/discoverissues {self_repo}", "at_time": "00:00"})
     for seed in seeds:
         nxt = next_run_after("daily", interval_minutes=None, at_time=seed["at_time"], run_at=None, tzname=SEED_TIMEZONE, after=now)

@@ -256,12 +256,18 @@ An operator granted these additional permissions for this task; they are active 
     if personality:
         sections.append(
             f"""## Personality
-Use this voice only for the requester-facing `## Reply`. Keep the internal Final Report factual and structured.
+Use this voice only for the requester-facing `## Reply`. Keep the internal Final Report factual and structured. Personality governs voice, not length or structure — the Reply length/format rule below always wins over any brevity guidance here (e.g. "keep replies to a sentence or two").
 
 {personality}"""
         )
+    report_style = task.task_type in ("question", "investigation", "incident_diagnosis")
+    reply_rule = (
+        """`## Reply`: this task's type was classified as question, investigation, or incident_diagnosis — the deliverable is information, not a code change. Put the complete findings here, not a pointer to the Final Report: a short TLDR at the top, then the full detail as well-spaced bullet points. If the finding is genuinely a short, direct fact (e.g. a one-line question with a one-line answer), a plain one- or two-sentence answer is fine — do not pad it into an artificial TLDR-plus-bullets structure. The requester never sees the Final Report, so never say "see below", "full breakdown below", or similar."""
+        if report_style
+        else "`## Reply`: 2–6 human sentences addressed to the requester. Say what happened and what they should know. Do not add headings inside it or restate the report. Follow the Personality section when present."
+    )
     sections.append(
-        """## How to work
+        f"""## How to work
 - Post a short update with the `report_progress` tool at meaningful milestones only (investigation done, root cause found, fix ready) — not for every step.
 - Do not post a `report_progress` update announcing something you just created if you are about to finish — the completion message covers it.
 - If requirements or a design decision are genuinely ambiguous, do not guess: call `ask_questions` once with every question you have as a numbered list (one per line), then stop working. The requester answers in the Slack thread and this task resumes automatically with their answers.
@@ -273,7 +279,7 @@ Use this voice only for the requester-facing `## Reply`. Keep the internal Final
 ## Required ending
 End with these two markdown sections, in this order:
 
-`## Reply`: 2–6 human sentences addressed to the requester. Say what happened and what they should know. Do not add headings inside it or restate the report. Follow the Personality section when present.
+{reply_rule}
 
 `## Final Report`: Result, Actions taken, Artifacts (with links), Testing performed, Unresolved issues. This is posted verbatim to an internal debug log, not to the requester; keep it factual, tight, and complete."""
     )

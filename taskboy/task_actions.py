@@ -4,7 +4,7 @@ import time
 
 from taskboy.config import Config
 from taskboy.models import BLOCKED, CANCELLED, FAILED, QUEUED, TERMINAL_STATES, Task, utcnow
-from taskboy.orchestrator import accept_task
+from taskboy.orchestrator import accept_task, reopen_issue_and_cancel
 from taskboy.store import Store, TransitionRaced
 
 
@@ -22,8 +22,6 @@ def cancel_task(store: Store, task_id: str, actor: str) -> tuple[Task | None, st
         if current is not None:
             store.add_event(task_id, "operator_action", {"actor": actor, "action": "cancel", "outcome": "raced", "state": current.state})
         return current, f"already {current.state}" if current else "not found"
-    # a cancelled coordinator must not strand its reserved issues until restart
-    store.release_reserved_issues(task_id)
     store.add_event(task_id, "operator_action", {"actor": actor, "action": "cancel", "outcome": "cancelled", "previous_state": task.state})
     return cancelled, "cancelled"
 
@@ -35,6 +33,10 @@ async def retry_task(store: Store, config: Config, notifier, source_task_id: str
     if source.state not in (FAILED, CANCELLED):
         store.add_event(source_task_id, "operator_action", {"actor": actor, "action": "retry", "outcome": "rejected", "state": source.state})
         return source, f"cannot retry {source.state}"
+    if (source.request_text or "").startswith("/spec2pr "):
+        # an issue-backed task's issue is already back to `proposed` with no spec by the time it's terminal (#76)
+        store.add_event(source_task_id, "operator_action", {"actor": actor, "action": "retry", "outcome": "rejected", "state": source.state, "reason": "issue_backed"})
+        return source, "cannot retry an issue-backed task — re-approve its issue instead"
     retried, status = await accept_task(
         store,
         config,
@@ -56,8 +58,8 @@ async def retry_task(store: Store, config: Config, notifier, source_task_id: str
     return retried, status
 
 
-def decide_permission(store: Store, task_id: str, kind: str, target: str, decision: str, actor: str) -> tuple[Task | None, str]:
-    """grant or deny a sub-agent's permission request. granting a blocked task also resumes it so it runs again with the access."""
+async def decide_permission(store: Store, notifier, task_id: str, kind: str, target: str, decision: str, actor: str) -> tuple[Task | None, str]:
+    """grant or deny a sub-agent's permission request: granting a blocked task resumes it, denying reopens and cancels its issue-backed task instead of stranding it (#76)."""
     if decision not in ("granted", "denied"):
         return None, "decision must be granted or denied"
     task = store.get_task(task_id)
@@ -68,13 +70,17 @@ def decide_permission(store: Store, task_id: str, kind: str, target: str, decisi
         store.add_event(task_id, "operator_action", {"actor": actor, "action": f"permission_{decision}", "outcome": "no pending request", "kind": kind, "target": target})
         return task, "no pending request"
     store.add_event(task_id, "permission_decision", {"actor": actor, "decision": decision, "kind": kind, "target": target})
-    if decision == "granted":
-        # re-read: the task may have settled into BLOCKED since we first fetched it. if it is still RUNNING, the
-        # orchestrator will pick up this grant when the session ends (run-start grant snapshot diff), so we leave it be here.
-        task = store.get_task(task_id) or task
-        if task.state == BLOCKED:
+    # re-read: the task may have settled into BLOCKED since we first fetched it. if it is still RUNNING, the
+    # orchestrator will pick up this grant when the session ends (run-start grant snapshot diff), so we leave it be here.
+    task = store.get_task(task_id) or task
+    if task.state == BLOCKED:
+        if decision == "granted":
             try:
                 task = store.transition(task_id, BLOCKED, QUEUED, f"resumed after permission granted by {actor}", resume_session_id=task.session_id)
             except TransitionRaced:
                 pass
+        elif not store.has_pending_permission_request(task_id):
+            # no other request is still pending on this task; an issue-backed task must not strand its issue in_progress forever (#76)
+            if await reopen_issue_and_cancel(store, notifier, task):
+                task = store.get_task(task_id) or task
     return task, decision

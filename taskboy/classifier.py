@@ -84,7 +84,7 @@ class Classifier:
             skill_config = self.config.raw.get("skills") or {}
             loaded = skills.load(settings.SKILLS_ROOT, name)
             profile = str(loaded.profile or skill_config.get("profile", "standard"))
-            approved_repos = (self.config.raw.get("github") or {}).get("approved_repos") or []
+            approved_repos = ((self.config.raw.get("github") or {}).get("approved_repos") or []) if self.config.service_enabled("github") else []
             if role.repos is not None:
                 approved_repos = [repo for repo in approved_repos if repo in role.repos]
             target_repos = []
@@ -136,7 +136,7 @@ class Classifier:
         return _task_fields(classification, decision, _review_persona(classification, self.config.reviewer.enabled))
 
     async def _classify_once(self, task: Task, role: Role | None = None) -> tuple[dict, dict | None, bool]:
-        github = self.config.raw.get("github") or {}
+        github = (self.config.raw.get("github") or {}) if self.config.service_enabled("github") else {}
         approved_repos = github.get("approved_repos") or []
         if role is not None and role.repos is not None:
             approved_repos = [repo for repo in approved_repos if repo in role.repos]
@@ -144,7 +144,7 @@ class Classifier:
         prompt = classifier_prompt(
             task.request_text,
             approved_repos,
-            ["github", "aws", "sentry", "jira", "confluence"],
+            self.config.enabled_integrations(),
             trim_context(task.thread_context),
             self_repo=self_repo if self_repo in approved_repos else None,
             bot_name=self.config.agent_name,

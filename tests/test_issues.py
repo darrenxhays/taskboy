@@ -396,6 +396,28 @@ def test_active_implementation_run_tracks_non_terminal_coordinator(store, make_t
     assert store.active_implementation_run() is None
 
 
+def test_active_implementation_run_still_tracks_blocked_coordinator_after_its_batch_is_enqueued(store, make_task):
+    row = rec(store, key="enqueued-then-blocked")
+    store.decide_issue(row["id"], "approved", "boss")
+    task = make_task(text="/implementapprovedissues")
+    store.reserve_issues(task.task_id, 1)
+    # the whole batch is handed off, so nothing is implementation_queued anymore — the coordinator is still parked and resumable
+    store.start_issue(row["id"], None, "spec")
+    store.transition(task.task_id, task.state, BLOCKED, "needs permission")
+    assert store.active_implementation_run() == task.task_id
+
+
+def test_fail_stalled_implementation_run_fails_stalled_coordinator_holding_no_reservation(store, make_task):
+    task = make_task(text="/implementapprovedissues")
+    store.transition(task.task_id, RECEIVED, BLOCKED, "no approved issues are waiting to be implemented")
+    stale_at = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(timespec="seconds")
+    store.conn.execute("UPDATE tasks SET updated_at = ? WHERE task_id = ?", (stale_at, task.task_id))
+    store.conn.commit()
+
+    assert fail_stalled_implementation_run(store) == task.task_id
+    assert store.get_task(task.task_id).state == FAILED
+
+
 def test_fail_stalled_implementation_run_fails_blocked_coordinator_and_releases_reservations(store, make_task):
     row = rec(store, key="stalled")
     store.decide_issue(row["id"], "approved", "boss")
@@ -411,6 +433,20 @@ def test_fail_stalled_implementation_run_fails_blocked_coordinator_and_releases_
     assert store.get_issue(row["id"])["status"] == "approved"
     assert store.active_implementation_run() is None
     assert "recovery" in [event["kind"] for event in store.events_for(task.task_id)]
+
+
+def test_fail_stalled_implementation_run_reaches_a_stale_coordinator_behind_a_fresh_one(store, make_task):
+    stale = make_task(text="/implementapprovedissues")
+    store.transition(stale.task_id, RECEIVED, BLOCKED, "needs permission")
+    stale_at = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(timespec="seconds")
+    store.conn.execute("UPDATE tasks SET updated_at = ? WHERE task_id = ?", (stale_at, stale.task_id))
+    store.conn.commit()
+    fresh = make_task(text="/implementapprovedissues")
+    store.transition(fresh.task_id, RECEIVED, BLOCKED, "needs permission")
+
+    # oldest-updated first, so the newer blocked coordinator can't hide the stale one from the sweep
+    assert fail_stalled_implementation_run(store) == stale.task_id
+    assert store.get_task(fresh.task_id).state == BLOCKED
 
 
 def test_fail_stalled_implementation_run_leaves_fresh_blocked_coordinator_alone(store, make_task):
@@ -444,6 +480,27 @@ def test_release_reserved_issues_restores_only_the_given_reservation(store):
     assert store.get_issue(a["id"])["reserved_by"] is None
     # a reservation held by someone else, or none at all, is untouched
     assert store.release_reserved_issues("coordinator-1") == 0
+
+
+def test_has_ever_reserved_stays_true_after_the_batch_is_claimed_or_released(store):
+    assert store.has_ever_reserved("coordinator-1") is False
+    row = rec(store, key="a")
+    store.decide_issue(row["id"], "approved", "boss")
+    store.reserve_issues("coordinator-1", 1)
+    assert store.has_ever_reserved("coordinator-1") is True
+    store.start_issue(row["id"], None, "spec")  # claims it; reserved_by is left in place
+    assert store.has_ever_reserved("coordinator-1") is True
+
+
+def test_has_pending_implementation_reservation_only_while_a_pending_marker_holds_one(store, make_task):
+    assert store.has_pending_implementation_reservation() is False
+    row = rec(store, key="a")
+    store.decide_issue(row["id"], "approved", "boss")
+    store.reserve_issues("pending:abc123", 1)
+    assert store.has_pending_implementation_reservation() is True
+    task = make_task(text="/implementapprovedissues")
+    store.assign_reservation("pending:abc123", task.task_id)  # the marker becomes a real task id
+    assert store.has_pending_implementation_reservation() is False
 
 
 def test_release_stale_reservations_restores_orphaned_and_terminal_coordinators(store, make_task):
@@ -503,6 +560,25 @@ async def test_list_accepted_issues_returns_only_this_runs_reservation_and_reser
     # a second call returns the same reserved batch rather than reserving again
     again = await adapter.list_accepted_issues({})
     assert json.loads(again["content"][0]["text"]) == payload
+
+
+@pytest.mark.asyncio
+async def test_list_accepted_issues_never_reserves_a_second_batch_once_the_first_is_handed_off(store, make_task):
+    # start_implementation_run reserves this coordinator's batch before the task even exists, so by the time the
+    # coordinator makes its first list_accepted_issues call it may already hold nothing under implementation_queued
+    # (its whole batch was claimed via start_issue) — that must never be mistaken for "never reserved"
+    coordinator = make_task(text="/implementapprovedissues")
+    mine = rec(store, key="mine")
+    later = rec(store, key="later")
+    store.decide_issue(mine["id"], "approved", "boss")
+    store.decide_issue(later["id"], "approved", "boss")
+    store.reserve_issues(coordinator.task_id, 1)  # claims "mine"
+    store.start_issue(mine["id"], None, "spec")  # hands the whole batch off; nothing left implementation_queued
+
+    adapter = IssuesAdapter(store, coordinator, ["example-org/taskboy"])
+    result = await adapter.list_accepted_issues({})
+    assert result["content"][0]["text"] == "no approved issues are waiting to be implemented"
+    assert store.get_issue(later["id"])["status"] == "approved"  # left alone, not swept into a second reservation
 
 
 @pytest.mark.asyncio

@@ -35,13 +35,14 @@ export function IconButton({ onClick, disabled, title, borderColor, color, fille
 }
 
 // arm-then-confirm icon button: first click arms it (shows a confirm/cancel pair), second click acts.
-export function ConfirmIconButton({ onConfirm, disabled, title, borderColor, color, children }: { onConfirm: () => void; disabled?: boolean; title: string; borderColor: string; color: string; children: ReactNode }) {
+export function ConfirmIconButton({ onConfirm, disabled, title, label, borderColor, color, children }: { onConfirm: () => void; disabled?: boolean; title: string; label?: string; borderColor: string; color: string; children: ReactNode }) {
   const [armed, setArmed] = useState(false);
   if (!armed) {
     return <IconButton onClick={() => setArmed(true)} disabled={disabled} title={title} borderColor={borderColor} color={color}>{children}</IconButton>;
   }
   return (
     <span className="inline-flex items-center gap-1">
+      {label && <span className="text-[12px] font-semibold" style={{ color }}>{label}</span>}
       <IconButton onClick={() => { setArmed(false); onConfirm(); }} disabled={disabled} title={`confirm ${title}`} borderColor={borderColor} color={color} filled>{children}</IconButton>
       <IconButton onClick={() => setArmed(false)} disabled={disabled} title="cancel" borderColor="var(--hairline-strong)" color="var(--text-secondary)"><XIcon /></IconButton>
     </span>

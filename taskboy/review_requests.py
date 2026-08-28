@@ -45,6 +45,12 @@ class ReviewRequestPoller:
         self.enabled = bool(review_requests.get("enabled", False))
         self.poll_interval_seconds = max(int(review_requests.get("poll_interval_seconds", 60)), 1)
         self.notify_channel = str(review_requests.get("notify_channel") or "")
+        self.auto_address_agent_prs = bool(review_requests.get("auto_address_agent_prs", False))
+        if self.auto_address_agent_prs and (reviewer_broker is None or not config.reviewer.enabled or not config.reviewer.review_agent_prs):
+            # the loop needs an enabled reviewer reviewing the main agent's pushes; anything less leaves the flag silently doing nothing
+            logger.warning("github.review_requests.auto_address_agent_prs requires an enabled reviewer with reviewer.review_agent_prs — forcing it off")
+            self.auto_address_agent_prs = False
+        self.round_cap = max(int(review_requests.get("round_cap", 10)), 1)
         self.approved_repos = list(github.get("approved_repos") or [])
         self.bot_login: str | None = None
         self.reviewer_bot_login: str | None = None
@@ -118,7 +124,8 @@ class ReviewRequestPoller:
         if status == 304:
             return
         etag = headers.get("ETag") or headers.get("etag")
-        if etag:
+        # don't cache while auto-follow-up is on: a 304 would skip the per-PR stall check
+        if etag and not self.auto_address_agent_prs:
             self.etags[path] = str(etag)
         for pr in pulls:
             reviewers = [(reviewer or {}).get("login") for reviewer in pr.get("requested_reviewers") or []]
@@ -133,7 +140,7 @@ class ReviewRequestPoller:
                 if self.store.has_active_main_task_referencing(pr["html_url"]):
                     logger.info("skipping reviewer task for %s#%d — an active main-agent task already references this PR", repo, number)
                     continue
-                reviewer_key = f"reviewer:{repo}#{number}@{head_sha}"
+                reviewer_key = self._reviewer_key(repo, number, head_sha)
                 task, status = await accept_task(
                     self.store,
                     self.config,
@@ -170,6 +177,104 @@ class ReviewRequestPoller:
                         logger.info("created github review task %s for %s", task.task_id if task else "", key)
                 elif status == "queue_full":
                     logger.warning("github review task refused because the queue is full: %s", key)
+            if self.auto_address_agent_prs and reviewer_available and author_login == self.bot_login:
+                await self._maybe_follow_up_agent(repo, pr, number, head_sha, token)
+
+    async def _maybe_follow_up_agent(self, repo: str, pr: dict, number: int, head_sha: str, token: str) -> None:
+        """when the reviewer has reviewed the current push of an agent-authored PR and hasn't approved, spawn the main
+        agent to address it — up to `round_cap` rounds, then stop and ping `notify_channel` once instead of pinging every sweep."""
+        html_url = pr["html_url"]
+        if self.store.has_active_main_task_referencing(html_url, include_reviewer=True):
+            return  # a main or reviewer task is already in flight for this pr — the reviewer's review task may still be running
+        round_key = f"review_followup_round:{repo}#{number}"
+        capped_key = f"review_followup_capped:{repo}#{number}"
+        stalled_key = f"review_followup_stalled:{repo}#{number}@{head_sha}"
+        if self.store.meta_get(capped_key) == "1" or self.store.meta_get(stalled_key) == "1":
+            return  # already escalated — stop paying a paged reviews GET per sweep; a new push re-arms a stalled loop
+        reviews = await self._get_reviews(repo, number, token)
+        reviewer_reviews = [review for review in reviews if (review.get("user") or {}).get("login") == self.reviewer_bot_login and review.get("state") in {"APPROVED", "CHANGES_REQUESTED"}]
+        latest = reviewer_reviews[-1] if reviewer_reviews else None  # github returns reviews in submission order
+        if latest is not None and latest.get("state") == "APPROVED":
+            return  # the reviewer is satisfied — the loop is done (issue #75)
+        if latest is None or latest.get("commit_id") != head_sha:
+            # no reviewer review of the current push: normally one is just in flight, but a reviewer task that
+            # died or parked without posting would leave this branch returning forever with no escalation.
+            # the guard at the top already returned for an active task, so any task found here is stalled.
+            reviewer_task = self.store.task_by_intake_key("github", self.notify_channel, self._reviewer_key(repo, number, head_sha))
+            if reviewer_task is not None:
+                await self._escalate_once(
+                    stalled_key,
+                    "review follow-up loop stalled on %s — the reviewer's review task %s is %s without posting a review" % (html_url, reviewer_task.task_id, reviewer_task.state),
+                    f"{self._loop_name} review loop on {html_url} stalled — {self.config.reviewer.name}'s review task is {reviewer_task.state} without posting a review, so the loop can't advance — needs a human look.",
+                )
+            return
+        # count rounds this poller actually created, not every reviewer CHANGES_REQUESTED ever (pre-flag or /review runs)
+        round_number = int(self.store.meta_get(round_key) or "0") + 1
+        if round_number > self.round_cap:
+            await self._escalate_once(
+                capped_key, f"review follow-up loop hit its {self.round_cap}-round cap on {html_url} — stopping and escalating", f"{self._loop_name} review loop on {html_url} hit its {self.round_cap}-round cap without {self.config.reviewer.name} approving — needs a human look."
+            )
+            return
+        key = f"{repo}#{number}@{head_sha}:review:{latest.get('id')}"
+        branch = str((pr.get("head") or {}).get("ref") or "")
+        task, status = await accept_task(
+            self.store,
+            self.config,
+            self.notifier,
+            team_id="github",
+            channel_id=self.notify_channel,
+            thread_ts=key,
+            message_ts=key,
+            user_id="github",
+            text=f"address review comments on {html_url} — push the fix to the existing branch `{branch}`, not a new one",
+        )
+        if status == "created":
+            self.store.meta_set(round_key, str(round_number))
+            logger.info("created follow-up task %s for %s (round %d/%d)", task.task_id if task else "", key, round_number, self.round_cap)
+        elif status == "queue_full":
+            logger.warning("follow-up task refused because the queue is full: %s", key)
+        elif status == "duplicate" and task is not None:
+            # terminal task on an unchanged key would dedup forever — escalate instead
+            await self._escalate_once(
+                stalled_key,
+                "review follow-up loop stalled on %s — the follow-up task %s finished (%s) without a new push" % (html_url, task.task_id, task.state),
+                f"{self._loop_name} review loop on {html_url} stalled — {self.config.agent_name}'s last follow-up task finished ({task.state}) without pushing a fix, so {self.config.reviewer.name} never re-reviewed — needs a human look.",
+            )
+
+    @property
+    def _loop_name(self) -> str:
+        return f"{self.config.agent_name}↔{self.config.reviewer.name}"
+
+    def _reviewer_key(self, repo: str, number: int, head_sha: str) -> str:
+        # also the poller's intake message_ts, so _maybe_follow_up_agent can look the reviewer task back up
+        return f"reviewer:{repo}#{number}@{head_sha}"
+
+    async def _escalate_once(self, escalation_key: str, log_message: str, notify_message: str) -> None:
+        """fire a warning + a single human-facing notification per `escalation_key`, falling back to the debug
+        notifier when no `notify_channel` is configured — otherwise the escalation is a log line no human sees."""
+        if self.store.meta_get(escalation_key) == "1":
+            return
+        logger.warning(log_message)
+        if self.notify_channel:
+            await self.notifier.answer(self.notify_channel, None, notify_message)
+        else:
+            debug = getattr(self.notifier, "debug", None)
+            if debug is not None:
+                await debug.system_error("review_poller", notify_message)
+        # marked sent only after the notification lands — a failed send must retry on the next sweep
+        self.store.meta_set(escalation_key, "1")
+
+    async def _get_reviews(self, repo: str, number: int, token: str) -> list[dict]:
+        reviews: list[dict] = []
+        page = 1
+        while True:
+            path = f"/repos/{repo}/pulls/{number}/reviews?per_page=100&page={page}"
+            _, _, page_reviews = await self._get_with_retry(path, token)
+            page_reviews = page_reviews or []
+            reviews.extend(page_reviews)
+            if len(page_reviews) < 100:
+                return reviews
+            page += 1
 
     async def _token(self) -> str:
         if self.token is None or self.token_expires_at - time.time() < TOKEN_REFRESH_MARGIN_SECONDS:

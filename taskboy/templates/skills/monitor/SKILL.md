@@ -18,11 +18,11 @@ An author comment counts **even when it's just "done"** with no new push. Never 
 
 Keep watch state in a file at `../notes/monitor.json` (your workspace's notes directory): `end_time` (epoch seconds), `head_sha`, `last_author_comment_ts`.
 
-1. **Baseline** — fetch the PR with `mcp__github__get_pull_request` (note `head_sha`) and the latest author comment timestamp from `mcp__github__list_pr_comments`. Compute `end_time` = now + 10800 (3 hours). Write the state file. Post one `report_progress`: `monitoring {repo}#{n} — checking every 5 min for up to 3h`. Do **not** review at baseline.
+1. **Baseline** — fetch the PR with `mcp__github__get_pull_request` (note `head_sha`) and the latest author comment timestamp from `mcp__github__list_pr_comments` called with `author` set to the PR author's login. Compute `end_time` = now + 10800 (3 hours). Write the state file. Post one `report_progress`: `monitoring {repo}#{n} — checking every 5 min for up to 3h`. Do **not** review at baseline.
 2. **Tick** — wait 5 minutes using Bash sleeps in chunks no longer than 100 seconds (`sleep 100` three times); a single long sleep will hit the command timeout. Then:
    - If now ≥ `end_time`, or the PR is closed/merged: stop the loop and write the Final Report.
-   - Fetch the current head SHA and latest author-comment timestamp.
-   - **Changed** (head moved, or a newer author comment): run the included `/review` procedure end to end, then update the state file and post `report_progress`: `reviewed — left N comments`.
+   - Fetch the current head SHA, and call `mcp__github__list_pr_comments` with `author` set to the PR author's login to check cheaply for anything new from them — the newest author comment is always the last line. It counts as new only if its `created_at` is **strictly greater than** `last_author_comment_ts`, not merely if the result is non-empty.
+   - **Changed** (head moved, or a newer author comment, per the strictly-greater check above): run the included `/review` procedure end to end, then update the state file and post `report_progress`: `reviewed — left N comments`.
    - **Not changed**: do nothing (no progress post) and continue.
 
 Keep per-tick work minimal — two tool calls and a comparison.

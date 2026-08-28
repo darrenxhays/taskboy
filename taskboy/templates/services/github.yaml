@@ -1,0 +1,14 @@
+# github service — git push auth, pull request tools, review-request polling, and the issues pipeline.
+enabled: false # true requires the GitHub App credentials (GITHUB_APP_ID / GITHUB_INSTALLATION_ID / GITHUB_APP_PRIVATE_KEY)
+approved_repos: [] # org/repo
+self_repo: "" # org/repo of this agent's own source; must also be in approved_repos; empty = no self-repo hint
+protected_branch_patterns: [main, develop]
+commit_name: "" # git author/committer on commits the agent pushes; empty = defaults to agent.name
+# GitHub derives the commit avatar from this email; verify it on a GitHub account to give the agent a custom avatar (operator-side setup)
+commit_email: ""
+review_requests: # poll approved repos for PRs where the agent is a requested reviewer -> run /review
+  enabled: false
+  poll_interval_seconds: 60
+  notify_channel: "" # optional slack channel id for lifecycle updates on github-triggered reviews
+  auto_address_agent_prs: false # when true, an unresolved (non-APPROVE) reviewer review on an agent-authored PR auto-spawns the agent to address it
+  round_cap: 10 # max agent<->reviewer rounds per PR before the loop stops and escalates instead of continuing

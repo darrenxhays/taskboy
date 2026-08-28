@@ -16,6 +16,9 @@ logger = logging.getLogger("taskboy.llm")
 
 _DIAGNOSTIC_SNIPPET_LEN = 300
 
+# sdk raises this after already yielding a usable result frame (issue #80)
+_TOLERABLE_ERROR_TEXT = "Claude Code returned an error result: success"
+
 
 async def structured_call(model_id: str, prompt: str, schema: dict[str, Any]) -> tuple[dict, dict | None]:
     """one tool-free schema-shaped call; retries once on failure, then raises."""
@@ -31,7 +34,7 @@ async def structured_call(model_id: str, prompt: str, schema: dict[str, Any]) ->
 
 
 async def _structured_call_once(model_id: str, prompt: str, schema: dict[str, Any]) -> tuple[dict, dict | None]:
-    from claude_agent_sdk import ClaudeAgentOptions, query
+    from claude_agent_sdk import ClaudeAgentOptions, SystemMessage, query
 
     cwd = tempfile.mkdtemp(prefix="ar-llm-")
     try:
@@ -45,8 +48,16 @@ async def _structured_call_once(model_id: str, prompt: str, schema: dict[str, An
             effort="low",
         )
         final = None
-        async for message in query(prompt=prompt, options=options):
-            final = message
+        try:
+            async for message in query(prompt=prompt, options=options):
+                # trailing session_state_changed marker must not clobber the result frame (#80)
+                if isinstance(message, SystemMessage) and message.subtype == "session_state_changed":
+                    continue
+                final = message
+        except Exception as exc:
+            if str(exc) != _TOLERABLE_ERROR_TEXT or final is None:
+                raise
+            logger.warning("tolerating SDK 'error result: success' (%s)", _diagnose(final))
     finally:
         shutil.rmtree(cwd, ignore_errors=True)  # per-call temp cwd must not accumulate on the host
     candidate = getattr(final, "structured_output", None)

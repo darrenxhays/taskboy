@@ -134,10 +134,9 @@ class IssuesAdapter:
         return _text(f"recorded issue #{row['id']} ({row['status']}); re-recording the same dedupe_key refreshes it while it stays proposed")
 
     async def list_accepted_issues(self, args: dict) -> dict:
-        # the dashboard-triggered path already reserved this run's batch before the coordinator existed; a
-        # scheduler-fired run has no dashboard reservation yet, so reserve one here the first time this is called.
+        # only a hand-typed or retried coordinator gets here without a reservation; gate on ever-reserved so a handed-off batch can't reserve a second one
         rows = self.store.issues_reserved_by(self.task.task_id)
-        if not rows:
+        if not self.store.has_ever_reserved(self.task.task_id):
             rows = self.store.reserve_issues(self.task.task_id)
         out = [{"id": r["id"], "repo": r["repo"], "summary": r["summary"], "issue_type": r["issue_type"], "details": r["details"], "priority": r["priority"]} for r in rows]
         self._audit("list_accepted_issues", {"count": len(out)}, False)

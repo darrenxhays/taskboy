@@ -1,3 +1,4 @@
+import dataclasses
 from unittest.mock import patch
 
 import pytest
@@ -83,6 +84,25 @@ def test_has_active_main_task_referencing_excludes_blocked(store, make_task):
     task = make_task("address review comments on https://github.com/org/a/pull/7")
     store.transition(task.task_id, RECEIVED, BLOCKED, "waiting on requester")
     assert store.has_active_main_task_referencing("github.com/org/a/pull/7") is False
+
+
+def test_task_by_intake_key(store, make_task):
+    task = make_task("do the thing")
+    found = store.task_by_intake_key(task.slack_team_id, task.slack_channel_id, task.slack_message_ts)
+    assert found is not None and found.task_id == task.task_id
+    assert store.task_by_intake_key("T1", "C1", "nope") is None
+
+
+def test_has_active_main_task_referencing_include_reviewer(store, make_task):
+    assert store.has_active_main_task_referencing("github.com/org/a/pull/7", include_reviewer=True) is False
+
+    reviewer_task = make_task("/review https://github.com/org/a/pull/7", persona="reviewer")
+    assert store.has_active_main_task_referencing("github.com/org/a/pull/7") is False  # blue is invisible without the flag
+    assert store.has_active_main_task_referencing("github.com/org/a/pull/7", include_reviewer=True) is True
+    assert store.has_active_main_task_referencing("github.com/org/a/pull/70", include_reviewer=True) is False  # still a bounded-token match
+
+    store.transition(reviewer_task.task_id, RECEIVED, CANCELLED, "test cleanup")
+    assert store.has_active_main_task_referencing("github.com/org/a/pull/7", include_reviewer=True) is False
 
 
 def test_slack_event_dedup(store):
@@ -278,6 +298,146 @@ def test_finish_issue_accepts_in_review_and_resolves_it(store, make_task):
 
     with pytest.raises(ValueError):
         store.finish_issue(row["id"], "garbage")
+
+
+def test_reopen_linked_issue_clears_the_claim_and_returns_to_proposed(store, make_task):
+    task = make_task()
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+
+    reopened = store.reopen_linked_issue(task)
+    assert reopened["status"] == "proposed"
+    assert reopened["task_id"] is None
+    assert reopened["spec"] is None
+    assert reopened["reserved_by"] is None
+    assert reopened["decided_by"] is None
+    assert reopened["decided_at"] is None
+
+
+def test_reopen_linked_issue_refuses_terminal_or_not_yet_claimed_statuses(store, make_task):
+    task = make_task()
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    # proposed: never claimed, nothing to reopen
+    assert store.reopen_linked_issue(task) is None
+
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "spec")
+    store.finish_issue(row["id"], "failed")
+    # failed keeps its one remaining meaning (sync_in_review saw a PR closed unmerged) — not reopenable
+    assert store.reopen_linked_issue(task) is None
+    assert store.get_issue(row["id"])["status"] == "failed"
+
+
+def test_reopen_linked_issue_prefers_the_real_error_over_a_stale_blocked_reason(store, make_task):
+    # blocked_reason is never cleared on resume, so a task that blocked then later failed for a different
+    # reason must not have its stale block reason quoted instead of the real error (#76 review)
+    task = make_task()
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+    stale = dataclasses.replace(task, blocked_reason="needs permission for bash", error="runner crashed: boom")
+
+    store.reopen_linked_issue(stale)
+
+    comments = store.list_issue_comments(row["id"])
+    assert len(comments) == 1
+    assert "runner crashed: boom" in comments[0]["body"]
+    assert "needs permission" not in comments[0]["body"]
+
+
+def test_reopen_stranded_issues_catches_one_left_behind_a_task_that_finished_before_the_hook_ran(store, make_task):
+    # a startup safety net for rows that predate transition()'s TERMINAL_STATES hook, or a crash between a
+    # task landing terminal and this reconcile pass getting a chance to run (#76)
+    task = make_task()
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+    # move the task straight to failed without going through transition(), simulating a pre-hook stranding
+    store.conn.execute("UPDATE tasks SET state = 'failed' WHERE task_id = ?", (task.task_id,))
+    store.conn.commit()
+
+    assert store.reopen_stranded_issues() == 1
+    assert store.get_issue(row["id"])["status"] == "proposed"
+
+
+def test_reopen_stranded_issues_leaves_a_still_in_progress_task_alone(store, make_task):
+    task = make_task()
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+
+    assert store.reopen_stranded_issues() == 0
+    assert store.get_issue(row["id"])["status"] == "in_progress"
+
+
+def test_transition_to_completed_reopens_an_issue_left_in_progress(store, make_task):
+    # finish_issue is supposed to close the issue before a task completes; if it never ran, transition()'s
+    # hook must still catch it — reopen_linked_issue is a no-op once finish_issue already moved it on (#76 review)
+    task = make_task()
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+
+    store.transition(task.task_id, RECEIVED, QUEUED, "classified")
+    store.transition(task.task_id, QUEUED, RUNNING, "dispatched")
+    store.transition(task.task_id, RUNNING, COMPLETED, "runner finished", result_summary="done")
+
+    assert store.get_issue(row["id"])["status"] == "proposed"
+
+
+def test_reopen_stranded_issues_catches_one_behind_a_completed_task_that_never_closed_it(store, make_task):
+    # a startup safety net for a completed-without-finish_issue row that predates transition()'s hook (#76 review)
+    task = make_task()
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+    # move the task straight to completed without going through transition(), simulating a pre-hook stranding
+    store.conn.execute("UPDATE tasks SET state = 'completed' WHERE task_id = ?", (task.task_id,))
+    store.conn.commit()
+
+    assert store.reopen_stranded_issues() == 1
+    assert store.get_issue(row["id"])["status"] == "proposed"
+
+
+def test_reopen_stranded_issues_catches_one_with_no_linked_task(store):
+    # a crash between start_issue and link_issue_task can leave task_id NULL while status is still in_progress —
+    # the plain inner join used to miss this row entirely (#76 review)
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], None, "the spec")
+
+    assert store.reopen_stranded_issues() == 1
+    reopened = store.get_issue(row["id"])
+    assert reopened["status"] == "proposed"
+    comments = store.list_issue_comments(row["id"])
+    assert len(comments) == 1 and "no linked task" in comments[0]["body"]
+
+
+def test_issue_for_task_looks_up_by_linked_task_id(store, make_task):
+    task = make_task()
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    assert store.issue_for_task(task.task_id) is None
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "spec")
+    assert store.issue_for_task(task.task_id)["id"] == row["id"]
+
+
+def test_transition_to_any_non_completed_terminal_state_reopens_a_linked_issue(store, make_task):
+    # centralized in transition()'s TERMINAL_STATES hook so no call site (reconcile, classification, an operator
+    # cancel) can forget to hand a linked issue back (#76 review)
+    task = make_task()
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+
+    store.transition(task.task_id, RECEIVED, FAILED, "recovery: retry attempts exhausted", error="task was interrupted too many times")
+
+    reopened = store.get_issue(row["id"])
+    assert reopened["status"] == "proposed"
+    assert reopened["task_id"] is None
+    comments = store.list_issue_comments(row["id"])
+    assert len(comments) == 1 and "task was interrupted too many times" in comments[0]["body"]
 
 
 def test_quick_answer_is_born_terminal_and_idempotent(store):

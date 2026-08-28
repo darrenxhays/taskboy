@@ -153,3 +153,24 @@ def test_skills_step_instantiates_selected_templates(tmp_path, monkeypatch):
                 setup_wizard.step_skills(data, {})
     installed = (skills_root / "greet" / "SKILL.md").read_text()
     assert "@Scout" in installed and "example-org" in installed and "{{" not in installed
+
+
+def test_service_sections_split_into_service_files(tmp_path, monkeypatch):
+    import yaml
+
+    config_path = _wizard_paths(monkeypatch, tmp_path)
+    data = setup_wizard.load_config_data()  # seeds config.yaml + services/*.yaml and returns the merged view
+    data["slack"]["enabled"] = True
+    data["slack"]["team_id"] = "T123"
+    data["roles"]["admin"]["members"] = ["U1"]
+    setup_wizard.save_config_data(data)
+    core = yaml.safe_load(config_path.read_text())
+    assert "slack" not in core and "github" not in core  # service sections live in their own files
+    slack_file = config_path.parent / "services" / "slack.yaml"
+    slack = yaml.safe_load(slack_file.read_text())
+    assert slack["enabled"] is True and slack["team_id"] == "T123"
+    assert "socket-mode intake" in slack_file.read_text()  # template comments survive the round trip
+    merged = setup_wizard.load_config_data()
+    assert merged["slack"]["team_id"] == "T123"  # later steps still see the merged view
+    config = load_config(str(config_path))
+    assert config.slack.enabled is True and config.services["github"] is False

@@ -6,7 +6,7 @@ import pytest
 from taskboy.classifier import stub_classify
 from taskboy.config import Config, Role, SlackConfig
 from taskboy.models import BLOCKED, CANCELLED, COMPLETED, FAILED, QUEUED, RECEIVED, REFUSED, RUNNING, Outcome
-from taskboy.orchestrator import Orchestrator, accept_task
+from taskboy.orchestrator import Orchestrator, accept_task, reopen_issue_and_cancel
 from taskboy.router import RoleRefusal
 
 
@@ -59,6 +59,30 @@ async def test_one_crashing_runner_does_not_affect_siblings(store, config, notif
 
 
 @pytest.mark.asyncio
+async def test_crashed_issue_backed_task_reopens_its_issue(store, config, notifier, make_task, wait_until):
+    # a runner crash must not strand an issue-backed task's issue in_progress forever either (#76)
+    async def run(task):
+        raise RuntimeError("runner exploded")
+
+    task = make_task()
+    issue = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(issue["id"], "approved", "boss")
+    store.start_issue(issue["id"], task.task_id, "the spec")
+
+    orchestrator = Orchestrator(store, config, classify=stub_classify, run=run, notifier=notifier)
+    loop_task = asyncio.create_task(orchestrator.dispatcher_loop())
+    await wait_until(lambda: store.count_tasks(FAILED) == 1)
+    await orchestrator.shutdown()
+    await loop_task
+
+    reopened = store.get_issue(issue["id"])
+    assert reopened["status"] == "proposed"
+    assert reopened["task_id"] is None
+    comments = store.list_issue_comments(issue["id"])
+    assert len(comments) == 1 and "runner exploded" in comments[0]["body"]
+
+
+@pytest.mark.asyncio
 async def test_blocked_outcome_transitions_and_notifies(store, config, notifier, make_task, wait_until):
     async def run(task):
         return Outcome(state=BLOCKED, blocked_reason="need repo access", session_id="s-block")
@@ -98,6 +122,106 @@ async def test_grant_during_running_resumes_instead_of_stranding_blocked(store, 
     assert calls["n"] == 2  # resumed and ran again with the grant
     assert "blocked" not in notifier.kinds()  # never surfaced to the operator as blocked
     assert store.get_task(task.task_id).resume_session_id == "s-1"
+
+
+@pytest.mark.asyncio
+async def test_blocked_outcome_for_issue_backed_task_reopens_issue_and_cancels(store, config, notifier, make_task, wait_until):
+    # a spec2pr run that cannot finish on its own must hand the issue back rather than stranding it BLOCKED (#76)
+    async def run(task):
+        store.ask_questions(task.task_id, "1. Which repo should this land in?")
+        return Outcome(state=BLOCKED, blocked_reason="waiting for the requester to answer follow-up questions", session_id="s-issue")
+
+    task = make_task()
+    issue = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(issue["id"], "approved", "boss")
+    store.start_issue(issue["id"], task.task_id, "the spec")
+
+    orchestrator = Orchestrator(store, config, classify=stub_classify, run=run, notifier=notifier)
+    loop_task = asyncio.create_task(orchestrator.dispatcher_loop())
+    await wait_until(lambda: store.get_task(task.task_id).state == CANCELLED)
+    await orchestrator.shutdown()
+    await loop_task
+
+    reopened = store.get_issue(issue["id"])
+    assert reopened["status"] == "proposed"
+    assert reopened["task_id"] is None and reopened["spec"] is None
+    comments = store.list_issue_comments(issue["id"])
+    assert len(comments) == 1 and comments[0]["author"] == "agent"
+    assert "waiting for the requester" in comments[0]["body"]
+    assert "Which repo should this land in?" in comments[0]["body"]
+    assert ("issue_blocked", task.task_id, issue["id"]) in notifier.calls
+    assert "blocked" not in notifier.kinds()
+    assert "questions" not in notifier.kinds()
+
+
+@pytest.mark.asyncio
+async def test_blocked_outcome_for_issue_backed_task_with_pending_permission_stays_blocked(store, config, notifier, make_task, wait_until):
+    # a pending permission request must NOT reopen+cancel: decide_permission can only resume a still-BLOCKED task,
+    # and grants are keyed to this task_id, so cancelling here would strand the grant and loop forever (#76 review)
+    async def run(task):
+        store.request_permission(task.task_id, "tool", "mcp__jira__add_comment", "need it")
+        return Outcome(state=BLOCKED, blocked_reason="needs permission for tool 'mcp__jira__add_comment'", session_id="s-perm")
+
+    task = make_task()
+    issue = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(issue["id"], "approved", "boss")
+    store.start_issue(issue["id"], task.task_id, "the spec")
+
+    orchestrator = Orchestrator(store, config, classify=stub_classify, run=run, notifier=notifier)
+    loop_task = asyncio.create_task(orchestrator.dispatcher_loop())
+    await wait_until(lambda: store.count_tasks(BLOCKED) == 1)
+    await orchestrator.shutdown()
+    await loop_task
+
+    assert store.get_issue(issue["id"])["status"] == "in_progress"  # left alone, not reopened
+    assert "blocked" in notifier.kinds()
+    assert "issue_blocked" not in notifier.kinds()
+
+
+@pytest.mark.asyncio
+async def test_reopen_issue_and_cancel_leaves_issue_alone_when_the_cancel_transition_races(store, make_task, notifier):
+    # cancel first, reopen only on success: if the task already moved on (e.g. resumed) before the cancel could
+    # land, reopening the issue anyway would leave a live task plus a re-approvable issue (#76 review)
+    task = make_task()
+    store.transition(task.task_id, RECEIVED, QUEUED)
+    store.transition(task.task_id, QUEUED, RUNNING)
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+    blocked = store.transition(task.task_id, RUNNING, BLOCKED, "waiting", blocked_reason="needs an answer")
+    # simulate a race landing between the caller's checks and this call's own cancel attempt
+    store.transition(task.task_id, BLOCKED, QUEUED, "resumed: permission granted during run")
+
+    result = await reopen_issue_and_cancel(store, notifier, blocked)
+
+    assert result is False
+    assert store.get_issue(row["id"])["status"] == "in_progress"  # left alone, not reopened
+    assert store.get_task(task.task_id).state == QUEUED  # untouched, still progressing
+    assert "issue_blocked" not in notifier.kinds()
+
+
+@pytest.mark.asyncio
+async def test_blocked_outcome_for_issue_already_left_reopenable_status_falls_back_to_blocked(store, config, notifier, make_task, wait_until):
+    # the issue raced out from under the block (e.g. deleted, or resolved by another path) — don't crash, just
+    # notify normally instead of pretending it was reopened
+    async def run(task):
+        return Outcome(state=BLOCKED, blocked_reason="need repo access", session_id="s-block")
+
+    task = make_task()
+    issue = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(issue["id"], "approved", "boss")
+    store.start_issue(issue["id"], task.task_id, "the spec")
+    store.finish_issue(issue["id"], "failed")  # already terminal by the time the run blocks
+
+    orchestrator = Orchestrator(store, config, classify=stub_classify, run=run, notifier=notifier)
+    loop_task = asyncio.create_task(orchestrator.dispatcher_loop())
+    await wait_until(lambda: store.count_tasks(BLOCKED) == 1)
+    await orchestrator.shutdown()
+    await loop_task
+
+    assert store.get_issue(issue["id"])["status"] == "failed"
+    assert "blocked" in notifier.kinds()
+    assert "issue_blocked" not in notifier.kinds()
 
 
 @pytest.mark.asyncio
@@ -195,6 +319,30 @@ async def test_non_retryable_failure_is_not_requeued(store, config, notifier, ma
     failed = store.get_task(task.task_id)
     assert failed.state == FAILED
     assert failed.attempt == 0
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_failure_of_issue_backed_task_reopens_its_issue(store, config, notifier, make_task, wait_until):
+    # a session_failure FAILED outcome must not strand an issue-backed task's issue in_progress forever either (#76)
+    async def run(task):
+        return Outcome(state=FAILED, error="boom", retryable=False)
+
+    task = make_task()
+    issue = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(issue["id"], "approved", "boss")
+    store.start_issue(issue["id"], task.task_id, "the spec")
+
+    orchestrator = Orchestrator(store, config, classify=stub_classify, run=run, notifier=notifier)
+    loop_task = asyncio.create_task(orchestrator.dispatcher_loop())
+    await wait_until(lambda: store.count_tasks(FAILED) == 1)
+    await orchestrator.shutdown()
+    await loop_task
+
+    reopened = store.get_issue(issue["id"])
+    assert reopened["status"] == "proposed"
+    assert reopened["task_id"] is None
+    comments = store.list_issue_comments(issue["id"])
+    assert len(comments) == 1 and "boom" in comments[0]["body"]
 
 
 @pytest.mark.asyncio
@@ -301,6 +449,24 @@ async def test_reconcile_releases_stale_issue_reservations(store, config, notifi
 
 
 @pytest.mark.asyncio
+async def test_reconcile_reopens_issues_stranded_behind_an_already_terminal_task(store, config, notifier, make_task):
+    # a startup safety net alongside release_stale_issue_reservations, for rows left in_progress by a task
+    # that finished terminally before store.transition's TERMINAL_STATES hook existed, or before this reconcile
+    # pass got a chance to run (#76)
+    task = make_task()
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+    store.conn.execute("UPDATE tasks SET state = 'failed' WHERE task_id = ?", (task.task_id,))
+    store.conn.commit()
+
+    orchestrator = Orchestrator(store, config, classify=stub_classify, run=None, notifier=notifier)
+    await orchestrator.reconcile()
+
+    assert store.get_issue(row["id"])["status"] == "proposed"
+
+
+@pytest.mark.asyncio
 async def test_failed_coordinator_releases_its_reserved_issues(store, config, notifier, make_task, wait_until):
     row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
@@ -359,6 +525,59 @@ async def test_cancelled_coordinator_releases_its_reserved_issues(store, config,
 
 
 @pytest.mark.asyncio
+async def test_reconcile_releases_the_batch_of_a_coordinator_it_fails_for_exhausted_retries(store, config, notifier, make_task):
+    # this failure happens after reconcile's own release_stale_reservations sweep, so it must release its own
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    coordinator = make_task(text="/implementapprovedissues")
+    store.reserve_issues(coordinator.task_id, 5)
+    store.transition(coordinator.task_id, RECEIVED, QUEUED, "classified")
+    store.transition(coordinator.task_id, QUEUED, RUNNING, "dispatched", attempt=config.max_retries)
+
+    orchestrator = Orchestrator(store, config, classify=stub_classify, run=None, notifier=notifier)
+    await orchestrator.reconcile()
+    assert store.get_task(coordinator.task_id).state == FAILED
+    assert store.get_issue(row["id"])["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_coordinator_that_dies_in_classification_releases_its_reserved_issues(store, config, notifier, make_task, wait_until):
+    # the batch is reserved before the coordinator task exists, so it is already held while classification runs
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    coordinator = make_task(text="/implementapprovedissues")
+    store.reserve_issues(coordinator.task_id, 5)
+
+    async def bad_classify(task):
+        raise RuntimeError("classifier down")
+
+    orchestrator = Orchestrator(store, config, classify=bad_classify, run=None, notifier=notifier)
+    loop_task = asyncio.create_task(orchestrator.dispatcher_loop())
+    await wait_until(lambda: store.count_tasks(FAILED) == 1)
+    await orchestrator.shutdown()
+    await loop_task
+    assert store.get_issue(row["id"])["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_coordinator_refused_as_unsupported_releases_its_reserved_issues(store, config, notifier, make_task, wait_until):
+    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    coordinator = make_task(text="/implementapprovedissues")
+    store.reserve_issues(coordinator.task_id, 5)
+
+    async def classify(task):
+        return {"task_type": "unsupported", "complexity": "trivial", "routing_rationale": "rule: none"}
+
+    orchestrator = Orchestrator(store, config, classify=classify, run=None, notifier=notifier)
+    loop_task = asyncio.create_task(orchestrator.dispatcher_loop())
+    await wait_until(lambda: store.count_tasks(REFUSED) == 1)
+    await orchestrator.shutdown()
+    await loop_task
+    assert store.get_issue(row["id"])["status"] == "approved"
+
+
+@pytest.mark.asyncio
 async def test_completed_coordinator_releases_any_leftover_reservation(store, config, notifier, make_task, wait_until):
     # a coordinator that finishes without enqueuing everything it reserved (e.g. it decided some no longer applied)
     # must not leave those rows stuck in implementation_queued forever
@@ -388,8 +607,12 @@ async def test_accept_task_dedup_and_queue_full(store, notifier):
     assert status_dup == "duplicate"
     assert dup.task_id == task1.task_id
     assert status2 == "queue_full"
-    assert store.get_task(task2.task_id).state == FAILED
-    assert "refused" in notifier.kinds()
+    assert task2 is None  # refused before a row exists, so the dedup key is not consumed
+    # once the queue drains, the same message becomes a task instead of dedup-ing against a failed row
+    store.transition(task1.task_id, RECEIVED, CANCELLED, "test: queue drained")
+    task3, status3 = await _accept(store, config, notifier, "second", 2)
+    assert status3 == "created"
+    assert task3 is not None
 
 
 @pytest.mark.asyncio

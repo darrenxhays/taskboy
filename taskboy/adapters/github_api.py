@@ -10,7 +10,7 @@ import json
 import logging
 import re
 
-from taskboy.adapters._util import _error, _text, wrap
+from taskboy.adapters._util import OUTPUT_LIMIT, _error, _text, wrap
 from taskboy.models import Task
 from taskboy.redact import redactor
 from taskboy.store import Store
@@ -18,9 +18,11 @@ from taskboy.store import Store
 logger = logging.getLogger("taskboy.github")
 
 GITHUB_API = "https://api.github.com"
-ALLOWED_REVIEW_EVENTS = {"COMMENT", "REQUEST_CHANGES"}  # approving is a human act in v1 (GIT-011 spirit)
+ALLOWED_REVIEW_EVENTS = {"COMMENT", "REQUEST_CHANGES"}  # APPROVE is added per-task for the reviewing persona (issue #75)
 TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
 BRANCH_ALREADY_GONE = {404, 422}  # github's "ref does not exist" statuses for a missing branch
+COMMENT_PREVIEW_CHARS = 400
+COMMENT_PREVIEW_MARKER = " …(truncated)"
 
 
 class GitHubStatusError(RuntimeError):
@@ -34,15 +36,17 @@ class GitHubStatusError(RuntimeError):
 
 
 class GitHubAdapter:
-    def __init__(self, broker, store: Store, task: Task, approved_repos: list[str], on_milestone=None, bot_logins: list[str] | None = None, bot_name: str = "Agent", other_bot_name: str = "Reviewer"):
+    def __init__(self, broker, store: Store, task: Task, approved_repos: list[str], on_milestone=None, main_broker=None, reviewer_broker=None, bot_name: str = "Agent", other_bot_name: str = "Reviewer", can_approve: bool = False):
         self.broker = broker
         self.store = store
         self.task = task
         self.approved_repos = approved_repos
         self.on_milestone = on_milestone  # async (message) -> None; artifact auto-milestones (SLK-006)
-        self.bot_logins = bot_logins or []
+        self.main_broker = main_broker
+        self.bot_brokers = [bot_broker for bot_broker in (main_broker, reviewer_broker) if bot_broker is not None]
         self.bot_name = bot_name
         self.other_bot_name = other_bot_name
+        self.can_approve = can_approve
 
     # -- tools -------------------------------------------------------------------
 
@@ -129,8 +133,20 @@ class GitHubAdapter:
         if error:
             return error
         number = int(args["number"])
-        issue_comments = await self._request("GET", f"/repos/{repo}/issues/{number}/comments")
-        review_comments = await self._request("GET", f"/repos/{repo}/pulls/{number}/comments")
+        offset = max(int(args.get("offset", 0) or 0), 0)
+        comment_id_raw = args.get("comment_id")
+        author = str(args.get("author") or "").strip().lower()
+        if author == "me":
+            own_login, login_error = await self._resolve_own_login()
+            if login_error or not own_login:
+                return _error(f"cannot resolve your own login for author='me' ({login_error})")
+            author = own_login
+        issue_comments = await self._paginated(f"/repos/{repo}/issues/{number}/comments")
+        review_comments = await self._paginated(f"/repos/{repo}/pulls/{number}/comments")
+
+        if comment_id_raw is not None:
+            return self._one_comment(int(comment_id_raw), issue_comments, review_comments, offset)
+
         resolution_by_comment: dict[int, bool] = {}
         try:
             for thread in await self._review_threads(repo, number):
@@ -140,14 +156,78 @@ class GitHubAdapter:
                         resolution_by_comment[int(comment_id)] = bool(thread.get("isResolved"))
         except Exception:
             logger.debug("could not annotate review thread status for %s#%s", repo, number, exc_info=True)
+        # combine before sorting so "newest-appearing-last" holds across both kinds, not just within each
+        combined = [("issue", comment) for comment in issue_comments] + [("review", comment) for comment in review_comments]
+        combined.sort(key=lambda item: str(item[1].get("created_at") or ""))
         lines = []
+        for kind, comment in combined:
+            comment_id_value = comment.get("id")
+            comment_resolution = resolution_by_comment.get(int(comment_id_value)) if comment_id_value is not None else None
+            comment_author = str((comment.get("user") or {}).get("login") or "")
+            if author and comment_author.lower() != author:
+                continue
+            status = ""
+            if kind == "review" and comment_resolution is not None:
+                status = " (resolved)" if comment_resolution else " (unresolved)"
+            location = self._review_comment_location(comment) if kind == "review" else ""
+            label = f"{kind}, {location}" if location else kind
+            body = str(comment.get("body", ""))
+            preview = body[:COMMENT_PREVIEW_CHARS] + (COMMENT_PREVIEW_MARKER if len(body) > COMMENT_PREVIEW_CHARS else "")
+            lines.append(f"[{comment.get('id')}] [{comment.get('created_at')}] {comment_author} ({label}): {preview}{status}")
+        if not lines:
+            total = len(issue_comments) + len(review_comments)
+            return _text("no comments" if not total else f"no comments matched the filters (there are {total} in total)")
+        # tail_fit always favors the newest lines, so offset skips from the newest end too — otherwise
+        # a caller paging with offset would keep landing back on the same tail-fitted chunk
+        selected = lines[: max(len(lines) - offset, 0)]
+        if not selected:
+            return _text(f"no comments past offset {offset} (there are {len(lines)} in total)")
+        return _text(self._tail_fit(selected, offset))
+
+    @staticmethod
+    def _tail_fit(selected: list[str], offset: int) -> str:
+        """newest lines win when the output cap bites, so the latest comments aren't the ones dropped."""
+        joined = "\n".join(selected)
+        if len(joined) <= OUTPUT_LIMIT:
+            return joined
+        reserve = 120  # room for the "earlier comments not shown" marker below
+        kept: list[str] = []
+        used = 0
+        for line in reversed(selected):
+            used += len(line) + (1 if kept else 0)
+            if used > OUTPUT_LIMIT - reserve:
+                break
+            kept.insert(0, line)
+        dropped = len(selected) - len(kept)
+        # next page must skip what offset already skipped plus what we just showed
+        next_offset = offset + len(kept)
+        marker = f"…({dropped} earlier comment(s) not shown — pass offset={next_offset} to see them, or narrow with author/comment_id)\n"
+        return marker + "\n".join(kept)
+
+    def _one_comment(self, comment_id: int, issue_comments: list[dict], review_comments: list[dict], body_offset: int) -> dict:
+        """offset is chars into the body, not a comment index."""
         for kind, comments in (("issue", issue_comments), ("review", review_comments)):
             for comment in comments:
-                status = ""
-                if kind == "review" and comment.get("id") in resolution_by_comment:
-                    status = " (resolved)" if resolution_by_comment[comment["id"]] else " (unresolved)"
-                lines.append(f"[{comment.get('id')}] [{comment.get('created_at')}] {(comment.get('user') or {}).get('login')} ({kind}): {str(comment.get('body', ''))[:400]}{status}")
-        return _text("\n".join(lines) or "no comments")
+                if comment.get("id") == comment_id:
+                    author = (comment.get("user") or {}).get("login")
+                    prefix = f"[{comment.get('id')}] [{comment.get('created_at')}] {author} ({kind}): "
+                    body = str(comment.get("body") or "")
+                    return _text(self._paged_text(prefix, body, body_offset))
+        return _error(f"comment {comment_id} was not found on this pull request (checked both issue and review comments)")
+
+    @staticmethod
+    def _paged_text(prefix: str, body: str, offset: int) -> str:
+        if body and offset >= len(body):
+            return f"{prefix}(no content past offset {offset} — this comment's body is {len(body)} chars long)"
+        remaining = body[offset:]
+        available = OUTPUT_LIMIT - len(prefix)
+        if len(remaining) <= available:
+            return prefix + remaining
+        reserve = 80  # room for the continuation marker below, sized generously for its numbers
+        chunk = remaining[: max(available - reserve, 0)]
+        end = offset + len(chunk)
+        marker = f"\n…(showing chars {offset}-{end} of {len(body)} — pass offset={end} to continue)"
+        return prefix + chunk + marker
 
     async def comment_on_pull_request(self, args: dict) -> dict:
         repo, error = self._check_repo(args)
@@ -163,9 +243,23 @@ class GitHubAdapter:
         if error:
             return error
         event = str(args.get("event", "COMMENT")).upper()
-        if event not in ALLOWED_REVIEW_EVENTS:
-            return _error(f"review event {event!r} is not permitted; use COMMENT or REQUEST_CHANGES")
+        allowed_events = ALLOWED_REVIEW_EVENTS | ({"APPROVE"} if self.can_approve else set())
+        if event not in allowed_events:
+            return _error(f"review event {event!r} is not permitted; use {' or '.join(sorted(allowed_events))}")
         number = int(args["number"])
+        # the follow-up loop only acts on REQUEST_CHANGES/APPROVE, so the reviewing persona's APPROVE and COMMENT both hinge on authorship (issue #75)
+        if self.can_approve and event in ("APPROVE", "COMMENT"):
+            main_login, lookup_error = await self._resolve_main_login()
+            if main_login is None and event == "APPROVE":
+                return _error(f"cannot verify pull request authorship — main-agent identity lookup unavailable ({lookup_error})")
+            # COMMENT fails open on a lookup blip — blocking the reviewer's reviews of human prs is worse than one unenforced comment
+            if main_login is not None:
+                pr = await self._request("GET", f"/repos/{repo}/pulls/{number}")
+                author_login = str((pr.get("user") or {}).get("login") or "").lower()
+                if event == "APPROVE" and author_login != main_login:
+                    return _error(f"APPROVE is only permitted on pull requests authored by {self.other_bot_name} — it's the review loop's exit signal (issue #75), not a general human-PR approval")
+                if event == "COMMENT" and author_login == main_login:
+                    return _error(f"COMMENT is not permitted on pull requests authored by {self.other_bot_name} — use REQUEST_CHANGES or APPROVE so the review loop can act on the outcome")
         payload: dict = {"body": str(args.get("body", "")), "event": event}
         comments_json = str(args.get("comments_json") or "").strip()
         if comments_json:
@@ -260,8 +354,10 @@ class GitHubAdapter:
         repo, error = self._check_repo(args)
         if error:
             return error
-        if not self.bot_logins:
-            return _error("cannot verify thread authorship — resolution unavailable for this task")
+        known_logins, unresolved = await self._resolve_bot_logins()
+        detail = f" ({'; '.join(unresolved)})" if unresolved else ""
+        if not known_logins:
+            return _error(f"cannot verify thread authorship — resolution unavailable for this task{detail}")
         number = int(args["number"])
         comment_id = int(args["comment_id"])
         thread = next(
@@ -272,8 +368,9 @@ class GitHubAdapter:
             return _error("comment id was not found in this pull request's review threads; pass a review-comment id from list_pr_comments")
         comments = (thread.get("comments") or {}).get("nodes") or []
         root_login = str((((comments[0] if comments else {}).get("author") or {}).get("login")) or "")
-        if root_login.lower() not in {login.lower() for login in self.bot_logins}:
-            return _error(f"only review threads started by {self.bot_name} or {self.other_bot_name} can be resolved")
+        if root_login.lower() not in known_logins:
+            # a partly-degraded identity lookup can still refuse one of our own threads, so name the failure here too
+            return _error(f"only review threads started by {self.bot_name} or {self.other_bot_name} can be resolved{detail}")
         if thread.get("isResolved"):
             return _text(f"review thread for comment {comment_id} on {repo}#{number} is already resolved")
         data = await self._graphql(
@@ -288,6 +385,44 @@ class GitHubAdapter:
 
     # -- plumbing ------------------------------------------------------------------
 
+    async def _resolve_main_login(self) -> tuple[str | None, str | None]:
+        """the main agent's login, resolved lazily like `_resolve_bot_logins` (#72) — used to gate APPROVE to agent-authored PRs."""
+        if self.main_broker is None:
+            return None, "no main-agent broker configured for this task"
+        return await self._resolve_login_for(self.main_broker)
+
+    async def _resolve_own_login(self) -> tuple[str | None, str | None]:
+        """the acting persona's own login — `self.broker` is whichever bot is running this task — for `author: "me"` in `list_pr_comments`."""
+        return await self._resolve_login_for(self.broker)
+
+    @staticmethod
+    async def _resolve_login_for(broker) -> tuple[str | None, str | None]:
+        """shared by `_resolve_main_login` and `_resolve_own_login`, which differ only in which broker they read."""
+        try:
+            return f"{await broker.app_slug()}[bot]".lower(), None
+        except Exception as exc:
+            return None, str(exc)
+
+    async def _resolve_bot_logins(self) -> tuple[set[str], list[str]]:
+        """logins for either persona, resolved lazily because a build-time snapshot can be permanently incomplete (#72)."""
+        logins: set[str] = set()
+        errors: list[str] = []
+        for broker in self.bot_brokers:
+            try:
+                # the bare app slug, which is how graphql reports a bot author — REST's "{slug}[bot]" shape is not used here
+                logins.add((await broker.app_slug()).lower())
+            except Exception as exc:
+                errors.append(str(exc))
+        return logins, errors
+
+    def _review_comment_location(self, comment: dict) -> str:
+        path = comment["path"]
+        # line goes null once the diff position goes stale, hence the original_line fallback
+        line = comment.get("line") or comment.get("original_line")
+        location = f"{path}:{line}" if line else path
+        in_reply_to = comment.get("in_reply_to_id")
+        return f"{location}, reply-to {in_reply_to}" if in_reply_to is not None else location
+
     def _check_repo(self, args: dict) -> tuple[str, dict | None]:
         repo = str(args.get("repo", "")).strip()
         if repo not in self.approved_repos:
@@ -296,6 +431,17 @@ class GitHubAdapter:
 
     def _record_pr(self, repo: str, pr: dict) -> None:
         self.store.add_artifact(self.task.task_id, "pull_request", f"{repo}#{pr['number']}", pr.get("html_url"))
+
+    async def _paginated(self, path: str) -> list[dict]:
+        """github defaults to 30 items/page; page through at 100 until a short page ends the walk."""
+        items: list[dict] = []
+        page = 1
+        while True:
+            batch = await self._request("GET", f"{path}?per_page=100&page={page}") or []
+            items.extend(batch)
+            if len(batch) < 100:
+                return items
+            page += 1
 
     async def _request(self, method: str, path: str, payload: dict | None = None):
         """the http seam — patched in unit tests. token fetched per call, never stored (TOL-007)."""
@@ -306,7 +452,9 @@ class GitHubAdapter:
         async with aiohttp.ClientSession() as session:
             async with session.request(method, GITHUB_API + path, json=payload, headers=headers) as response:
                 if response.status >= 300:
-                    raise GitHubStatusError(response.status, redactor.redact(f"github api {method} {path} failed: {response.status}"))
+                    body = redactor.redact(await response.text())[:300]
+                    retry_after = response.headers.get("Retry-After")
+                    raise GitHubStatusError(response.status, f"github api {method} {path} failed: {response.status} — {body}", retry_after=retry_after)
                 if response.status == 204:
                     return None
                 return await response.json()
@@ -328,23 +476,32 @@ class GitHubAdapter:
 
     async def _review_threads(self, repo: str, number: int) -> list[dict]:
         owner, name = repo.split("/", 1)
-        data = await self._graphql(
-            """query ReviewThreads($owner: String!, $name: String!, $number: Int!) {
+        nodes: list[dict] = []
+        cursor = None
+        while True:
+            data = await self._graphql(
+                """query ReviewThreads($owner: String!, $name: String!, $number: Int!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $after) {
         nodes {
           id
           isResolved
           comments(first: 100) { nodes { databaseId author { login } } }
         }
+        pageInfo { hasNextPage endCursor }
       }
     }
   }
 }""",
-            {"owner": owner, "name": name, "number": number},
-        )
-        return ((((data.get("repository") or {}).get("pullRequest") or {}).get("reviewThreads") or {}).get("nodes")) or []
+                {"owner": owner, "name": name, "number": number, "after": cursor},
+            )
+            review_threads = (((data.get("repository") or {}).get("pullRequest") or {}).get("reviewThreads")) or {}
+            nodes.extend(review_threads.get("nodes") or [])
+            page_info = review_threads.get("pageInfo") or {}
+            cursor = page_info.get("endCursor")
+            if not page_info.get("hasNextPage") or not cursor:
+                return nodes
 
 
 def build_github_server(adapter: GitHubAdapter):
@@ -364,11 +521,25 @@ def build_github_server(adapter: GitHubAdapter):
             "List changed files and bounded patches for a pull request, 10 per page. Fetch full diffs with git.",
             {"type": "object", "properties": {"repo": {"type": "string"}, "number": {"type": "integer"}, "page": {"type": "integer"}}, "required": ["repo", "number"]},
         )(wrap(adapter.list_pr_files, logger)),
-        tool("list_pr_comments", "List comments and review comments on a pull request.", {"repo": str, "number": int})(wrap(adapter.list_pr_comments, logger)),
+        tool(
+            "list_pr_comments",
+            f"List comments and review comments on a pull request, newest-appearing-last, bodies previewed at {COMMENT_PREVIEW_CHARS} chars. Optional author filter narrows the list and combines with offset; pass comment_id instead to page that one comment's body.",
+            {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string"},
+                    "number": {"type": "integer"},
+                    "offset": {"type": "integer", "description": "if truncated, skip this many of the most-recently-shown comments (the truncation marker gives the right value); with comment_id, this is characters into that body to resume from instead"},
+                    "author": {"type": "string", "description": 'login, exact match; pass "me" for the acting persona\'s own login'},
+                    "comment_id": {"type": "integer", "description": "page this one comment's body (issue or review) instead of a filtered list; ignores author"},
+                },
+                "required": ["repo", "number"],
+            },
+        )(wrap(adapter.list_pr_comments, logger)),
         tool("comment_on_pull_request", "Post a comment on a pull request.", {"repo": str, "number": int, "body": str})(wrap(adapter.comment_on_pull_request, logger)),
         tool(
             "create_pr_review",
-            "Post a review (COMMENT or REQUEST_CHANGES) on a pull request, optionally with inline comments_json.",
+            "Post a review (COMMENT or REQUEST_CHANGES, and APPROVE for the reviewing persona) on a pull request, optionally with inline comments_json.",
             {
                 "type": "object",
                 "properties": {"repo": {"type": "string"}, "number": {"type": "integer"}, "body": {"type": "string"}, "event": {"type": "string"}, "comments_json": {"type": "string"}},

@@ -2,7 +2,7 @@
 
 IAM is the real enforcement (AWS-005) — this adapter is the belt on those suspenders:
 service and region allowlists from config (AWS-003) and a read-verb operation gate.
-red is deployed once (staging account) and reads other environments by assuming that
+the harness is deployed once (host account) and reads other environments by assuming that
 environment's configured per-environment diagnostics role per task, with session name
 ar-<task_id> so every cloudtrail entry is task-attributable (AWS-006).
 """

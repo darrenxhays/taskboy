@@ -1,0 +1,4 @@
+# confluence service — read-only page search/fetch (uses the jira service account credentials).
+enabled: false # true requires site below plus JIRA_EMAIL / JIRA_API_TOKEN in the environment
+site: "" # e.g. https://your-org.atlassian.net
+spaces: [] # empty = any space the service account can read

@@ -12,7 +12,7 @@ Turn the current reserved issue batch into implementation specs, then hand each 
 
 ## Step 1 — Load the batch
 
-Call `list_accepted_issues`. It returns up to five issues reserved for this coordinator, including each issue's target `repo`. If there are none, call `report_blocked` saying there are no approved issues and stop.
+Call `list_accepted_issues`. It returns up to five issues reserved for this coordinator, including each issue's target `repo`. If there are none, reply that nothing was approved and stop — do not call `report_blocked`; an empty queue is a normal daily outcome.
 
 Clone each distinct target repo as needed. A batch may span repositories; never assume an issue targets `{{self_repo}}`.
 

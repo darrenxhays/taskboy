@@ -58,14 +58,16 @@ async def amain() -> None:
         logger.info("slack intake enabled (team=%s)", config.slack.team_id)
     else:
         notifier = StdoutNotifier()
-        logger.info("slack intake disabled (slack.team_id not set) — use `taskboy inject`")
+        logger.info("slack intake disabled (services/slack.yaml enabled: false or team_id not set) — use `taskboy inject`")
 
     broker = None
     reviewer_broker = None
     if config.runner == "claude":
         from taskboy.broker import CredentialBroker
 
-        if secrets is not None and secrets.github_enabled:
+        if not config.service_enabled("github"):
+            logger.info("github disabled in config — sessions run without git push auth or PR tools")
+        elif secrets is not None and secrets.github_enabled:
             broker = CredentialBroker(secrets.github_app_id, secrets.github_installation_id, secrets.github_app_private_key, settings.BROKER_SOCKET, settings.GIT_CRED_HELPER)
             await broker.start()
             try:
@@ -76,7 +78,9 @@ async def amain() -> None:
         else:
             logger.info("github credentials not configured — sessions run without git push auth")
         if config.reviewer.enabled:
-            if secrets is not None and secrets.reviewer_github_enabled:
+            if not config.service_enabled("github"):
+                logger.warning("reviewer is enabled but the github service is disabled — reviewer GitHub review tasks are disabled")
+            elif secrets is not None and secrets.reviewer_github_enabled:
                 candidate = CredentialBroker(secrets.reviewer_github_app_id, secrets.reviewer_github_installation_id, secrets.reviewer_github_app_private_key, settings.REVIEWER_BROKER_SOCKET, settings.GIT_CRED_HELPER)
                 try:
                     await candidate.start()
@@ -95,10 +99,10 @@ async def amain() -> None:
         logger.info(
             "session integrations: github=%s jira=%s confluence=%s sentry=%s aws=%s slack=%s",
             broker is not None,
-            secrets.jira_enabled and bool((config.raw.get("jira") or {}).get("site")),
-            secrets.jira_enabled and bool((config.raw.get("confluence") or {}).get("site")),
-            bool(secrets.sentry_token and (config.raw.get("sentry") or {}).get("organization")),
-            bool((config.raw.get("aws") or {}).get("allowed_services")),
+            config.service_enabled("jira") and secrets.jira_enabled,
+            config.service_enabled("confluence") and secrets.jira_enabled,
+            config.service_enabled("sentry") and bool(secrets.sentry_token),
+            config.service_enabled("aws"),
             slack_client is not None,
         )
     else:
@@ -178,7 +182,7 @@ async def amain() -> None:
     if config.runner == "claude":
         from taskboy.scheduler import scheduler_loop, seed_default_schedules
 
-        seed_default_schedules(store, self_repo=str((config.raw.get("github") or {}).get("self_repo") or ""))
+        seed_default_schedules(store, self_repo=str((config.raw.get("github") or {}).get("self_repo") or ""), github_enabled=config.service_enabled("github"))
         scheduler_task = asyncio.ensure_future(scheduler_loop(store, config, notifier))
     if handler is not None:
         asyncio.ensure_future(handler.start_async())

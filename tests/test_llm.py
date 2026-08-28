@@ -62,7 +62,7 @@ async def test_structured_call_retries_once_then_succeeds(monkeypatch):
     async def flaky(*, prompt, options):
         calls["count"] += 1
         if calls["count"] == 1:
-            raise Exception("Claude Code returned an error result: success")
+            raise Exception("boom")
         yield SimpleNamespace(structured_output={"answer": "ok"}, usage={}, total_cost_usd=None)
 
     monkeypatch.setattr(claude_agent_sdk, "query", flaky)
@@ -70,6 +70,87 @@ async def test_structured_call_retries_once_then_succeeds(monkeypatch):
 
     assert result == {"answer": "ok"}
     assert calls["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_structured_call_tolerates_error_result_success_with_structured_output(monkeypatch):
+    """issue #80: a usable result frame followed by the benign SDK error is used, not discarded."""
+    import claude_agent_sdk
+
+    calls = {"count": 0}
+
+    async def success_result_then_stream_error(*, prompt, options):
+        calls["count"] += 1
+        yield SimpleNamespace(
+            structured_output={"answer": "ok"},
+            usage={"input_tokens": 5, "output_tokens": 1},
+            total_cost_usd=0.002,
+        )
+        raise Exception("Claude Code returned an error result: success")
+
+    monkeypatch.setattr(claude_agent_sdk, "query", success_result_then_stream_error)
+    result, usage = await structured_call("claude-haiku", "prompt", {"type": "object"})
+
+    assert result == {"answer": "ok"}
+    assert usage["cost_usd"] == 0.002
+    assert calls["count"] == 1  # tolerated inline, no wasted retry
+
+
+@pytest.mark.asyncio
+async def test_structured_call_does_not_tolerate_genuine_error_result(monkeypatch):
+    """a genuine error's exception text differs from the tolerated shape, so it still raises and retries."""
+    import claude_agent_sdk
+
+    calls = {"count": 0}
+
+    async def genuine_error(*, prompt, options):
+        calls["count"] += 1
+        yield SimpleNamespace()
+        raise Exception("Claude Code returned an error result: overloaded_error")
+
+    monkeypatch.setattr(claude_agent_sdk, "query", genuine_error)
+
+    with pytest.raises(Exception, match="overloaded_error"):
+        await structured_call("claude-haiku", "prompt", {"type": "object"})
+
+    assert calls["count"] == 2  # exactly one retry, not tolerated
+
+
+@pytest.mark.asyncio
+async def test_structured_call_tolerates_error_result_success_with_trailing_session_state_frame(monkeypatch):
+    """the SDK's trailing session_state_changed marker after the result must not clobber the usable frame before it."""
+    import claude_agent_sdk
+    from claude_agent_sdk import SystemMessage
+
+    async def success_result_then_trailer_then_stream_error(*, prompt, options):
+        yield SimpleNamespace(structured_output={"answer": "ok"}, usage={}, total_cost_usd=None)
+        yield SystemMessage(subtype="session_state_changed", data={})
+        raise Exception("Claude Code returned an error result: success")
+
+    monkeypatch.setattr(claude_agent_sdk, "query", success_result_then_trailer_then_stream_error)
+    result, _ = await structured_call("claude-haiku", "prompt", {"type": "object"})
+
+    assert result == {"answer": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_structured_call_reraises_tolerated_text_when_no_frame_received(monkeypatch):
+    """the tolerated error text must still surface if no usable frame ever arrived."""
+    import claude_agent_sdk
+
+    calls = {"count": 0}
+
+    async def error_before_any_frame(*, prompt, options):
+        calls["count"] += 1
+        raise Exception("Claude Code returned an error result: success")
+        yield  # unreachable; makes this an async generator so `async for` works
+
+    monkeypatch.setattr(claude_agent_sdk, "query", error_before_any_frame)
+
+    with pytest.raises(Exception, match="Claude Code returned an error result: success"):
+        await structured_call("claude-haiku", "prompt", {"type": "object"})
+
+    assert calls["count"] == 2  # exactly one retry, not tolerated
 
 
 @pytest.mark.asyncio

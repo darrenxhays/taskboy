@@ -366,7 +366,9 @@ async def test_blue_session_uses_reviewer_github_adapter_and_git_identity(store,
 
     assert outcome.state == COMPLETED
     assert captured["github_broker"] is reviewer_broker
-    assert captured["github_kwargs"]["bot_logins"] == ["red-app[bot]", "blue-app[bot]"]
+    assert captured["github_kwargs"]["main_broker"] is red_broker  # APPROVE is gated to main-agent-authored prs, not just the reviewer persona
+    assert captured["github_kwargs"]["reviewer_broker"] is reviewer_broker  # so resolve_pr_thread resolves both logins lazily (issue #72)
+    assert captured["github_kwargs"]["can_approve"] is True  # the reviewer persona may APPROVE
     assert captured["options"]["env"]["GIT_AUTHOR_NAME"] == "Blue"
     assert captured["options"]["env"]["GIT_COMMITTER_EMAIL"] == "blue@example.com"
     assert captured["slack_kwargs"] == {"allowed_channels": config.slack.allowed_channels, "files_dir": tmp_path / "repo" / "slack_files"}
@@ -885,6 +887,23 @@ async def test_question_asker_records_and_blocks(store, config, make_task, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_question_asker_tells_an_issue_backed_task_it_reopens_instead_of_slack(store, config, make_task, tmp_path):
+    # an issue-backed task's questions land on the issue and reopen it, not a Slack thread reply (#76)
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+    issue = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    store.decide_issue(issue["id"], "approved", "boss")
+    store.start_issue(issue["id"], task.task_id, "the spec")
+    blocked: dict = {}
+    ask = runner._question_asker(task, blocked)
+
+    message = await ask("1. Which environment?")
+
+    assert "tracked as an issue" in message and "reopened as 'proposed'" in message
+    assert "resumes automatically with their answers" not in message
+
+
+@pytest.mark.asyncio
 async def test_run_replays_answered_questions_into_prompt(store, config, make_task, tmp_path):
     runner = make_runner(store, config, tmp_path)
     runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
@@ -903,3 +922,15 @@ def test_build_progress_server_exposes_ask_questions():
 
     server = build_progress_server(AsyncMock(), {}, AsyncMock(return_value="ok"), AsyncMock(return_value="ok"))
     assert server is not None
+
+
+# -- disabled services drop their mcp tools from session allowlists ----------
+
+
+def test_strip_disabled_service_tools_filters_only_disabled_service_prefixes():
+    from taskboy.runner import strip_disabled_service_tools
+    from tests.conftest import make_config
+
+    config = make_config(services={"slack": False, "github": True, "jira": False, "confluence": False, "sentry": False, "aws": False})
+    tools = ["Read", "Bash", "mcp__harness__report_progress", "mcp__github__create_pull_request", "mcp__jira__get_issue", "mcp__slack__send_dm", "mcp__sentry__list_issues", "mcp__issues__update_issue"]
+    assert strip_disabled_service_tools(tools, config) == ["Read", "Bash", "mcp__harness__report_progress", "mcp__github__create_pull_request", "mcp__issues__update_issue"]

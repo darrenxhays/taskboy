@@ -3,7 +3,7 @@ import itertools
 
 import pytest
 
-from taskboy.config import Config, Role, SlackConfig
+from taskboy.config import KNOWN_SERVICES, Config, Role, SlackConfig
 from taskboy.store import Store
 
 
@@ -14,9 +14,10 @@ def make_config(**overrides) -> Config:
         max_retries=2,
         progress_min_interval_seconds=0,
         runner="echo",
-        slack=SlackConfig(team_id="T1", allowed_channels=["C1"]),
+        slack=SlackConfig(team_id="T1", allowed_channels=["C1"], enabled=True),
         roles={"admin": Role(name="admin", members=["U1"], allowed_profiles=["read_only", "standard", "deep"], model_override=True, max_budget_usd=None, repos=None)},
         raw={"github": {"approved_repos": ["example-org/taskboy"], "self_repo": "example-org/taskboy"}, "issues": {"notify_channel": "", "uploads_bucket": ""}},
+        services={name: True for name in KNOWN_SERVICES},  # tests exercise every integration path unless a test disables one
     )
     fields.update(overrides)
     return Config(**fields)
@@ -68,6 +69,9 @@ class RecordingNotifier:
 
     async def questions(self, task, questions):
         self.calls.append(("questions", task.task_id, questions))
+
+    async def issue_blocked(self, task, issue):
+        self.calls.append(("issue_blocked", task.task_id, issue["id"]))
 
     async def recovered(self, task):
         self.calls.append(("recovered", task.task_id))

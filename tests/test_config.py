@@ -406,3 +406,86 @@ def test_dashboard_email_domain_required_when_enabled(tmp_path):
         load_config(str(path))
     path.write_text(VALID + "dashboard: {enabled: true, allowed_email_domain: example.com}\n")
     assert load_config(str(path)).dashboard.allowed_email_domain == "example.com"
+
+
+# -- per-service config files (services/<name>.yaml) -------------------------
+
+
+def _write_services(tmp_path, **files):
+    services = tmp_path / "services"
+    services.mkdir(exist_ok=True)
+    for name, content in files.items():
+        (services / f"{name}.yaml").write_text(content)
+
+
+def test_service_files_merge_and_enable(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID + "\nroles:\n  admin: {members: [U1], allowed_profiles: []}\n")
+    _write_services(
+        tmp_path,
+        slack="enabled: true\nteam_id: T1\nallowed_channels: [C1]\n",
+        jira="enabled: false\nsite: https://org.atlassian.net\n",
+    )
+    config = load_config(str(path))
+    assert config.services["slack"] is True
+    assert config.slack.enabled is True and config.slack.team_id == "T1"
+    assert config.services["jira"] is False  # fully configured but explicitly off
+    assert config.raw["jira"]["site"] == "https://org.atlassian.net"  # settings still visible when disabled
+    assert config.service_enabled("github") is True  # no file and no inline section: legacy default, secrets still gate it at runtime
+    assert config.enabled_integrations() == ["github"]
+
+
+def test_service_file_conflicts_with_inline_section(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID + "\nsentry: {organization: org}\n")
+    _write_services(tmp_path, sentry="enabled: true\norganization: org\n")
+    with pytest.raises(ConfigError, match="both config.yaml and services/sentry.yaml"):
+        load_config(str(path))
+
+
+def test_service_file_requires_explicit_enabled(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID)
+    _write_services(tmp_path, sentry="organization: org\n")
+    with pytest.raises(ConfigError, match="services/sentry.yaml must set enabled"):
+        load_config(str(path))
+
+
+def test_unknown_service_file_fails(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID)
+    _write_services(tmp_path, mystery="enabled: true\n")
+    with pytest.raises(ConfigError, match="services/mystery.yaml is not a known service"):
+        load_config(str(path))
+
+
+def test_enabled_service_requires_its_key(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID)
+    _write_services(tmp_path, jira="enabled: true\n")
+    with pytest.raises(ConfigError, match="jira.site is required when jira is enabled"):
+        load_config(str(path))
+
+
+def test_inline_sections_keep_legacy_enable_inference(tmp_path):
+    # configs from before the services/ split: presence of the key signals "on"; github rides on secrets alone
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID + "\nslack: {team_id: T1}\nroles:\n  admin: {members: [U1], allowed_profiles: []}\njira: {site: https://org.atlassian.net}\n")
+    config = load_config(str(path))
+    assert config.services == {"slack": True, "github": True, "jira": True, "confluence": False, "sentry": False, "aws": False}
+
+
+def test_inline_enabled_false_turns_off_a_configured_service(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID + "\nslack: {enabled: false, team_id: T1}\ngithub: {enabled: false}\n")
+    config = load_config(str(path))
+    assert config.slack.enabled is False
+    assert config.service_enabled("github") is False
+    assert config.enabled_integrations() == []
+
+
+def test_non_boolean_enabled_fails(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID + "\nsentry: {enabled: definitely}\n")
+    with pytest.raises(ConfigError, match="sentry.enabled must be a boolean"):
+        load_config(str(path))

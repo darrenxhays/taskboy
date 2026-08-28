@@ -2,6 +2,10 @@
 # config.yaml is gitignored in this repo template — commit it to your own private fork/repo if you want it version-controlled.
 # apply changes with a service restart — restarts are safe, running tasks are requeued and resumed.
 # tip: run `taskboy setup` for a guided walkthrough that fills this file in for you.
+#
+# connected services (slack, github, jira, confluence, sentry, aws) each live in their own file
+# under services/<name>.yaml next to this file, with an explicit enabled flag — turn a service
+# on or off there without touching this file.
 
 orchestrator:
   max_concurrency: 3 # max sub-agents running at once (ORC-005)
@@ -39,13 +43,6 @@ issues: # multi-repo issue discovery, refinement, discussion, and implementation
 skills: # model + execution profile for /skill-name invocations; tier must be in the models catalog
   tier: opus # change here to move all skill runs
   profile: standard
-
-slack: # socket-mode intake and notifications
-  team_id: "" # non-empty enables slack intake
-  debug_channel: "" # set to a private debug channel id; empty disables the debug feed
-  task_started_messages_file: task_started_messages.yaml # relative to this config file; missing/invalid uses legacy text
-  allowed_channels: [] # channel ids, e.g. [C0123ABCDEF]
-  ack_reaction: true # 👀 reaction instead of the "On it" message; false restores the text ack
 
 roles: # use members: ["*"] on at most one role to allow anyone in an allowed channel
   admin:
@@ -118,39 +115,6 @@ usage_limits: # total-token ceilings for dashboard remaining-capacity meters; ze
 
 conventions: # engineering conventions doc injected into repo-targeting task workspaces as CONVENTIONS.md
   file: "" # e.g. conventions.md, relative to this config file's directory; empty = disabled
-
-github: # used from phase 4
-  approved_repos: [] # org/repo
-  self_repo: "" # org/repo of this agent's own source; must also be in approved_repos; empty = no self-repo hint
-  protected_branch_patterns: [main, develop]
-  commit_name: "" # git author/committer on commits the agent pushes; empty = defaults to agent.name
-  # GitHub derives the commit avatar from this email; verify it on a GitHub account to give the agent a custom avatar (operator-side setup)
-  commit_email: ""
-  review_requests: # poll approved repos for PRs where the agent is a requested reviewer -> run /review
-    enabled: false
-    poll_interval_seconds: 60
-    notify_channel: "" # optional slack channel id for lifecycle updates on github-triggered reviews
-
-jira: # used from phase 5
-  site: "" # e.g. https://your-org.atlassian.net
-  projects: [] # project keys the agent may touch, e.g. [ENG]
-  issue_types: [Story, Bug, Task]
-  story_points_field: "" # e.g. customfield_10016; empty = story points not set
-
-confluence:
-  site: "" # e.g. https://your-org.atlassian.net
-  spaces: [] # empty = any space the service account can read
-
-aws: # read-only diagnostics; writes are denied by IAM and by the adapter (AWS-004/005)
-  allowed_services: [] # e.g. [logs, cloudwatch, lambda, ecs, s3]
-  allowed_regions: [us-east-1]
-  # diagnostics_role_arns: # per-environment roles the agent assumes for reads; comment out for local-dev default creds
-  #   staging: arn:aws:iam::YOUR_ACCOUNT_ID:role/your-staging-diagnostics-role
-  #   production: arn:aws:iam::YOUR_ACCOUNT_ID:role/your-production-diagnostics-role
-
-sentry: # used from phase 5
-  organization: "" # sentry org slug
-  projects: []
 
 dashboard: # web ui; served behind an alb doing sso in deployed envs
   enabled: false

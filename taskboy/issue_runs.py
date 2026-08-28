@@ -54,50 +54,66 @@ async def start_refine_task(store: Store, config: Config, notifier, issue_id: in
     return task, status, None
 
 
-async def start_implementation_run(store: Store, config: Config, notifier, *, source: str) -> tuple[Task | None, str, str | None]:
+async def start_implementation_run(
+    store: Store,
+    config: Config,
+    notifier,
+    *,
+    thread_key: str,
+    request_text: str = "/implementapprovedissues",
+    user_id: str = SYSTEM_USER,
+    channel_id: str | None = None,
+    model_override: str | None = None,
+    effort_override: str | None = None,
+    schedule_name: str | None = None,
+) -> tuple[Task | None, str, str | None]:
     """reserve up to IMPLEMENTATION_BATCH_SIZE approved issues and start the /implementapprovedissues coordinator
     for exactly that batch. returns (task, status, active_task_id): status is "already_running" (active_task_id set
-    to the running coordinator), "no_approved_issues", or whatever accept_task reports ("created" or a refusal
-    like "paused"/"queue_full"/"duplicate").
-
-    the active-run check and the reservation are plain synchronous store calls with no `await` between them, so two
-    simultaneous calls can never both reserve the same issues or both go on to create a coordinator: the loser
-    sees zero approved rows left (or the winner's now-active run) and reports back without creating anything.
-    """
+    to the running coordinator, or None if refused on a pending reservation before one exists), "no_approved_issues",
+    or whatever accept_task reports ("created" or a refusal like "paused"/"queue_full"/"duplicate")."""
     existing = store.active_implementation_run()
     if existing is not None:
         return None, "already_running", existing
+    if store.has_pending_implementation_reservation():
+        return None, "already_running", None
 
     marker = f"pending:{uuid.uuid4().hex[:12]}"
     reserved = store.reserve_issues(marker, IMPLEMENTATION_BATCH_SIZE)
     if not reserved:
         return None, "no_approved_issues", None
 
-    channel = str(((config.raw.get("issues") or {}).get("notify_channel")) or "")
-    key = f"issues:implementapprovedissues:{source}@{utcnow()}"
-    task, status = await accept_task(
-        store,
-        config,
-        notifier,
-        team_id=SYSTEM_TEAM,
-        channel_id=channel,
-        thread_ts=key,
-        message_ts=key,
-        user_id=SYSTEM_USER,
-        text="/implementapprovedissues",
-    )
-    if status != "created" or task is None:
-        # intake itself refused (paused/queue_full/duplicate) — don't strand the reservation
-        store.release_reserved_issues(marker)
-        return task, status, None
-
-    store.assign_reservation(marker, task.task_id)
-    return task, "created", None
+    channel = channel_id if channel_id is not None else str(((config.raw.get("issues") or {}).get("notify_channel")) or "")
+    assigned = False
+    try:
+        task, status = await accept_task(
+            store,
+            config,
+            notifier,
+            team_id=SYSTEM_TEAM,
+            channel_id=channel,
+            thread_ts=thread_key,
+            message_ts=thread_key,
+            user_id=user_id,
+            text=request_text,
+            model_override=model_override,
+            effort_override=effort_override,
+            schedule_name=schedule_name,
+        )
+        if status != "created" or task is None:
+            return task, status, None
+        store.assign_reservation(marker, task.task_id)
+        assigned = True
+        return task, "created", None
+    finally:
+        # covers accept_task raising (incl. cancellation) and the plain refusal case above — either way, don't
+        # strand the reservation under a marker no coordinator will ever claim
+        if not assigned:
+            store.release_reserved_issues(marker)
 
 
 def fail_stalled_implementation_run(store: Store) -> str | None:
     """fail a coordinator left blocked for over a day and release its reserved issues."""
-    task_id = store.active_implementation_run()
+    task_id = store.blocked_implementation_run()
     if task_id is None:
         return None
     task = store.get_task(task_id)
@@ -115,7 +131,6 @@ def fail_stalled_implementation_run(store: Store) -> str | None:
         )
     except TransitionRaced:
         return None
-    store.release_reserved_issues(task_id)
     store.add_event(task_id, "recovery", {"action": "failed_stalled_coordinator"})
     return task_id
 

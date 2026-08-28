@@ -13,13 +13,13 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from fastapi.responses import RedirectResponse, StreamingResponse
 
 from taskboy import memory, settings, skills
-from taskboy.config import ConfigError
+from taskboy.config import KNOWN_SERVICES, ConfigError
 from taskboy.dashboard import gitops
 from taskboy.dashboard.auth import Viewer, require_admin, require_viewer, require_viewer_write
 from taskboy.dashboard.editors import EDITABLE_KINDS, atomic_write, contains_secret_submission, content_hash, target_for, unified_diff, validate
 from taskboy.dashboard.render import bounded_text, redact_bounded_value, redact_value, safe_text
 from taskboy.issue_runs import start_implementation_run, start_issue_task, start_refine_task
-from taskboy.models import CANCELLED, EFFORT_LEVELS, FAILED, RUNNING, STATES, TERMINAL_STATES, Task
+from taskboy.models import CANCELLED, EFFORT_LEVELS, FAILED, RUNNING, STATES, TERMINAL_STATES, Task, utcnow
 from taskboy.scheduler import fire_schedule_now, next_run_after
 from taskboy.skills import SkillError
 from taskboy.task_actions import cancel_task, decide_permission, retry_task
@@ -205,7 +205,7 @@ async def task_permission(request: Request, task_id: str, viewer: Viewer = Depen
     if decision not in ("granted", "denied"):
         raise HTTPException(status_code=400, detail="decision must be granted or denied")
     store = request.app.state.store
-    task, status = decide_permission(store, task_id, kind, target, decision, viewer.email)
+    task, status = await decide_permission(store, request.app.state.notifier, task_id, kind, target, decision, viewer.email)
     store.add_admin_event(viewer.email, f"permission_{decision}", f"{task_id}:{kind}:{target}", status)
     orchestrator = request.app.state.orchestrator
     if orchestrator is not None:
@@ -406,14 +406,17 @@ async def bulk_issues(request: Request, viewer: Viewer = Depends(require_admin))
     action = str(body.get("action") or "")
     if not isinstance(ids, list) or not ids or not all(isinstance(value, int) and not isinstance(value, bool) for value in ids):
         raise HTTPException(status_code=400, detail="ids must be a non-empty list of integers")
-    if action not in ("approve", "deny", "refine"):
-        raise HTTPException(status_code=400, detail="action must be approve, deny, or refine")
+    if action not in ("approve", "deny", "refine", "delete"):
+        raise HTTPException(status_code=400, detail="action must be approve, deny, refine, or delete")
     store = request.app.state.store
     results = []
     for issue_id in dict.fromkeys(ids):
         if action in ("approve", "deny"):
             row = store.decide_issue(issue_id, "approved" if action == "approve" else "denied", viewer.email)
             results.append({"id": issue_id, "status": ("approved" if action == "approve" else "denied") if row else "skipped"})
+        elif action == "delete":
+            # delete_issue already refuses in_progress/in_review rows
+            results.append({"id": issue_id, "status": "deleted" if store.delete_issue(issue_id) else "skipped"})
         elif store.get_issue(issue_id) is None:
             results.append({"id": issue_id, "status": "not_found"})
         else:
@@ -555,7 +558,7 @@ async def issues_run(request: Request, viewer: Viewer = Depends(require_admin)) 
         raise HTTPException(status_code=400, detail=f"skill must be one of {sorted(ISSUE_SKILLS)}")
     store = request.app.state.store
     if skill == "implementapprovedissues":
-        task, status, active_task_id = await start_implementation_run(store, request.app.state.config, request.app.state.notifier, source=f"dashboard:{viewer.email}")
+        task, status, active_task_id = await start_implementation_run(store, request.app.state.config, request.app.state.notifier, thread_key=f"dashboard:{viewer.email}@{utcnow()}")
         task_id = task.task_id if task else active_task_id
     else:
         repo = str(body.get("repo") or "").strip()
@@ -789,12 +792,15 @@ async def config_view(request: Request, viewer: Viewer = Depends(require_viewer)
         "secrets_bundle_name": settings.SECRETS_NAME,
     }
     secret_presence = {name: bool(getattr(app_secrets, name)) for name in app_secrets.__dataclass_fields__} if app_secrets else {}
+    services_dir = Path(settings.CONFIG_PATH).parent / "services"
     return {
         "runtime": redact_value(runtime),
         "policy": redact_value(config.raw),
         "dashboard": redact_value(asdict(config.dashboard)),
         "secret_presence": secret_presence,
         "skills": skills.available(settings.SKILLS_ROOT),
+        # editable = the section lives in its own services/<name>.yaml file (legacy inline sections are edited via config.yaml)
+        "services": {name: {"enabled": config.service_enabled(name), "editable": (services_dir / f"{name}.yaml").is_file()} for name in KNOWN_SERVICES},
     }
 
 
@@ -864,7 +870,7 @@ async def manage_write(request: Request, kind: str, viewer: Viewer = Depends(req
             store.add_admin_event(viewer.email, "commit", repo_path, "failed", {"reason": commit_error})
     elif config.dashboard.auto_commit_enabled:
         commit_error = "auto-commit is configured but dashboard_github_token is not set"
-    if kind == "config":
+    if kind in ("config", "service"):
         message = "Saved. Configuration changes apply after a service restart."
     else:
         message = "Saved and live immediately."

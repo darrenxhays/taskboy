@@ -1,0 +1,7 @@
+# aws service — read-only diagnostics; writes are denied by IAM and by the adapter (AWS-004/005).
+enabled: false # true requires at least one entry in allowed_services
+allowed_services: [] # e.g. [logs, cloudwatch, lambda, ecs, s3]
+allowed_regions: [us-east-1]
+# diagnostics_role_arns: # per-environment roles the agent assumes for reads; comment out for local-dev default creds
+#   staging: arn:aws:iam::YOUR_ACCOUNT_ID:role/your-staging-diagnostics-role
+#   production: arn:aws:iam::YOUR_ACCOUNT_ID:role/your-production-diagnostics-role

@@ -8,6 +8,7 @@ passes here cannot brick the service.
 import difflib
 import hashlib
 import os
+import shutil
 import stat
 import tempfile
 from pathlib import Path
@@ -15,11 +16,11 @@ from pathlib import Path
 import yaml
 
 from taskboy import personality, settings, skills, started_messages
-from taskboy.config import Config, load_config
+from taskboy.config import KNOWN_SERVICES, Config, load_config
 from taskboy.dashboard.render import SECRET_KEY
 from taskboy.redact import redactor
 
-EDITABLE_KINDS = ("config", "personality", "reviewer_personality", "started", "skill", "conventions")
+EDITABLE_KINDS = ("config", "service", "personality", "reviewer_personality", "started", "skill", "conventions")
 
 
 class EditorError(Exception):
@@ -34,6 +35,10 @@ def target_for(config: Config, kind: str, name: str | None) -> tuple[Path, str, 
     """returns (live_path, repo_path, title). repo layout keeps config files under config/ and skills under skills/."""
     if kind == "config":
         return Path(settings.CONFIG_PATH), "config/config.yaml", "System configuration"
+    if kind == "service" and name in KNOWN_SERVICES:
+        live = Path(settings.CONFIG_PATH).parent / "services" / f"{name}.yaml"
+        if live.is_file():  # legacy configs keep service sections inline in config.yaml and get no per-service editor
+            return live, f"config/services/{name}.yaml", f"{name} service"
     if kind == "personality" and config.personality_path:
         return Path(config.personality_path), f"config/{Path(config.personality_path).name}", "Personality"
     if kind == "reviewer_personality" and config.reviewer.personality_path:
@@ -50,7 +55,7 @@ def target_for(config: Config, kind: str, name: str | None) -> tuple[Path, str, 
 def contains_secret_submission(kind: str, content: str) -> bool:
     if redactor.redact(content) != content:
         return True
-    if kind != "config":
+    if kind not in ("config", "service"):
         return False
     try:
         value = yaml.safe_load(content)
@@ -82,6 +87,15 @@ def validate(kind: str, name: str | None, content: str, target: Path) -> None:
             load_config(temp_name)
         finally:
             Path(temp_name).unlink(missing_ok=True)
+    elif kind == "service" and name:
+        # a service file only validates in context, so run the full loader over a scratch copy of the config dir
+        config_path = Path(settings.CONFIG_PATH)
+        with tempfile.TemporaryDirectory() as root:
+            scratch = Path(root) / "config"
+            shutil.copytree(config_path.parent, scratch)
+            (scratch / "services").mkdir(exist_ok=True)
+            (scratch / "services" / f"{name}.yaml").write_text(content)
+            load_config(str(scratch / config_path.name))
     elif kind in ("personality", "reviewer_personality"):
         handle, temp_name = tempfile.mkstemp(prefix=".dashboard-validate-", suffix=".md", dir=target.parent)
         os.close(handle)
