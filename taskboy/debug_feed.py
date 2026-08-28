@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 import traceback
 
 from taskboy.models import Task
@@ -13,6 +14,13 @@ logger = logging.getLogger("taskboy.debug_feed")
 
 SNIPPET_THRESHOLD = 3500
 
+# repeats of the same (component, message) are suppressed this long; in-memory, resets on restart
+SYSTEM_ERROR_COOLDOWN_SECONDS = 900
+
+
+def _now() -> float:
+    return time.monotonic()
+
 
 class DebugFeed:
     def __init__(self, client, store: Store, channel_id: str, dashboard_url: str = ""):
@@ -20,6 +28,8 @@ class DebugFeed:
         self.store = store
         self.channel_id = channel_id
         self.dashboard_url = dashboard_url.rstrip("/")
+        # (component, message) -> last_posted_monotonic
+        self._system_error_state: dict[tuple[str, str], float] = {}
 
     def _record_failure(self, operation: str, error: Exception, task_id: str | None = None) -> None:
         logger.warning("debug feed %s failed", operation, exc_info=True)
@@ -124,11 +134,25 @@ class DebugFeed:
     async def intake_refusal(self, thread_ts: str | None, reason: str) -> None:
         await self.post(thread_ts, f"Intake refused: {reason}")
 
-    async def system_error(self, component: str, message: str) -> None:
+    async def system_error(self, component: str, message: str) -> bool:
+        """returns False when the repeat was suppressed, so callers don't mark it as delivered."""
+        key = (component, message)
+        now = _now()
+        last_posted = self._system_error_state.get(key)
+        if last_posted is not None and now - last_posted < SYSTEM_ERROR_COOLDOWN_SECONDS:
+            return False
+        # evict entries whose cooldown has fully elapsed, to keep the dict from growing unbounded
+        self._system_error_state = {k: v for k, v in self._system_error_state.items() if now - v < SYSTEM_ERROR_COOLDOWN_SECONDS}
+        # claim the window before the post so concurrent calls suppress instead of all posting
+        self._system_error_state[key] = now
         try:
             await self.client.chat_postMessage(channel=self.channel_id, text=redactor.redact(to_mrkdwn(f"System error ({component}): {message}")), unfurl_links=False, unfurl_media=False)
         except Exception as e:
             self._record_failure("system_error", e)
+            # the claim didn't hold, and restoring an expired last_posted is the same as having no entry
+            self._system_error_state.pop(key, None)
+            return False
+        return True
 
     def _metrics(self, task: Task) -> str:
         usage_lines = []

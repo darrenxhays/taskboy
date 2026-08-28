@@ -24,10 +24,14 @@ ADMIN = "boss@example.com"
 VIEWER = "person@example.com"
 
 
-def identity(email: str, expired: bool = False, **extra_claims: object) -> dict[str, str]:
+EXPECTED_ALB_ARN = "arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app/agent-dashboard/abc123"
+
+
+def identity(email: str, expired: bool = False, signer: str | None = EXPECTED_ALB_ARN, **extra_claims: object) -> dict[str, str]:
     exp = int(time.time()) + (300 if not expired else -600)
     claims = {"email": email, "exp": exp, **extra_claims}
-    token = jwt.encode(claims, PRIVATE_PEM, algorithm="ES256", headers={"kid": KID})
+    headers = {"kid": KID} if signer is None else {"kid": KID, "signer": signer}
+    token = jwt.encode(claims, PRIVATE_PEM, algorithm="ES256", headers=headers)
     return {"x-amzn-oidc-data": token}
 
 
@@ -46,7 +50,7 @@ def dashboard(store, tmp_path, monkeypatch):
     personality_path.write_text("Red is direct and dry.")
     config = make_config(
         personality_path=str(personality_path),
-        dashboard=DashboardConfig(enabled=True, allowed_email_domain="example.com", admin_emails=[ADMIN], commit_repo="example-org/taskboy"),
+        dashboard=DashboardConfig(enabled=True, allowed_email_domain="example.com", admin_emails=[ADMIN], commit_repo="example-org/taskboy", expected_alb_arn=EXPECTED_ALB_ARN),
     )
     notifier = RecordingNotifier()
     app = create_app(store, config, notifier, Secrets(dashboard_github_token="pat"), orchestrator=None, ui_dist=str(tmp_path / "dist"))
@@ -92,6 +96,31 @@ async def test_unverified_email_rejected(dashboard, email_verified):
 async def test_verified_email_accepted(dashboard):
     client, _, _ = dashboard
     assert (await client.get("/api/me", headers=identity(VIEWER, email_verified=True))).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_wrong_signer_rejected(dashboard):
+    # an attacker's own alb+idp mints a token the shared regional key endpoint will verify
+    client, _, _ = dashboard
+    other_arn = "arn:aws:elasticloadbalancing:us-east-1:999999999999:loadbalancer/app/attacker-alb/def456"
+    response = await client.get("/api/me", headers=identity(VIEWER, signer=other_arn))
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_missing_signer_rejected(dashboard):
+    client, _, _ = dashboard
+    response = await client.get("/api/me", headers=identity(VIEWER, signer=None))
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_empty_expected_alb_arn_fails_closed(dashboard):
+    # empty expected_alb_arn must reject every alb token, not silently skip the check
+    client, config, _ = dashboard
+    config.dashboard.expected_alb_arn = ""
+    response = await client.get("/api/me", headers=identity(VIEWER))
+    assert response.status_code == 401
 
 
 @pytest.mark.asyncio
@@ -587,6 +616,117 @@ async def test_delete_issue_endpoint_requires_admin_and_blocks_active_statuses(d
     deleted = await client.delete(f"/api/issues/{deletable['id']}", headers=admin_headers())
     assert deleted.status_code == 200 and deleted.json()["status"] == "deleted"
     assert store.get_issue(deletable["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_implement_issue_endpoint_approves_and_starts_a_scoped_run(dashboard, store):
+    client, _, _ = dashboard
+    row = store.record_issue("rocket", "example-org/taskboy", "s", "bug", "d", 50)
+
+    forbidden = await client.post(f"/api/issues/{row['id']}/implement", headers=identity(VIEWER))
+    assert forbidden.status_code == 403
+
+    ok = await client.post(f"/api/issues/{row['id']}/implement", headers=admin_headers())
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["status"] == "created" and body["task_id"]
+    task = store.get_task(body["task_id"])
+    assert task is not None and task.request_text == "/implementapprovedissues"
+    reserved = store.get_issue(row["id"])
+    assert reserved["status"] == "implementation_queued" and reserved["reserved_by"] == body["task_id"]
+    # the rocket approved it along the way, as the acting admin
+    assert reserved["decided_by"] == ADMIN
+
+    missing = await client.post("/api/issues/9999/implement", headers=admin_headers())
+    assert missing.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_implement_issue_endpoint_409s_when_not_eligible(dashboard, store):
+    client, _, _ = dashboard
+    active = store.record_issue("active", "example-org/taskboy", "s", "bug", "d", 50)
+    store.decide_issue(active["id"], "approved", ADMIN)
+    [reserved] = store.reserve_issues("coordinator", 1)
+    store.start_issue(reserved["id"], None, "spec")
+
+    not_eligible = await client.post(f"/api/issues/{active['id']}/implement", headers=admin_headers())
+    assert not_eligible.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_implement_issue_endpoint_409s_while_a_coordinator_is_already_running(dashboard, store, make_task):
+    client, _, _ = dashboard
+    make_task(text="/implementapprovedissues")
+    other = store.record_issue("other", "example-org/taskboy", "s2", "bug", "d", 50)
+    store.decide_issue(other["id"], "approved", ADMIN)
+
+    running = await client.post(f"/api/issues/{other['id']}/implement", headers=admin_headers())
+    assert running.status_code == 409 and "already running" in running.json()["detail"]
+    assert store.get_issue(other["id"])["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_bulk_implement_action_starts_one_scoped_run_for_the_selection(dashboard, store):
+    client, _, _ = dashboard
+    first = store.record_issue("bulk-implement-1", "example-org/taskboy", "s", "bug", "d", 50)
+    second = store.record_issue("bulk-implement-2", "example-org/taskboy", "s2", "bug", "d", 90)
+
+    response = await client.post("/api/issues/bulk", headers=admin_headers(), json={"ids": [first["id"], second["id"]], "action": "implement"})
+    assert response.status_code == 200
+    results = response.json()["results"]
+    task_ids = {row["task_id"] for row in results}
+    assert {row["id"]: row["status"] for row in results} == {first["id"]: "created", second["id"]: "created"}
+    assert len(task_ids) == 1
+    assert store.get_issue(first["id"])["status"] == "implementation_queued"
+    assert store.get_issue(second["id"])["status"] == "implementation_queued"
+
+
+@pytest.mark.asyncio
+async def test_bulk_implement_action_reports_ineligible_ids_as_skipped(dashboard, store):
+    client, _, _ = dashboard
+    eligible = store.record_issue("bulk-mixed-eligible", "example-org/taskboy", "s", "bug", "d", 50)
+    denied = store.record_issue("bulk-mixed-denied", "example-org/taskboy", "s2", "bug", "d", 50)
+    store.decide_issue(denied["id"], "denied", ADMIN)
+    missing_id = denied["id"] + 1000
+
+    response = await client.post("/api/issues/bulk", headers=admin_headers(), json={"ids": [eligible["id"], denied["id"], missing_id], "action": "implement"})
+
+    assert response.status_code == 200
+    by_id = {row["id"]: row["status"] for row in response.json()["results"]}
+    assert by_id == {eligible["id"]: "created", denied["id"]: "skipped", missing_id: "not_found"}
+    assert store.get_issue(eligible["id"])["status"] == "implementation_queued"
+    assert store.get_issue(denied["id"])["status"] == "denied"
+
+
+@pytest.mark.asyncio
+async def test_bulk_implement_action_rejects_a_selection_over_the_batch_cap(dashboard, store):
+    client, _, _ = dashboard
+    ids = [store.record_issue(f"over-cap-{i}", "example-org/taskboy", f"s{i}", "bug", "d", 50)["id"] for i in range(6)]
+
+    response = await client.post("/api/issues/bulk", headers=admin_headers(), json={"ids": ids, "action": "implement"})
+
+    assert response.status_code == 400
+    assert "5" in response.json()["detail"]
+    assert all(store.get_issue(issue_id)["status"] == "proposed" for issue_id in ids)
+
+
+@pytest.mark.asyncio
+async def test_bulk_implement_action_cap_counts_only_eligible_ids(dashboard, store):
+    # 6 selected but 3 are denied, so only 3 would ever run -> should succeed, not 400 on the raw selection size
+    client, _, _ = dashboard
+    eligible_ids = [store.record_issue(f"cap-eligible-{i}", "example-org/taskboy", f"s{i}", "bug", "d", 50)["id"] for i in range(3)]
+    denied_ids = []
+    for i in range(3):
+        row = store.record_issue(f"cap-denied-{i}", "example-org/taskboy", f"d{i}", "bug", "d", 50)
+        store.decide_issue(row["id"], "denied", ADMIN)
+        denied_ids.append(row["id"])
+
+    response = await client.post("/api/issues/bulk", headers=admin_headers(), json={"ids": eligible_ids + denied_ids, "action": "implement"})
+
+    assert response.status_code == 200
+    by_id = {row["id"]: row["status"] for row in response.json()["results"]}
+    assert all(by_id[issue_id] == "created" for issue_id in eligible_ids)
+    assert all(by_id[issue_id] == "skipped" for issue_id in denied_ids)
 
 
 @pytest.mark.asyncio

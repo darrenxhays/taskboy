@@ -18,7 +18,8 @@ SYSTEM_TEAM = "github"
 SYSTEM_USER = "github"
 
 GITHUB_API = "https://api.github.com"
-PR_URL_RE = re.compile(r"^https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)/?$")
+# not end-anchored so a /files, ?query, or #fragment suffix still parses (#87)
+PR_URL_RE = re.compile(r"^https://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
 
 # a batch this size keeps a run's PRs reviewable (also enforced by the coordinator only seeing its reserved rows)
 IMPLEMENTATION_BATCH_SIZE = 5
@@ -66,11 +67,13 @@ async def start_implementation_run(
     model_override: str | None = None,
     effort_override: str | None = None,
     schedule_name: str | None = None,
+    issue_ids: list[int] | None = None,
+    actor: str | None = None,
 ) -> tuple[Task | None, str, str | None]:
-    """reserve up to IMPLEMENTATION_BATCH_SIZE approved issues and start the /implementapprovedissues coordinator
-    for exactly that batch. returns (task, status, active_task_id): status is "already_running" (active_task_id set
-    to the running coordinator, or None if refused on a pending reservation before one exists), "no_approved_issues",
-    or whatever accept_task reports ("created" or a refusal like "paused"/"queue_full"/"duplicate")."""
+    """with `issue_ids` omitted, reserves up to IMPLEMENTATION_BATCH_SIZE approved issues top-priority-first;
+    with `issue_ids` given, approves any of those still `proposed` (as `actor`) and reserves exactly that set.
+    Returns (task, status, active_task_id): status is "already_running", "no_approved_issues", or whatever
+    accept_task reports ("created" or a refusal like "paused"/"queue_full"/"duplicate")."""
     existing = store.active_implementation_run()
     if existing is not None:
         return None, "already_running", existing
@@ -78,9 +81,22 @@ async def start_implementation_run(
         return None, "already_running", None
 
     marker = f"pending:{uuid.uuid4().hex[:12]}"
-    reserved = store.reserve_issues(marker, IMPLEMENTATION_BATCH_SIZE)
+    auto_approved_ids: list[int] = []
+    if issue_ids is not None:
+        for issue_id in issue_ids:
+            issue = store.get_issue(issue_id)
+            if issue is not None and issue["status"] == "proposed":
+                store.decide_issue(issue_id, "approved", actor or user_id)
+                auto_approved_ids.append(issue_id)
+        reserved = store.reserve_issues_by_id(marker, issue_ids)
+    else:
+        reserved = store.reserve_issues(marker, IMPLEMENTATION_BATCH_SIZE)
     if not reserved:
         return None, "no_approved_issues", None
+    # only the ones we actually reserved under this marker count — a row that missed reservation
+    # (e.g. denied by someone else in between) was never ours to roll back
+    reserved_ids = {row["id"] for row in reserved}
+    auto_approved_ids = [issue_id for issue_id in auto_approved_ids if issue_id in reserved_ids]
 
     channel = channel_id if channel_id is not None else str(((config.raw.get("issues") or {}).get("notify_channel")) or "")
     assigned = False
@@ -109,6 +125,10 @@ async def start_implementation_run(
         # strand the reservation under a marker no coordinator will ever claim
         if not assigned:
             store.release_reserved_issues(marker)
+            # release_reserved_issues put these back to approved; anything we auto-approved from proposed
+            # goes back to proposed instead, so a failed rocket click doesn't leave it eligible for the next batch run
+            for issue_id in auto_approved_ids:
+                store.decide_issue(issue_id, "proposed", actor or user_id)
 
 
 def fail_stalled_implementation_run(store: Store) -> str | None:

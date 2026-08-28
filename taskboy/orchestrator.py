@@ -5,7 +5,7 @@ import logging
 import sqlite3
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from taskboy.config import Config
 from taskboy.models import BLOCKED, CANCELLED, COMPLETED, FAILED, QUEUED, RECEIVED, REFUSED, RUNNING, Task, utcnow
@@ -13,6 +13,14 @@ from taskboy.router import RoleRefusal
 from taskboy.store import Store, TransitionRaced
 
 logger = logging.getLogger("taskboy.orchestrator")
+
+
+def intake_paused(store: Store) -> bool:
+    return store.meta_get("intake_paused") == "1"
+
+
+def queue_at_capacity(store: Store, config: Config) -> bool:
+    return store.count_tasks(QUEUED) + store.count_tasks(RECEIVED) >= config.queue_max
 
 
 async def accept_task(
@@ -37,12 +45,12 @@ async def accept_task(
     debug_permalink: str | None = None,
 ) -> tuple[Task | None, str]:
     """shared intake for slack and the cli. returns (task, status): created | duplicate | paused | queue_full."""
-    if store.meta_get("intake_paused") == "1":
+    if intake_paused(store):
         return None, "paused"
     existing = store.task_by_intake_key(team_id, channel_id, message_ts)
     if existing is not None:
         return existing, "duplicate"
-    if store.count_tasks(QUEUED) + store.count_tasks(RECEIVED) >= config.queue_max:
+    if queue_at_capacity(store, config):
         # refuse before creating the row so the dedup key survives for a retry once the queue drains;
         # no task row exists, so record the refusal here to keep the audit trail (ORC-006)
         store.add_error("intake", "queue_full", f"queue full — refused intake from {user_id}", context={"team_id": team_id, "channel_id": channel_id, "message_ts": message_ts, "text": text[:200]})
@@ -94,8 +102,63 @@ async def reopen_issue_and_cancel(store: Store, notifier, blocked: Task) -> bool
         cancelled = store.transition(blocked.task_id, BLOCKED, CANCELLED, "issue reopened: implementation could not finish", finished_at=utcnow())
     except TransitionRaced:
         return False
-    await _notify_safe(notifier.issue_blocked, cancelled, issue)
+    # transition()'s hook may have tracked the issue's PR instead of reopening it (#87) — refetch so the
+    # notification words itself off what actually happened, not the pre-transition snapshot
+    refreshed = store.get_issue(issue["id"]) or issue
+    await _notify_safe(notifier.issue_blocked, cancelled, refreshed)
     return True
+
+
+async def _expire_stale_blocked(store: Store, notifier, task: Task, max_days: int) -> bool:
+    """fail (or, for an issue-backed task, cancel + reopen its issue) one task that outlived the stale-blocked window."""
+    reason = task.blocked_reason or "no reply"
+    if await reopen_issue_and_cancel(store, notifier, task):
+        store.add_event(task.task_id, "recovery", {"action": "expired_stale_blocked", "outcome": "issue_reopened", "reason": reason})
+        return True
+    try:
+        failed = store.transition(
+            task.task_id,
+            BLOCKED,
+            FAILED,
+            f"recovery: stale blocked task expired ({reason})",
+            error=f"blocked for over {max_days} days on {reason}",
+            finished_at=utcnow(),
+        )
+    except TransitionRaced:
+        return False
+    store.add_event(task.task_id, "recovery", {"action": "expired_stale_blocked", "outcome": "failed", "reason": reason})
+    await _notify_safe(notifier.failed, failed, f"This task expired after sitting blocked on {reason} for over {max_days} days.")
+    return True
+
+
+# blocked tasks aren't terminal, so an abandoned one keeps its workspace forever (#104)
+async def expire_stale_blocked_tasks(store: Store, notifier, retention: dict) -> dict:
+    """post one reminder partway through the window, then fail (or cancel + reopen the issue) anything still BLOCKED once it elapses."""
+    max_days = retention.get("blocked_task_max_days", 10)
+    reminder_days = retention.get("blocked_task_reminder_days", 5)
+    now = datetime.now(timezone.utc)
+    reminded = 0
+    expired = 0
+    for task in store.tasks_in_state(BLOCKED):
+        updated_at = datetime.fromisoformat(task.updated_at)
+        age = now - updated_at
+        if age >= timedelta(days=max_days):
+            if await _expire_stale_blocked(store, notifier, task, max_days):
+                expired += 1
+            continue
+        if age < timedelta(days=reminder_days):
+            continue
+        # compare against updated_at, not "ever reminded" — a task that got answered and blocked again needs a fresh reminder (#104)
+        reminder_events = store.events_for_kinds(task.task_id, {"blocked_reminder"})
+        if reminder_events and datetime.fromisoformat(reminder_events[-1]["ts"]) >= updated_at:
+            continue
+        deadline = (updated_at + timedelta(days=max_days)).date().isoformat()
+        store.add_event(task.task_id, "blocked_reminder", {"expires_on": deadline})
+        await _notify_safe(notifier.progress, task, f"Still waiting on your reply here — this task expires on {deadline} if unanswered.")
+        reminded += 1
+    if reminded or expired:
+        logger.info("stale-blocked sweep: %s reminders sent, %s tasks expired", reminded, expired)
+    return {"reminded": reminded, "expired": expired}
 
 
 class Orchestrator:
@@ -118,9 +181,11 @@ class Orchestrator:
         released = self.store.release_stale_reservations()
         if released:
             logger.info("released %d stale issue reservation(s) at startup", released)
-        reopened = self.store.reopen_stranded_issues()
-        if reopened:
-            logger.info("reopened %d issue(s) stranded behind an already-terminal task", reopened)
+        stranded = self.store.reopen_stranded_issues()
+        if stranded["reopened"]:
+            logger.info("reopened %d issue(s) stranded behind an already-terminal task", stranded["reopened"])
+        if stranded["tracked"]:
+            logger.info("resumed tracking %d issue(s) stranded behind an already-terminal task with an already-open PR", stranded["tracked"])
         for task in self.store.tasks_in_state(RUNNING):
             if task.attempt >= self.config.max_retries:
                 failed = self.store.transition(task.task_id, RUNNING, FAILED, "recovery: retry attempts exhausted", error="task was interrupted too many times", finished_at=utcnow())
@@ -230,9 +295,13 @@ class Orchestrator:
             outcome = await self.run(task)
         except asyncio.CancelledError:
             if self.stopping:
-                # shutdown: requeue for resume after restart; a user cancel already moved the row to cancelled
+                # shutdown: requeue for resume after restart; a user cancel already moved the row to cancelled.
+                # re-read the row first: the in-memory `task` snapshot predates the run and never observes the
+                # session_id the runner persists mid-run (issue #92) — prefer the persisted value when present.
                 try:
-                    self.store.transition(task.task_id, RUNNING, QUEUED, "requeued: orchestrator shutting down", resume_session_id=task.session_id, attempt=task.attempt + 1)
+                    current = self.store.get_task(task.task_id)
+                    sid = (current.session_id if current else None) or task.session_id
+                    self.store.transition(task.task_id, RUNNING, QUEUED, "requeued: orchestrator shutting down", resume_session_id=sid, attempt=task.attempt + 1)
                 except TransitionRaced:
                     pass
             # a user cancel needs nothing here — it already moved the row to cancelled, which released the batch

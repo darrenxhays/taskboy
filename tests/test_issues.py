@@ -225,6 +225,21 @@ async def test_list_recent_errors_filters_by_component_kind_offset_and_traceback
 
 
 @pytest.mark.asyncio
+async def test_list_task_feedback_pages_with_offset(store, make_task):
+    a = make_task("thing a")
+    store.add_feedback(a.task_id, "a@redzone.co", 2, "meh")
+    b = make_task("thing b")
+    store.add_feedback(b.task_id, "b@redzone.co", 5, "great")
+    c = make_task("thing c")
+    store.add_feedback(c.task_id, "c@redzone.co", 2, "also meh")
+    adapter = IssuesAdapter(store, make_task(), ["example-org/taskboy"])
+
+    # most-recent-first ordering: offset 1 skips c, leaving b then a
+    paged = json.loads((await adapter.list_task_feedback({"limit": 2, "offset": 1})).get("content")[0]["text"])
+    assert [row["task_id"] for row in paged] == [b.task_id, a.task_id]
+
+
+@pytest.mark.asyncio
 async def test_list_failed_tasks_excludes_refused(store, make_task):
     # issue #16: refused (unsupported-request) tasks have their own terminal state so they
     # stop drowning real failures in list_failed_tasks and its failure-rate metrics.
@@ -386,6 +401,28 @@ def test_reserve_issues_takes_only_the_top_batch(store):
 
 def test_reserve_issues_is_a_noop_when_nothing_approved(store):
     assert store.reserve_issues("coordinator-1", 5) == []
+
+
+def test_reserve_issues_by_id_reserves_only_the_given_approved_ids(store):
+    picked = rec(store, key="picked")
+    other = rec(store, key="other")
+    denied = rec(store, key="denied")
+    store.decide_issue(picked["id"], "approved", "boss")
+    store.decide_issue(other["id"], "approved", "boss")
+    store.decide_issue(denied["id"], "denied", "boss")
+
+    reserved = store.reserve_issues_by_id("rocket-1", [picked["id"], denied["id"], 999999])
+
+    assert [r["id"] for r in reserved] == [picked["id"]]
+    assert store.get_issue(picked["id"])["status"] == "implementation_queued"
+    assert store.get_issue(picked["id"])["reserved_by"] == "rocket-1"
+    # untouched: not approved, or never existed
+    assert store.get_issue(other["id"])["status"] == "approved"
+    assert store.get_issue(denied["id"])["status"] == "denied"
+
+
+def test_reserve_issues_by_id_is_a_noop_for_empty_ids(store):
+    assert store.reserve_issues_by_id("rocket-1", []) == []
 
 
 def test_active_implementation_run_tracks_non_terminal_coordinator(store, make_task):

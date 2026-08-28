@@ -1,8 +1,9 @@
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -244,6 +245,23 @@ async def test_runner_scopes_broker_repositories_to_role(store, config, make_tas
 
 
 @pytest.mark.asyncio
+async def test_runner_resolves_hooks_path_for_relative_workspaces_root(store, config, make_task, tmp_path, monkeypatch):
+    # TASKBOY_WORKSPACES_ROOT defaults to a relative path ("local/workspaces"); core.hooksPath is
+    # resolved by git against its own cwd, so a relative hooks_path would silently miss the hook (#75)
+    config.raw = RAW
+    monkeypatch.chdir(tmp_path)
+    broker = MagicMock()
+    broker.register_task.return_value = {}
+    runner = ClaudeRunner(store, config, "workspaces", str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
+    runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
+    task = routed_task(store, make_task)
+    await runner.run(task)
+    hooks_path = broker.register_task.call_args.kwargs["hooks_path"]
+    assert Path(hooks_path).is_absolute()
+    assert hooks_path == str((tmp_path / "workspaces" / task.task_id / "githooks").resolve())
+
+
+@pytest.mark.asyncio
 async def test_blue_runner_uses_reviewer_broker_personality_and_name(store, config, make_task, tmp_path):
     config.raw = RAW
     red_personality = tmp_path / "red.md"
@@ -275,7 +293,7 @@ async def test_blue_runner_uses_reviewer_broker_personality_and_name(store, conf
 
     await runner.run(task)
 
-    reviewer_broker.register_task.assert_called_once_with(task, [], granted_repos=[])
+    reviewer_broker.register_task.assert_called_once_with(task, [], granted_repos=[], hooks_path=ANY)
     red_broker.register_task.assert_not_called()
     assert runner._run_session.call_args.args[6] is reviewer_broker
     prompt = runner._run_session.call_args.args[3]
@@ -618,6 +636,123 @@ async def test_run_clones_granted_repo_outside_approved_list_same_org(store, con
     assert "example-org/portal" in broker.register_task.call_args.args[1]
 
 
+@pytest.mark.asyncio
+async def test_run_records_repo_seed_failure_when_refresh_fails(store, config, make_task, tmp_path, monkeypatch):
+    config.raw = {**RAW, "github": {"approved_repos": ["org/a"], "protected_branch_patterns": ["main"]}}
+    broker = MagicMock()
+    broker.register_task.return_value = {}
+    runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
+    runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
+    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", AsyncMock(return_value=False))
+    clone = AsyncMock(return_value=True)
+    monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", clone)
+    task = routed_task(store, make_task)
+    store.set_fields(task.task_id, classification_json='{"target_repos": ["org/a"]}')
+
+    await runner.run(store.get_task(task.task_id))
+
+    clone.assert_not_awaited()  # short-circuits on refresh failure, same as before
+    errors = store.errors_for(task.task_id)
+    assert any(e["kind"] == "repo_seed_failed" and e["context_json"] and "org/a" in e["context_json"] for e in errors)
+    events = [e for e in store.events_for(task.task_id) if e["kind"] == "repo_seed_failed"]
+    assert len(events) == 1
+    detail = json.loads(events[0]["detail_json"])
+    assert detail["repository"] == "org/a"
+    assert detail["stage"] == "refresh"
+    prompt = runner._run_session.call_args.args[3]
+    assert "org/a" in prompt
+    assert "could not be pre-cloned" in prompt
+
+
+@pytest.mark.asyncio
+async def test_run_records_repo_seed_failure_when_clone_from_mirror_fails(store, config, make_task, tmp_path, monkeypatch):
+    config.raw = {**RAW, "github": {"approved_repos": ["org/a"], "protected_branch_patterns": ["main"]}}
+    broker = MagicMock()
+    broker.register_task.return_value = {}
+    runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
+    runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
+    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", AsyncMock(return_value=True))
+    monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", AsyncMock(return_value=False))
+    task = routed_task(store, make_task)
+    store.set_fields(task.task_id, classification_json='{"target_repos": ["org/a"]}')
+
+    await runner.run(store.get_task(task.task_id))
+
+    events = [e for e in store.events_for(task.task_id) if e["kind"] == "repo_seed_failed"]
+    assert len(events) == 1
+    assert json.loads(events[0]["detail_json"])["stage"] == "clone"
+
+
+@pytest.mark.asyncio
+async def test_run_skips_reclone_when_workspace_already_has_repo(store, config, make_task, tmp_path, monkeypatch):
+    config.raw = {**RAW, "github": {"approved_repos": ["org/a"], "protected_branch_patterns": ["main"]}}
+    broker = MagicMock()
+    broker.register_task.return_value = {}
+    runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
+    runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
+    refresh = AsyncMock(return_value=True)
+    clone = AsyncMock(return_value=True)
+    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", refresh)
+    monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", clone)
+    task = routed_task(store, make_task)
+    store.set_fields(task.task_id, classification_json='{"target_repos": ["org/a"]}')
+    dest = tmp_path / "workspaces" / task.task_id / "repo" / "a"
+    (dest / ".git").mkdir(parents=True)
+    (dest / "marker.txt").write_text("prior attempt's working tree")
+
+    await runner.run(store.get_task(task.task_id))
+
+    refresh.assert_not_awaited()
+    clone.assert_not_awaited()
+    assert (dest / "marker.txt").exists()  # prior working tree survives, not rmtree'd by clone_from_mirror
+    assert store.errors_for(task.task_id) == []
+    prompt = runner._run_session.call_args.args[3]
+    assert "could not be pre-cloned" not in prompt
+    assert "./a" in prompt
+
+
+@pytest.mark.asyncio
+async def test_run_reclones_when_workspace_has_leftover_non_git_dir(store, config, make_task, tmp_path, monkeypatch):
+    config.raw = {**RAW, "github": {"approved_repos": ["org/a"], "protected_branch_patterns": ["main"]}}
+    broker = MagicMock()
+    broker.register_task.return_value = {}
+    runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
+    runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
+    refresh = AsyncMock(return_value=True)
+    clone = AsyncMock(return_value=True)
+    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", refresh)
+    monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", clone)
+    task = routed_task(store, make_task)
+    store.set_fields(task.task_id, classification_json='{"target_repos": ["org/a"]}')
+    dest = tmp_path / "workspaces" / task.task_id / "repo" / "a"
+    dest.mkdir(parents=True)  # empty/half-cloned leftover, no .git — must not be mistaken for a real clone
+
+    await runner.run(store.get_task(task.task_id))
+
+    refresh.assert_awaited_once()
+    clone.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_repo_seed_success_path_records_no_new_events(store, config, make_task, tmp_path, monkeypatch):
+    config.raw = {**RAW, "github": {"approved_repos": ["org/a"], "protected_branch_patterns": ["main"]}}
+    broker = MagicMock()
+    broker.register_task.return_value = {}
+    runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
+    runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
+    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", AsyncMock(return_value=True))
+    monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", AsyncMock(return_value=True))
+    task = routed_task(store, make_task)
+    store.set_fields(task.task_id, classification_json='{"target_repos": ["org/a"]}')
+
+    await runner.run(store.get_task(task.task_id))
+
+    assert store.errors_for(task.task_id) == []
+    assert not [e for e in store.events_for(task.task_id) if e["kind"] == "repo_seed_failed"]
+    prompt = runner._run_session.call_args.args[3]
+    assert "could not be pre-cloned" not in prompt
+
+
 def test_build_progress_server_exposes_request_permission():
     from taskboy.runner import build_progress_server
 
@@ -717,7 +852,7 @@ async def test_run_session_marks_session_limit_error_retryable(store, config, ma
 
         async def receive_response(self):
             yield RateLimitEvent(SimpleNamespace(rate_limit_type="five_hour", status="rejected", utilization=1.0, resets_at=1780000000))
-            yield SimpleNamespace(total_cost_usd=0.5, num_turns=3, usage={}, result="You've hit your session limit · resets 6:50pm (UTC)", is_error=True, subtype="error_max_turns", session_id="s1")
+            yield SimpleNamespace(total_cost_usd=0.5, num_turns=3, usage={"input_tokens": 40, "output_tokens": 20, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}, result="You've hit your session limit · resets 6:50pm (UTC)", is_error=True, subtype="error_max_turns", session_id="s1")
 
     monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
     monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
@@ -730,6 +865,8 @@ async def test_run_session_marks_session_limit_error_retryable(store, config, ma
     assert outcome.retryable is True
     assert outcome.retry_not_before is not None
     assert store.rate_limit_windows()[0]["resets_at"] == 1780000000
+    # a clean session with a result message must record usage exactly once, not once per recording site
+    assert len(store.usage_for(task.task_id)) == 1
 
 
 @pytest.mark.asyncio
@@ -857,6 +994,191 @@ async def test_run_session_non_limit_error_is_not_retryable(store, config, make_
 
 
 @pytest.mark.asyncio
+async def test_run_session_without_result_message_fails_instead_of_completing(store, config, make_task, tmp_path, monkeypatch):
+    """if the message stream ends without a ResultMessage (CLI dies quietly, stream closes early), the
+    session must be reported FAILED — not COMPLETED with an empty '*Done*' summary (issue #91)."""
+    config.raw = RAW
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            return None
+
+        async def receive_response(self):
+            yield SimpleNamespace(usage={"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}, session_id="s1")
+            # stream closes without ever yielding a ResultMessage
+
+    monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
+
+    outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
+
+    assert outcome.state == FAILED
+    rows = store.usage_for(task.task_id)
+    assert len(rows) == 1
+    assert rows[0]["input_tokens"] == 100
+    assert rows[0]["output_tokens"] == 50
+    assert rows[0]["cost_usd"] is None
+    assert outcome.error == "session ended without a result message"
+    assert outcome.retryable is False
+    assert outcome.result_summary == ""
+    assert store.errors_for(task.task_id)[0]["kind"] == "missing_result"
+
+
+@pytest.mark.asyncio
+async def test_run_session_records_partial_usage_on_timeout(store, config, make_task, tmp_path, monkeypatch):
+    config.raw = RAW
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            return None
+
+        async def receive_response(self):
+            yield SimpleNamespace(usage={"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 10, "cache_creation_input_tokens": 5}, session_id="s1")
+            yield SimpleNamespace(usage={"input_tokens": 200, "output_tokens": 80, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 20}, session_id="s1")
+            # totals deliberately don't equal the sum of the two frames above, to prove this frame's cumulative usage is used verbatim
+            yield SimpleNamespace(total_cost_usd=1.23, usage={"input_tokens": 500, "output_tokens": 222, "cache_read_input_tokens": 33, "cache_creation_input_tokens": 44}, num_turns=3, session_id="s1")
+            raise TimeoutError()
+
+    monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
+
+    outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
+
+    assert outcome.state == FAILED
+    assert outcome.session_id == "s1"
+    rows = store.usage_for(task.task_id)
+    assert len(rows) == 1
+    assert rows[0]["input_tokens"] == 500
+    assert rows[0]["output_tokens"] == 222
+    assert rows[0]["cache_read_tokens"] == 33
+    assert rows[0]["cache_write_tokens"] == 44
+    assert rows[0]["cost_usd"] == 1.23
+
+
+@pytest.mark.asyncio
+async def test_run_session_records_partial_usage_on_cancellation(store, config, make_task, tmp_path, monkeypatch):
+    config.raw = RAW
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            return None
+
+        async def receive_response(self):
+            # no result frame ever arrives, so the finally block must fall back to the running
+            # per-turn sum of these two frames rather than a cumulative total
+            yield SimpleNamespace(usage={"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 10, "cache_creation_input_tokens": 5}, session_id="s1")
+            yield SimpleNamespace(usage={"input_tokens": 200, "output_tokens": 80, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 20}, session_id="s1")
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
+
+    rows = store.usage_for(task.task_id)
+    assert len(rows) == 1
+    assert rows[0]["input_tokens"] == 300
+    assert rows[0]["output_tokens"] == 130
+    assert rows[0]["cache_read_tokens"] == 10
+    assert rows[0]["cache_write_tokens"] == 25
+    assert rows[0]["cost_usd"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_session_timeout_without_usage_records_nothing(store, config, make_task, tmp_path, monkeypatch):
+    config.raw = RAW
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+    store.set_fields(task.task_id, max_runtime_minutes=None)
+    task = store.get_task(task.task_id)
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            return None
+
+        async def receive_response(self):
+            raise TimeoutError()
+            yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
+
+    outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
+
+    assert outcome.state == FAILED
+    assert outcome.error == "exceeded the 60 minute runtime limit"
+    assert store.errors_for(task.task_id)[0]["message"] == "exceeded the 60 minute runtime limit"
+    assert store.usage_for(task.task_id) == []
+
+
+@pytest.mark.asyncio
 async def test_artifact_milestone_is_audited_and_debugged_without_requester_progress(store, config, make_task, tmp_path):
     runner = make_runner(store, config, tmp_path)
     runner.debug = AsyncMock()
@@ -891,7 +1213,7 @@ async def test_question_asker_tells_an_issue_backed_task_it_reopens_instead_of_s
     # an issue-backed task's questions land on the issue and reopen it, not a Slack thread reply (#76)
     runner = make_runner(store, config, tmp_path)
     task = routed_task(store, make_task)
-    issue = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    issue = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(issue["id"], "approved", "boss")
     store.start_issue(issue["id"], task.task_id, "the spec")
     blocked: dict = {}

@@ -61,7 +61,7 @@ class CredentialBroker:
 
     # -- task lifecycle --------------------------------------------------------
 
-    def register_task(self, task: Task, approved_repos: list[str], granted_repos: list[str] | None = None) -> dict[str, str]:
+    def register_task(self, task: Task, approved_repos: list[str], granted_repos: list[str] | None = None, *, hooks_path: str) -> dict[str, str]:
         """returns the env vars for the task session; the future token is scoped to profile + target repos.
 
         granted_repos are repos an operator approved mid-task; they widen the token scope beyond the task's
@@ -81,9 +81,12 @@ class CredentialBroker:
             "TASKBOY_BROKER_SOCKET": self.socket_path,
             "TASKBOY_TASK_NONCE": nonce,
             "GIT_TERMINAL_PROMPT": "0",
-            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_COUNT": "2",
             "GIT_CONFIG_KEY_0": "credential.helper",
             "GIT_CONFIG_VALUE_0": self.helper_path,
+            # every repo the session touches — mirror-seeded or agent-cloned — runs the workspace pre-push hook (#95)
+            "GIT_CONFIG_KEY_1": "core.hooksPath",
+            "GIT_CONFIG_VALUE_1": hooks_path,
         }
 
     def release_task(self, task_id: str) -> None:

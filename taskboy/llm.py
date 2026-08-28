@@ -19,24 +19,35 @@ _DIAGNOSTIC_SNIPPET_LEN = 300
 # sdk raises this after already yielding a usable result frame (issue #80)
 _TOLERABLE_ERROR_TEXT = "Claude Code returned an error result: success"
 
+_JSON_FALLBACK_PREAMBLE = "Respond with only a single minified JSON object (no prose, no markdown fences) matching this schema exactly:\n"
+
+
+class _NoFrameObserved(Exception):
+    """the tolerated SDK error (#80) arrived before any usable frame was seen (#93)."""
+
 
 async def structured_call(model_id: str, prompt: str, schema: dict[str, Any]) -> tuple[dict, dict | None]:
     """one tool-free schema-shaped call; retries once on failure, then raises."""
+    use_output_format = True
     last_exc: Exception | None = None
     for attempt in (1, 2):
         try:
-            return await _structured_call_once(model_id, prompt, schema)
+            return await _structured_call_once(model_id, prompt, schema, use_output_format=use_output_format)
         except Exception as exc:
             last_exc = exc
+            if isinstance(exc, _NoFrameObserved):
+                # retrying the identical call fails identically, so the retry drops output_format and parses text
+                use_output_format = False
             logger.warning("structured_call attempt %s/2 failed (%s): %s", attempt, type(exc).__name__, redactor.redact(str(exc))[:_DIAGNOSTIC_SNIPPET_LEN])
     assert last_exc is not None
     raise last_exc
 
 
-async def _structured_call_once(model_id: str, prompt: str, schema: dict[str, Any]) -> tuple[dict, dict | None]:
+async def _structured_call_once(model_id: str, prompt: str, schema: dict[str, Any], *, use_output_format: bool) -> tuple[dict, dict | None]:
     from claude_agent_sdk import ClaudeAgentOptions, SystemMessage, query
 
-    cwd = tempfile.mkdtemp(prefix="ar-llm-")
+    cwd = tempfile.mkdtemp(prefix="taskboy-llm-")
+    call_prompt = prompt if use_output_format else f"{prompt}\n\n{_JSON_FALLBACK_PREAMBLE}{json.dumps(schema)}"
     try:
         options = ClaudeAgentOptions(
             model=model_id,
@@ -44,19 +55,25 @@ async def _structured_call_once(model_id: str, prompt: str, schema: dict[str, An
             allowed_tools=[],
             setting_sources=[],
             cwd=cwd,
-            output_format={"type": "json_schema", "schema": schema},
+            output_format={"type": "json_schema", "schema": schema} if use_output_format else None,
             effort="low",
         )
         final = None
+        seen: list[str] = []
         try:
-            async for message in query(prompt=prompt, options=options):
+            async for message in query(prompt=call_prompt, options=options):
+                seen.append(type(message).__name__)
                 # trailing session_state_changed marker must not clobber the result frame (#80)
                 if isinstance(message, SystemMessage) and message.subtype == "session_state_changed":
                     continue
                 final = message
         except Exception as exc:
-            if str(exc) != _TOLERABLE_ERROR_TEXT or final is None:
+            if str(exc) != _TOLERABLE_ERROR_TEXT:
                 raise
+            if final is None:
+                # surface what was actually seen instead of the same undiagnosable message every time
+                diag = f"{exc} (no result frame observed before raise; frames seen: {seen or ['none']})"
+                raise _NoFrameObserved(diag) from exc
             logger.warning("tolerating SDK 'error result: success' (%s)", _diagnose(final))
     finally:
         shutil.rmtree(cwd, ignore_errors=True)  # per-call temp cwd must not accumulate on the host

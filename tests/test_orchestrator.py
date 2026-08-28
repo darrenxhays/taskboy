@@ -65,7 +65,7 @@ async def test_crashed_issue_backed_task_reopens_its_issue(store, config, notifi
         raise RuntimeError("runner exploded")
 
     task = make_task()
-    issue = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    issue = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(issue["id"], "approved", "boss")
     store.start_issue(issue["id"], task.task_id, "the spec")
 
@@ -132,7 +132,7 @@ async def test_blocked_outcome_for_issue_backed_task_reopens_issue_and_cancels(s
         return Outcome(state=BLOCKED, blocked_reason="waiting for the requester to answer follow-up questions", session_id="s-issue")
 
     task = make_task()
-    issue = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    issue = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(issue["id"], "approved", "boss")
     store.start_issue(issue["id"], task.task_id, "the spec")
 
@@ -163,7 +163,7 @@ async def test_blocked_outcome_for_issue_backed_task_with_pending_permission_sta
         return Outcome(state=BLOCKED, blocked_reason="needs permission for tool 'mcp__jira__add_comment'", session_id="s-perm")
 
     task = make_task()
-    issue = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    issue = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(issue["id"], "approved", "boss")
     store.start_issue(issue["id"], task.task_id, "the spec")
 
@@ -185,7 +185,7 @@ async def test_reopen_issue_and_cancel_leaves_issue_alone_when_the_cancel_transi
     task = make_task()
     store.transition(task.task_id, RECEIVED, QUEUED)
     store.transition(task.task_id, QUEUED, RUNNING)
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "the spec")
     blocked = store.transition(task.task_id, RUNNING, BLOCKED, "waiting", blocked_reason="needs an answer")
@@ -201,6 +201,33 @@ async def test_reopen_issue_and_cancel_leaves_issue_alone_when_the_cancel_transi
 
 
 @pytest.mark.asyncio
+async def test_reopen_issue_and_cancel_notifies_with_the_post_transition_issue_state(store, make_task):
+    # transition()'s hook may track the issue's PR (in_review) instead of reopening it to proposed if one was
+    # already opened (#87); the notifier must get that refreshed issue, not the stale pre-transition snapshot,
+    # so it can word the message off what actually happened instead of always claiming a reopen (review)
+    task = make_task()
+    store.transition(task.task_id, RECEIVED, QUEUED)
+    store.transition(task.task_id, QUEUED, RUNNING)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+    store.add_artifact(task.task_id, "pull_request", "example-org/taskboy#9", "https://github.com/example-org/taskboy/pull/9")
+    blocked = store.transition(task.task_id, RUNNING, BLOCKED, "waiting", blocked_reason="needs an answer")
+
+    seen = {}
+
+    class CapturingNotifier:
+        async def issue_blocked(self, task, issue):
+            seen["issue"] = issue
+
+    result = await reopen_issue_and_cancel(store, CapturingNotifier(), blocked)
+
+    assert result is True
+    assert seen["issue"]["status"] == "in_review"
+    assert seen["issue"]["pr_url"] == "https://github.com/example-org/taskboy/pull/9"
+
+
+@pytest.mark.asyncio
 async def test_blocked_outcome_for_issue_already_left_reopenable_status_falls_back_to_blocked(store, config, notifier, make_task, wait_until):
     # the issue raced out from under the block (e.g. deleted, or resolved by another path) — don't crash, just
     # notify normally instead of pretending it was reopened
@@ -208,7 +235,7 @@ async def test_blocked_outcome_for_issue_already_left_reopenable_status_falls_ba
         return Outcome(state=BLOCKED, blocked_reason="need repo access", session_id="s-block")
 
     task = make_task()
-    issue = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    issue = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(issue["id"], "approved", "boss")
     store.start_issue(issue["id"], task.task_id, "the spec")
     store.finish_issue(issue["id"], "failed")  # already terminal by the time the run blocks
@@ -227,6 +254,9 @@ async def test_blocked_outcome_for_issue_already_left_reopenable_status_falls_ba
 @pytest.mark.asyncio
 async def test_shutdown_requeues_running_tasks_for_resume(store, config, notifier, make_task, wait_until):
     async def run(task):
+        # mimics the runner persisting the sdk session id mid-run, durably, before the orchestrator's
+        # in-memory snapshot of `task` ever sees it (issue #92).
+        store.set_fields(task.task_id, session_id="s-live")
         await asyncio.sleep(30)
         return Outcome(state=COMPLETED)
 
@@ -234,11 +264,13 @@ async def test_shutdown_requeues_running_tasks_for_resume(store, config, notifie
     orchestrator = Orchestrator(store, config, classify=stub_classify, run=run, notifier=notifier)
     loop_task = asyncio.create_task(orchestrator.dispatcher_loop())
     await wait_until(lambda: store.count_tasks(RUNNING) == 1)
+    await wait_until(lambda: store.get_task(task.task_id).session_id == "s-live")
     await orchestrator.shutdown()
     await loop_task
     requeued = store.get_task(task.task_id)
     assert requeued.state == QUEUED
     assert requeued.attempt == 1
+    assert requeued.resume_session_id == "s-live"
 
 
 @pytest.mark.asyncio
@@ -328,7 +360,7 @@ async def test_non_retryable_failure_of_issue_backed_task_reopens_its_issue(stor
         return Outcome(state=FAILED, error="boom", retryable=False)
 
     task = make_task()
-    issue = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    issue = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(issue["id"], "approved", "boss")
     store.start_issue(issue["id"], task.task_id, "the spec")
 
@@ -527,7 +559,7 @@ async def test_cancelled_coordinator_releases_its_reserved_issues(store, config,
 @pytest.mark.asyncio
 async def test_reconcile_releases_the_batch_of_a_coordinator_it_fails_for_exhausted_retries(store, config, notifier, make_task):
     # this failure happens after reconcile's own release_stale_reservations sweep, so it must release its own
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     coordinator = make_task(text="/implementapprovedissues")
     store.reserve_issues(coordinator.task_id, 5)
@@ -543,7 +575,7 @@ async def test_reconcile_releases_the_batch_of_a_coordinator_it_fails_for_exhaus
 @pytest.mark.asyncio
 async def test_coordinator_that_dies_in_classification_releases_its_reserved_issues(store, config, notifier, make_task, wait_until):
     # the batch is reserved before the coordinator task exists, so it is already held while classification runs
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     coordinator = make_task(text="/implementapprovedissues")
     store.reserve_issues(coordinator.task_id, 5)
@@ -561,7 +593,7 @@ async def test_coordinator_that_dies_in_classification_releases_its_reserved_iss
 
 @pytest.mark.asyncio
 async def test_coordinator_refused_as_unsupported_releases_its_reserved_issues(store, config, notifier, make_task, wait_until):
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     coordinator = make_task(text="/implementapprovedissues")
     store.reserve_issues(coordinator.task_id, 5)

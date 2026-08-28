@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from taskboy.config import Config
 from taskboy.issue_runs import start_implementation_run
 from taskboy.models import utcnow
-from taskboy.orchestrator import accept_task
+from taskboy.orchestrator import _notify_safe, accept_task, intake_paused, queue_at_capacity
 from taskboy.store import Store
 
 logger = logging.getLogger("taskboy.scheduler")
@@ -79,6 +79,22 @@ async def fire_due(store: Store, config: Config, notifier, now: datetime) -> int
         try:
             # key the task to the slot that triggered it so a double-tick can't create two tasks for one slot
             slot = str(schedule["next_run_at"])
+            notify_key = f"schedule_fire_refused:{schedule['id']}"
+            # slot + hour bucket: a schedule stuck for days still re-pages every hour instead of paging once ever
+            notify_value = f"{slot}@{now:%Y-%m-%dT%H}"
+            gate_status = "paused" if intake_paused(store) else "queue_full" if queue_at_capacity(store, config) else None
+            if gate_status is not None:
+                # gated before the attempt so a known-refused schedule never re-enters accept_task (and its
+                # own error-row write, or the implementation path's reserve/release of a batch) every tick
+                if store.meta_get(notify_key) != notify_value:
+                    store.meta_set(notify_key, notify_value)
+                    detail = f"schedule {schedule['id']} ({schedule['name']}) fire refused ({gate_status}); slot not consumed, will retry next tick"
+                    store.add_error("scheduler", "fire_refused", detail, context={"schedule_id": schedule["id"], "schedule_name": schedule["name"], "status": gate_status})
+                    debug = getattr(notifier, "debug", None)
+                    if debug is not None:
+                        await _notify_safe(debug.system_error, "scheduler", detail)
+                    logger.warning("schedule %s fire refused (%s); slot %s not consumed", schedule["id"], gate_status, slot)
+                continue
             if _is_implementation_run(schedule["request_text"]):
                 # reserve the batch before the coordinator exists so an empty queue never starts one
                 task, status, _active = await start_implementation_run(

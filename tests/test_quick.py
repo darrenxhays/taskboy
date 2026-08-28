@@ -5,7 +5,7 @@ import pytest
 
 from taskboy.config import Role
 from taskboy.models import COMPLETED, QUEUED, RECEIVED, RUNNING
-from taskboy.quick import QuickAnswer
+from taskboy.quick import QUICK_PAGE_AFTER_CONSECUTIVE_FAILURES, QuickAnswer
 from taskboy.slack import handle_mention
 
 BOT = "UBOT"
@@ -28,12 +28,12 @@ def event(text="what does HTTP 429 mean?", user="U1", ts="1.1", thread_ts=None):
     return value
 
 
-def make_quick(store, config, **overrides):
+def make_quick(store, config, debug=None, **overrides):
     config.raw = {
         "models": {"haiku": {"id": "claude-haiku", "fallbacks": []}},
         "quick_answer": {"enabled": True, "tier": "haiku", "timeout_seconds": 1, "max_per_user_per_hour": 30, **overrides},
     }
-    return QuickAnswer(store, config)
+    return QuickAnswer(store, config, debug=debug)
 
 
 @pytest.mark.asyncio
@@ -200,3 +200,93 @@ async def test_dm_chat_escalation_and_rate_cap_do_not_create_tasks(store, config
     assert await quick.chat(channel_id="D1", user_id="U1", text="change code", team_id="T1", message_ts="1") == (None, "escalate")
     assert await quick.chat(channel_id="D1", user_id="U1", text="try again", team_id="T1", message_ts="2") == (None, "rate_limited")
     assert store.tasks_in_state(COMPLETED) == []
+
+
+@pytest.mark.asyncio
+async def test_consecutive_failures_page_debug_channel_exactly_once(store, config):
+    debug = AsyncMock()
+    quick = make_quick(store, config, debug=debug)
+    quick._call_model = AsyncMock(side_effect=RuntimeError("model down"))
+
+    for i in range(QUICK_PAGE_AFTER_CONSECUTIVE_FAILURES + 3):
+        task, classification = await quick.try_answer(channel_id="C1", thread_ts="1", user_id="U1", text="q", parent=None, team_id="T1", message_ts=str(i))
+        assert (task, classification) == (None, None)
+
+    debug.system_error.assert_awaited_once()
+    assert debug.system_error.await_args.args[0] == "quick_answer"
+    assert "model down" in debug.system_error.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_success_resets_streak_and_later_failures_page_again(store, config):
+    debug = AsyncMock()
+    quick = make_quick(store, config, debug=debug)
+    quick._call_model = AsyncMock(side_effect=RuntimeError("model down"))
+
+    for i in range(QUICK_PAGE_AFTER_CONSECUTIVE_FAILURES):
+        await quick.try_answer(channel_id="C1", thread_ts="1", user_id="U1", text="q", parent=None, team_id="T1", message_ts=str(i))
+    assert debug.system_error.await_count == 1
+
+    quick._call_model = AsyncMock(return_value=({"action": "answer", "answer": "fixed now"}, None))
+    await quick.try_answer(channel_id="C1", thread_ts="1", user_id="U1", text="q", parent=None, team_id="T1", message_ts="reset")
+
+    quick._call_model = AsyncMock(side_effect=RuntimeError("model down again"))
+    for i in range(QUICK_PAGE_AFTER_CONSECUTIVE_FAILURES):
+        await quick.try_answer(channel_id="C1", thread_ts="1", user_id="U1", text="q", parent=None, team_id="T1", message_ts=f"again-{i}")
+    assert debug.system_error.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_post_call_validation_failure_still_pages(store, config):
+    debug = AsyncMock()
+    quick = make_quick(store, config, debug=debug)
+    # "action": "classify" without task_type makes validate_classification raise on every call,
+    # after the model call itself has already succeeded (issue #97 review follow-up).
+    quick._call_model = AsyncMock(return_value=({"action": "classify", "complexity": "low"}, None))
+
+    for i in range(QUICK_PAGE_AFTER_CONSECUTIVE_FAILURES + 3):
+        task, classification = await quick.try_answer(channel_id="C1", thread_ts="1", user_id="U1", text="q", parent=None, team_id="T1", message_ts=str(i))
+        assert (task, classification) == (None, None)
+
+    debug.system_error.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_triage_and_dm_failure_streaks_are_independent(store, config):
+    debug = AsyncMock()
+    quick = make_quick(store, config, debug=debug)
+    quick._call_model = AsyncMock(side_effect=RuntimeError("triage model down"))
+    quick._call_chat_model = AsyncMock(return_value=({"action": "answer", "answer": "fine"}, None))
+
+    for i in range(QUICK_PAGE_AFTER_CONSECUTIVE_FAILURES):
+        await quick.try_answer(channel_id="C1", thread_ts="1", user_id="U1", text="q", parent=None, team_id="T1", message_ts=str(i))
+        await quick.chat(channel_id="D1", user_id="U2", text="hi", team_id="T1", message_ts=f"dm-{i}")
+
+    debug.system_error.assert_awaited_once()
+    assert debug.system_error.await_args.args[0] == "quick_answer"
+    assert "triage" in debug.system_error.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_classify_escalation_does_not_count_as_a_failure(store, config):
+    debug = AsyncMock()
+    quick = make_quick(store, config, debug=debug)
+    quick._call_model = AsyncMock(return_value=({"action": "classify", "answer": "", **CLASSIFICATION}, None))
+
+    for i in range(QUICK_PAGE_AFTER_CONSECUTIVE_FAILURES + 2):
+        await quick.try_answer(channel_id="C1", thread_ts="1", user_id="U1", text="q", parent=None, team_id="T1", message_ts=str(i))
+
+    debug.system_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dm_chat_consecutive_failures_page_once(store, config):
+    debug = AsyncMock()
+    quick = make_quick(store, config, debug=debug)
+    quick._call_chat_model = AsyncMock(side_effect=ValueError("bad schema"))
+
+    for i in range(QUICK_PAGE_AFTER_CONSECUTIVE_FAILURES):
+        result = await quick.chat(channel_id="D1", user_id="U1", text="q", team_id="T1", message_ts=str(i))
+        assert result == (None, "escalate")
+
+    debug.system_error.assert_awaited_once()

@@ -53,11 +53,15 @@ async def test_create_pull_request_records_artifacts_and_footer(adapter, store):
 
 
 @pytest.mark.asyncio
-async def test_create_pull_request_is_idempotent_via_artifacts(adapter, store):
+async def test_create_pull_request_ignores_closed_pr_artifact(adapter, store):
+    """issue #113: a closed pr recorded earlier in the task must not block a new create on the same head."""
     store.add_artifact(adapter.task.task_id, "pull_request", "org/service-a#7", "https://github.com/org/service-a/pull/7")
+    adapter._request.side_effect = [
+        [],  # no open pr for this head (#7 is closed, so it doesn't show up)
+        {"number": 9, "html_url": "https://github.com/org/service-a/pull/9"},  # POST create
+    ]
     result = await adapter.create_pull_request({"repo": "org/service-a", "title": "fix", "head": "agent/t1-fix", "body": ""})
-    assert "already exists" in result["content"][0]["text"]
-    adapter._request.assert_not_awaited()  # no create call (ORC-012)
+    assert "created pull request #9" in result["content"][0]["text"]
 
 
 @pytest.mark.asyncio
@@ -199,7 +203,7 @@ async def test_get_pull_request_output_is_bounded_and_trimmed(adapter):
 async def test_list_pull_requests_formats_state_and_metadata(adapter):
     adapter._request.return_value = [{"number": 2, "state": "open", "draft": True, "user": {"login": "dev"}, "title": "work", "head": {"sha": "abcdef123"}, "updated_at": "2026-01-01T00:00:00Z"}]
     result = await adapter.list_pull_requests({"repo": "org/service-a", "state": "all"})
-    assert adapter._request.call_args.args[1].endswith("state=all&per_page=50&sort=created&direction=desc")
+    assert adapter._request.call_args.args[1].endswith("state=all&per_page=100&sort=created&direction=desc")
     assert "#2 [open, draft] dev: work (head abcdef1, updated 2026-01-01T00:00:00Z)" in result["content"][0]["text"]
 
 

@@ -1,6 +1,7 @@
 """service entrypoint: wire store + orchestrator (+ slack when configured), handle signals, run until stopped."""
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -17,6 +18,31 @@ from taskboy.runner import ClaudeRunner, EchoRunner
 from taskboy.store import Store
 
 logger = logging.getLogger("taskboy")
+
+SLACK_CONNECT_TIMEOUT_SECONDS = 60
+
+
+async def serve_slack(handler: Any, store: Store, notifier: Any, connect_timeout: float = SLACK_CONNECT_TIMEOUT_SECONDS) -> None:
+    """slack_sdk's connect() retries forever and never raises, so detect a dead connection via task.done()."""
+    task = asyncio.ensure_future(handler.connect_async())
+    try:
+        await asyncio.wait({task}, timeout=connect_timeout)
+        if not task.done():
+            raise RuntimeError(f"slack socket-mode client did not connect within {connect_timeout}s")
+        await task
+    except asyncio.CancelledError:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        raise
+    except Exception as e:
+        logger.exception("slack socket-mode handler failed to start")
+        store.add_error("slack", type(e).__name__, str(e), traceback=traceback.format_exc(), context={"operation": "socket_mode_start"})
+        debug = getattr(notifier, "debug", None)
+        if debug is not None:
+            await debug.system_error("slack", f"socket-mode handler failed to start: {type(e).__name__}: {e}")
+        if not task.done():
+            await task  # connect() retries forever internally -- a late connection shouldn't be cancelled
 
 
 def should_start_review_poller(config, broker) -> bool:
@@ -151,29 +177,44 @@ async def amain() -> None:
     async def housekeeping_loop() -> None:
         from taskboy import audit
         from taskboy.issue_runs import fail_stalled_implementation_run, sync_in_review
+        from taskboy.orchestrator import expire_stale_blocked_tasks
 
-        while True:
+        async def _step(name: str, fn) -> None:
+            # runs fn (sync or async) in isolation so one failing step can't also skip sync_in_review for an hour (#87)
             try:
-                workspace.sweep_once(store, settings.WORKSPACES_ROOT, settings.MEMORY_ROOT, config.raw.get("retention") or {})
-                if audit_bucket:
-                    await audit.ship_once(store, audit_bucket)
-                    await audit.ship_admin_once(store, audit_bucket)
-                if broker is not None:
-                    await repocache.refresh_all(store, broker, settings.REPOS_ROOT, (config.raw.get("github") or {}).get("approved_repos") or [])
-                    await sync_in_review(store, broker)
-                stalled_task_id = fail_stalled_implementation_run(store)
-                if stalled_task_id is not None:
-                    message = f"failed stalled implementation coordinator {stalled_task_id}"
-                    logger.warning(message)
-                    debug = getattr(notifier, "debug", None)
-                    if debug is not None:
-                        await debug.system_error("housekeeping", message)
+                result = fn()
+                if asyncio.iscoroutine(result):
+                    await result
             except Exception as e:
-                store.add_error("housekeeping", type(e).__name__, str(e), traceback=traceback.format_exc())
+                store.add_error(name, type(e).__name__, str(e), traceback=traceback.format_exc())
                 debug = getattr(notifier, "debug", None)
                 if debug is not None:
-                    await debug.system_error("housekeeping", str(e))
-                logger.exception("housekeeping failed")
+                    try:
+                        await debug.system_error(name, str(e))
+                    except Exception:
+                        # a notifier outage must never take housekeeping_loop down with it (nothing awaits `housekeeper`)
+                        logger.exception("debug notifier failed while reporting housekeeping step %s", name)
+                logger.exception("housekeeping step %s failed", name)
+
+        async def _notify_stalled() -> None:
+            stalled_task_id = fail_stalled_implementation_run(store)
+            if stalled_task_id is not None:
+                message = f"failed stalled implementation coordinator {stalled_task_id}"
+                logger.warning(message)
+                debug = getattr(notifier, "debug", None)
+                if debug is not None:
+                    await debug.system_error("housekeeping", message)
+
+        while True:
+            await _step("workspace_sweep", lambda: workspace.sweep_once(store, settings.WORKSPACES_ROOT, settings.MEMORY_ROOT, config.raw.get("retention") or {}))
+            await _step("expire_stale_blocked_tasks", lambda: expire_stale_blocked_tasks(store, notifier, config.raw.get("retention") or {}))
+            if audit_bucket:
+                await _step("audit_ship", lambda: audit.ship_once(store, audit_bucket))
+                await _step("audit_ship_admin", lambda: audit.ship_admin_once(store, audit_bucket))
+            if broker is not None:
+                await _step("repocache_refresh", lambda: repocache.refresh_all(store, broker, settings.REPOS_ROOT, (config.raw.get("github") or {}).get("approved_repos") or []))
+                await _step("sync_in_review", lambda: sync_in_review(store, broker))
+            await _step("fail_stalled_implementation_run", _notify_stalled)
             await asyncio.sleep(3600)
 
     await orchestrator.reconcile()
@@ -184,8 +225,9 @@ async def amain() -> None:
 
         seed_default_schedules(store, self_repo=str((config.raw.get("github") or {}).get("self_repo") or ""), github_enabled=config.service_enabled("github"))
         scheduler_task = asyncio.ensure_future(scheduler_loop(store, config, notifier))
+    slack_task = None
     if handler is not None:
-        asyncio.ensure_future(handler.start_async())
+        slack_task = asyncio.ensure_future(serve_slack(handler, store, notifier))
     logger.info("taskboy started (environment=%s, db=%s, audit_shipping=%s)", settings.ENVIRONMENT, settings.DB_PATH, bool(audit_bucket))
     await orchestrator.dispatcher_loop()
     housekeeper.cancel()
@@ -193,6 +235,8 @@ async def amain() -> None:
         scheduler_task.cancel()
     if review_poller is not None:
         review_poller.cancel()
+    if slack_task is not None:
+        slack_task.cancel()
     if handler is not None:
         await handler.close_async()
     if broker is not None:

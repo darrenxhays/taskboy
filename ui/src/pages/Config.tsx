@@ -168,10 +168,11 @@ export function ConfigPage({ admin }: { admin: boolean }) {
   if (error) return <ErrorNote message={error} />;
   if (!data) return <EmptyState label="loading configuration…" />;
 
-  const policy = data.policy as { agent?: { personality_file?: string }; reviewer?: { enabled?: boolean; personality_file?: string }; conventions?: { file?: string } };
+  const policy = data.policy as { agent?: { personality_file?: string }; reviewer?: { enabled?: boolean; personality_file?: string }; conventions?: { file?: string }; help?: { file?: string } };
   const personalityEnabled = Boolean(policy.agent?.personality_file);
   const reviewerEnabled = Boolean(policy.reviewer?.enabled && policy.reviewer?.personality_file);
   const conventionsEnabled = Boolean(policy.conventions?.file);
+  const helpEnabled = Boolean(policy.help?.file);
 
   const editButton = (kind: string, label: string, name?: string) => (
     <button
@@ -202,6 +203,7 @@ export function ConfigPage({ admin }: { admin: boolean }) {
             {personalityEnabled && editButton("personality", "◈ personality")}
             {reviewerEnabled && editButton("reviewer_personality", "◈ reviewer personality")}
             {conventionsEnabled && editButton("conventions", "§ conventions")}
+            {helpEnabled && editButton("help", "❓ help")}
             {editButton("started", "✉ task-started phrases")}
             {data.skills.map((skill) => editButton("skill", `/${skill}`, skill))}
           </div>

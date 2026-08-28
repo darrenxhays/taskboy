@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from taskboy.hooks import TaskHooks, bash_denial, classify_tool, profile_permits_writes, repo_grantable, tool_grantable
@@ -77,26 +79,95 @@ def test_bash_denials():
     assert "environment" in bash_denial("python -c 'import os; print(os.environ)'", PROTECTED)
     assert "force" in bash_denial("git push --force origin feature", PROTECTED)
     assert "force" in bash_denial("git push -f origin feature", PROTECTED)
+    assert "no-verify" in bash_denial("git push --no-veri origin agent/t123-fix", PROTECTED)  # unambiguous abbreviation
+    assert "no-verify" in bash_denial("git -c foo.bar=1 push --no-verify", PROTECTED)  # push needn't be adjacent to git
+    assert "hook configuration" in bash_denial("git -c core.hooksPath=/dev/null push origin agent/t123-fix", PROTECTED)
+    assert "hook configuration" in bash_denial("git config core.hooksPath /tmp/h", PROTECTED)
+    # a global option between "git" and "config" must not defeat this guard either (issue #106)
+    assert "hook configuration" in bash_denial("git -C repo config core.hookspath=/tmp/h", PROTECTED)
+    assert "hook configuration" in bash_denial("git --config-env=core.hooksPath=HOME push origin HEAD", PROTECTED)
+    assert "hook configuration" in bash_denial("GIT_CONFIG_COUNT=0 git push origin agent/t123-fix", PROTECTED)
+    assert "hook configuration" in bash_denial('git -c "core.hooksPath=/tmp/nowhere" push origin HEAD:x', PROTECTED)
+    assert "hook configuration" in bash_denial("env GIT_CONFIG_COUNT=0 git push", PROTECTED)
+    assert "hook configuration" in bash_denial("export GIT_CONFIG_COUNT=0; git push", PROTECTED)
+    assert "hook configuration" in bash_denial("env -u GIT_CONFIG_COUNT git push", PROTECTED)
+    assert "hook configuration" in bash_denial("FOO=1 GIT_CONFIG_COUNT=0 git push", PROTECTED)  # unrelated assignments may precede it
     assert "protected branch 'main'" in bash_denial("git push origin main", PROTECTED)
     assert "protected branch 'develop'" in bash_denial("git push origin HEAD:develop", PROTECTED)
+    assert "protected branch 'main'" in bash_denial("git -C repo push origin main", PROTECTED)
+    assert "protected branch 'main'" in bash_denial('git "push" origin main', PROTECTED)  # a quoted subcommand is still a push
+    assert "force" in bash_denial("git -P push -f origin feature", PROTECTED)
+    assert "force" in bash_denial("git push \\\norigin agent/x \\\n--force", PROTECTED)
+    assert "protected branch 'main'" in bash_denial("/usr/bin/git push origin main", PROTECTED)
+    assert "force" in bash_denial("git push -fu origin agent/x", PROTECTED)
+    assert "force" in bash_denial("git push --force-with-lease origin agent/x", PROTECTED)
+    # a `+refspec` is a force push even without a `--force`/`-f` flag
+    assert "force" in bash_denial("git push origin +HEAD:agent/x", PROTECTED)
+    # a shell-quoted force flag/refspec must not defeat the guard
+    assert "force" in bash_denial("git push origin '+HEAD:agent/x'", PROTECTED)
+    assert "force" in bash_denial("git push origin '-f' agent/x", PROTECTED)
+    assert "force" in bash_denial('git push origin "--force" agent/x', PROTECTED)
+    # `heads/main` resolves to `refs/heads/main` on the remote, same as bare `main`
+    assert "protected branch 'main'" in bash_denial("git push origin HEAD:heads/main", PROTECTED)
+    # --all/--mirror can update a protected branch without ever naming it
+    assert "--all" in bash_denial("git push --all origin", PROTECTED)
+    assert "--mirror" in bash_denial('git push "--mirror" origin', PROTECTED)
+    assert "wildcard refspec" in bash_denial("git push origin 'refs/heads/*:refs/heads/*'", PROTECTED)
+    # a quoted global-option value containing a space must not defeat the global-option skip
+    assert "protected branch 'main'" in bash_denial('git -C "my repo" push origin main', PROTECTED)
+    # a quote embedded mid-value (not just at the start of the token) must not defeat the skip either
+    assert "protected branch 'main'" in bash_denial('git -c user.name="a b" push origin main', PROTECTED)
+    # stripping a redirect must not open a hole for a flag that follows it
+    assert "--all" in bash_denial("git push origin >/dev/null --all", PROTECTED)
+    # `2>&1` and `&>file` redirect forms must be stripped too, not just `>`/`>>`
+    assert "force" in bash_denial("git push origin agent/x 2>&1 --force", PROTECTED)
+    assert "force" in bash_denial("git push origin agent/x &>/dev/null --force", PROTECTED)
+
+
+def test_bash_denial_git_global_opt_scan_is_linear_time():
+    # a value-taking global option followed by a flag-like token must not cause backtracking blowup (issue #106 follow-up)
+    command = "git " + "-c -c " * 14 + "status"
+    start = time.monotonic()
+    bash_denial(command, PROTECTED)
+    assert time.monotonic() - start < 1.0
 
 
 def test_bash_allows_normal_work():
     for command in [
         "git clone https://github.com/org/repo.git",
         "git push origin agent/t123-fix",
+        "git -C repo push origin agent/t123-fix",
+        "git push origin agent/t1 && gh pr create --base main",
+        "git push origin agent/t1; rm -f /tmp/x",
+        "git push origin agent/x\ngh pr create --base main",
+        'git commit -m "no push to main"',
+        "git push --no-verbose origin agent/t123-fix",  # legitimate flag; the guard matches only --no-veri* (verify abbreviations)
+        "git push",  # refspec-less pushes are judged by the workspace pre-push hook, not here
+        "grep -rn GIT_CONFIG taskboy/broker.py",  # mentions the env vars, doesn't assign them
+        "grep -rn core.hooksPath taskboy/",  # mentions the setting, doesn't set it
+        'git commit -m "wire core.hooksPath into the session env"',
         "pytest tests/ -q",
         "ls -la && cat README.md",
         "grep -r 'environment' src/",  # mentions the word, doesn't dump it
         "python -m venv .venv",
+        "git push origin agent/x > main.log",
+        "git push origin agent/x > out-*.log",  # a wildcard after a redirect is a shell glob, not a refspec
+        # a protected branch name as a substring of an unrelated ref must not trip the guard
+        "git push origin agent/t123-main-guard-fix",
+        # a --no-verify on a *later* command must not fall out of the no-verify guard's scan
+        "git push origin agent/x\ngit commit --no-verify -m x",
+        # a redirect target must not swallow the following `;`/`&&` and merge two commands into one
+        "git push origin agent/x >/dev/null; gh pr create --base main",
     ]:
         assert bash_denial(command, PROTECTED) is None, command
 
 
 def test_tool_classification_defaults_to_write():
     assert classify_tool("Read") == "read"
+    assert classify_tool("ToolSearch") == "read"
     assert classify_tool("Bash") == "write"
     assert classify_tool("mcp__harness__report_progress") == "read"
+    assert classify_tool("mcp__harness__ask_questions") == "read"
     assert classify_tool("mcp__slack__channel_history") == "read"
     assert classify_tool("mcp__slack__thread_replies") == "read"
     assert classify_tool("mcp__slack__get_file") == "read"

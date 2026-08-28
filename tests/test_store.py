@@ -1,4 +1,5 @@
 import dataclasses
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -86,13 +87,6 @@ def test_has_active_main_task_referencing_excludes_blocked(store, make_task):
     assert store.has_active_main_task_referencing("github.com/org/a/pull/7") is False
 
 
-def test_task_by_intake_key(store, make_task):
-    task = make_task("do the thing")
-    found = store.task_by_intake_key(task.slack_team_id, task.slack_channel_id, task.slack_message_ts)
-    assert found is not None and found.task_id == task.task_id
-    assert store.task_by_intake_key("T1", "C1", "nope") is None
-
-
 def test_has_active_main_task_referencing_include_reviewer(store, make_task):
     assert store.has_active_main_task_referencing("github.com/org/a/pull/7", include_reviewer=True) is False
 
@@ -103,6 +97,13 @@ def test_has_active_main_task_referencing_include_reviewer(store, make_task):
 
     store.transition(reviewer_task.task_id, RECEIVED, CANCELLED, "test cleanup")
     assert store.has_active_main_task_referencing("github.com/org/a/pull/7", include_reviewer=True) is False
+
+
+def test_task_by_intake_key(store, make_task):
+    task = make_task("do the thing")
+    found = store.task_by_intake_key(task.slack_team_id, task.slack_channel_id, task.slack_message_ts)
+    assert found is not None and found.task_id == task.task_id
+    assert store.task_by_intake_key("T1", "C1", "nope") is None
 
 
 def test_slack_event_dedup(store):
@@ -302,7 +303,7 @@ def test_finish_issue_accepts_in_review_and_resolves_it(store, make_task):
 
 def test_reopen_linked_issue_clears_the_claim_and_returns_to_proposed(store, make_task):
     task = make_task()
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "the spec")
 
@@ -317,7 +318,7 @@ def test_reopen_linked_issue_clears_the_claim_and_returns_to_proposed(store, mak
 
 def test_reopen_linked_issue_refuses_terminal_or_not_yet_claimed_statuses(store, make_task):
     task = make_task()
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     # proposed: never claimed, nothing to reopen
     assert store.reopen_linked_issue(task) is None
 
@@ -333,7 +334,7 @@ def test_reopen_linked_issue_prefers_the_real_error_over_a_stale_blocked_reason(
     # blocked_reason is never cleared on resume, so a task that blocked then later failed for a different
     # reason must not have its stale block reason quoted instead of the real error (#76 review)
     task = make_task()
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "the spec")
     stale = dataclasses.replace(task, blocked_reason="needs permission for bash", error="runner crashed: boom")
@@ -346,28 +347,128 @@ def test_reopen_linked_issue_prefers_the_real_error_over_a_stale_blocked_reason(
     assert "needs permission" not in comments[0]["body"]
 
 
+def test_reopen_linked_issue_tracks_an_already_opened_pr_instead_of_reopening(store, make_task):
+    # the task ended (crashed/blocked/cancelled) after create_pull_request already recorded a "pull_request"
+    # artifact but before finish_issue could run — reopening this issue to proposed on the spot risks
+    # re-implementing an already-merged PR as a duplicate (#87)
+    task = make_task()
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+    store.add_artifact(task.task_id, "pull_request", "example-org/taskboy#9", "https://github.com/example-org/taskboy/pull/9")
+
+    tracked = store.reopen_linked_issue(task)
+
+    assert tracked["status"] == "in_review"
+    assert tracked["pr_url"] == "https://github.com/example-org/taskboy/pull/9"
+    assert tracked["task_id"] == task.task_id  # still linked — this isn't a reopen, just a status/pr_url move
+    comments = store.list_issue_comments(row["id"])
+    assert len(comments) == 1 and "https://github.com/example-org/taskboy/pull/9" in comments[0]["body"]
+
+
+def test_reopen_linked_issue_includes_the_crash_reason_even_when_tracking_a_pr(store, make_task):
+    # the PR-tracking path returns early, but an operator still needs to know the task crashed and why —
+    # not just that it happens to have left a PR behind (#87 review)
+    task = make_task()
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+    store.add_artifact(task.task_id, "pull_request", "example-org/taskboy#9", "https://github.com/example-org/taskboy/pull/9")
+    crashed = dataclasses.replace(task, error="runner crashed: boom")
+
+    tracked = store.reopen_linked_issue(crashed)
+
+    assert tracked["status"] == "in_review"
+    comments = store.list_issue_comments(row["id"])
+    assert len(comments) == 1
+    assert "runner crashed: boom" in comments[0]["body"]
+    assert "https://github.com/example-org/taskboy/pull/9" in comments[0]["body"]
+
+
+def test_reopen_linked_issue_ignores_a_pull_request_artifact_with_no_url(store, make_task):
+    # defensive: an artifact row is only trusted as "a PR exists" when it actually carries a url
+    task = make_task()
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+    store.add_artifact(task.task_id, "pull_request", "example-org/taskboy#9", None)
+
+    reopened = store.reopen_linked_issue(task)
+
+    assert reopened["status"] == "proposed"
+
+
+def test_reopen_linked_issue_ignores_a_pull_request_artifact_from_a_different_repo(store, make_task):
+    # a task can touch more than one approved repo; a PR artifact from a repo other than this issue's must not
+    # be adopted as "this issue's PR" — create_pull_request's own idempotency guard is per-repo too (#87 review)
+    task = make_task()
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+    store.add_artifact(task.task_id, "pull_request", "redzone-co/other-repo#9", "https://github.com/redzone-co/other-repo/pull/9")
+
+    reopened = store.reopen_linked_issue(task)
+
+    assert reopened["status"] == "proposed"
+
+
+def test_reopen_linked_issue_tracks_the_most_recently_recorded_pr_artifact(store, make_task):
+    # a close-then-recreate (#88) leaves the old closed-pr artifact alongside the new one; reopen_linked_issue
+    # must track the newer PR, not the first one recorded, or a terminally-failed task's issue gets stuck behind
+    # a closed PR while the real open PR goes untracked (#88 review)
+    task = make_task()
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+    store.add_artifact(task.task_id, "pull_request", "example-org/taskboy#9", "https://github.com/example-org/taskboy/pull/9")
+    store.add_artifact(task.task_id, "pull_request", "example-org/taskboy#15", "https://github.com/example-org/taskboy/pull/15")
+
+    tracked = store.reopen_linked_issue(task)
+
+    assert tracked["status"] == "in_review"
+    assert tracked["pr_url"] == "https://github.com/example-org/taskboy/pull/15"
+
+
+def test_transition_to_completed_tracks_the_pr_instead_of_reopening(store, make_task):
+    # same guard, exercised through the transition() hook (not a direct reopen_linked_issue call) — the hook
+    # must not undo a PR that's already out for review just because finish_issue never ran (#87)
+    task = make_task()
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+    store.add_artifact(task.task_id, "pull_request", "example-org/taskboy#9", "https://github.com/example-org/taskboy/pull/9")
+
+    store.transition(task.task_id, RECEIVED, QUEUED, "classified")
+    store.transition(task.task_id, QUEUED, RUNNING, "dispatched")
+    store.transition(task.task_id, RUNNING, COMPLETED, "runner finished", result_summary="done")
+
+    tracked = store.get_issue(row["id"])
+    assert tracked["status"] == "in_review"
+    assert tracked["pr_url"] == "https://github.com/example-org/taskboy/pull/9"
+
+
 def test_reopen_stranded_issues_catches_one_left_behind_a_task_that_finished_before_the_hook_ran(store, make_task):
     # a startup safety net for rows that predate transition()'s TERMINAL_STATES hook, or a crash between a
     # task landing terminal and this reconcile pass getting a chance to run (#76)
     task = make_task()
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "the spec")
     # move the task straight to failed without going through transition(), simulating a pre-hook stranding
     store.conn.execute("UPDATE tasks SET state = 'failed' WHERE task_id = ?", (task.task_id,))
     store.conn.commit()
 
-    assert store.reopen_stranded_issues() == 1
+    assert store.reopen_stranded_issues() == {"reopened": 1, "tracked": 0}
     assert store.get_issue(row["id"])["status"] == "proposed"
 
 
 def test_reopen_stranded_issues_leaves_a_still_in_progress_task_alone(store, make_task):
     task = make_task()
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "the spec")
 
-    assert store.reopen_stranded_issues() == 0
+    assert store.reopen_stranded_issues() == {"reopened": 0, "tracked": 0}
     assert store.get_issue(row["id"])["status"] == "in_progress"
 
 
@@ -375,7 +476,7 @@ def test_transition_to_completed_reopens_an_issue_left_in_progress(store, make_t
     # finish_issue is supposed to close the issue before a task completes; if it never ran, transition()'s
     # hook must still catch it — reopen_linked_issue is a no-op once finish_issue already moved it on (#76 review)
     task = make_task()
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "the spec")
 
@@ -389,34 +490,51 @@ def test_transition_to_completed_reopens_an_issue_left_in_progress(store, make_t
 def test_reopen_stranded_issues_catches_one_behind_a_completed_task_that_never_closed_it(store, make_task):
     # a startup safety net for a completed-without-finish_issue row that predates transition()'s hook (#76 review)
     task = make_task()
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "the spec")
     # move the task straight to completed without going through transition(), simulating a pre-hook stranding
     store.conn.execute("UPDATE tasks SET state = 'completed' WHERE task_id = ?", (task.task_id,))
     store.conn.commit()
 
-    assert store.reopen_stranded_issues() == 1
+    assert store.reopen_stranded_issues() == {"reopened": 1, "tracked": 0}
     assert store.get_issue(row["id"])["status"] == "proposed"
 
 
 def test_reopen_stranded_issues_catches_one_with_no_linked_task(store):
     # a crash between start_issue and link_issue_task can leave task_id NULL while status is still in_progress —
     # the plain inner join used to miss this row entirely (#76 review)
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], None, "the spec")
 
-    assert store.reopen_stranded_issues() == 1
+    assert store.reopen_stranded_issues() == {"reopened": 1, "tracked": 0}
     reopened = store.get_issue(row["id"])
     assert reopened["status"] == "proposed"
     comments = store.list_issue_comments(row["id"])
     assert len(comments) == 1 and "no linked task" in comments[0]["body"]
 
 
+def test_reopen_stranded_issues_tracks_a_pr_instead_of_reopening(store, make_task):
+    # same #87 guard as reopen_linked_issue, exercised through the startup sweep — the count must reflect that
+    # this row was left tracking a PR, not reopened to proposed (review: orchestrator's log must not misreport it)
+    task = make_task()
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
+    store.decide_issue(row["id"], "approved", "boss")
+    store.start_issue(row["id"], task.task_id, "the spec")
+    store.add_artifact(task.task_id, "pull_request", "example-org/taskboy#9", "https://github.com/example-org/taskboy/pull/9")
+    store.conn.execute("UPDATE tasks SET state = 'failed' WHERE task_id = ?", (task.task_id,))
+    store.conn.commit()
+
+    assert store.reopen_stranded_issues() == {"reopened": 0, "tracked": 1}
+    tracked = store.get_issue(row["id"])
+    assert tracked["status"] == "in_review"
+    assert tracked["pr_url"] == "https://github.com/example-org/taskboy/pull/9"
+
+
 def test_issue_for_task_looks_up_by_linked_task_id(store, make_task):
     task = make_task()
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     assert store.issue_for_task(task.task_id) is None
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "spec")
@@ -427,7 +545,7 @@ def test_transition_to_any_non_completed_terminal_state_reopens_a_linked_issue(s
     # centralized in transition()'s TERMINAL_STATES hook so no call site (reconcile, classification, an operator
     # cancel) can forget to hand a linked issue back (#76 review)
     task = make_task()
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "the spec")
 
@@ -584,3 +702,18 @@ def test_feedback_upsert_listing_and_redaction(store, make_task):
     assert "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in (other["comment"] or "")
     assert any(event["kind"] == "feedback" for event in store.events_for(task.task_id))
     assert {row["submitted_by"] for row in store.recent_feedback()} == {"person@example.com", "other@example.com"}
+
+
+def test_purge_errors_only_removes_rows_older_than_cutoff(store, make_task):
+    task = make_task()
+    store.add_error("runner", "timeout", "old failure", task_id=task.task_id)
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat(timespec="seconds")
+    store.conn.execute("UPDATE errors SET ts = ?", (old_ts,))
+    store.add_error("runner", "timeout", "fresh failure", task_id=task.task_id)
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(timespec="seconds")
+    removed = store.purge_errors(cutoff)
+    assert removed == 1
+    remaining = store.recent_errors(10)
+    assert len(remaining) == 1
+    assert remaining[0]["message"] == "fresh failure"

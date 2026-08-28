@@ -1,4 +1,4 @@
-from taskboy.prompts import CLASSIFICATION_SCHEMA, TRIAGE_SCHEMA, classifier_prompt, dm_chat_prompt, quick_answer_prompt, task_prompt, triage_prompt
+from taskboy.prompts import CLASSIFICATION_SCHEMA, QUICK_ANSWER_SCHEMA, TRIAGE_SCHEMA, classifier_prompt, dm_chat_prompt, quick_answer_prompt, task_prompt, triage_prompt
 
 
 def test_classifier_prompt_includes_thread_context_only_when_present():
@@ -34,6 +34,16 @@ def test_task_prompt_includes_thread_and_precloned_repositories(make_task):
     assert "## Conversation in this Slack thread" in prompt
     assert "use the prior approach" in prompt
     assert "./service-a, ./service-b" in prompt
+
+
+def test_task_prompt_names_repos_that_failed_to_preclone(make_task):
+    task = make_task()
+    without = task_prompt(task, None, [], github=True, cloned_repos=["org/service-a"])
+    with_failure = task_prompt(task, None, [], github=True, cloned_repos=["org/service-a"], failed_repo_clones=["org/service-b"])
+    assert "could not be pre-cloned" not in without
+    assert "could not be pre-cloned" in with_failure
+    assert "org/service-b" in with_failure
+    assert "./service-a" in with_failure  # the successfully-cloned repo line is unaffected
 
 
 def test_task_prompt_self_repo_rules_only_when_present(make_task):
@@ -79,6 +89,7 @@ def test_task_prompt_includes_github_pre_push_and_review_comment_rules(make_task
     prompt = task_prompt(make_task(), None, [], github=True, bot_name="Red")
 
     assert "Docker is available" in prompt
+    assert "Pushes may only target `agent/` branches" in prompt
     assert "Before pushing code changes" in prompt
     assert "`make check` (lint, format, mypy, tests)" in prompt
     assert "reply to that comment with mcp__github__reply_to_pr_comment as Red" in prompt
@@ -169,16 +180,10 @@ def test_triage_prompt_combines_answer_context_and_classification_scope():
     assert set(TRIAGE_SCHEMA["required"]) == {"action", "answer"}
 
 
-def test_triage_schema_anyof_requires_classification_fields_only_on_classify_branch():
-    assert set(TRIAGE_SCHEMA["required"]) == {"action", "answer"}  # top-level required is unchanged
-    branches = TRIAGE_SCHEMA["anyOf"]
-    assert len(branches) == 2
-
-    answer_branch = next(b for b in branches if b["properties"]["action"]["const"] == "answer")
-    assert set(answer_branch["required"]) == {"action", "answer"}
-
-    classify_branch = next(b for b in branches if b["properties"]["action"]["const"] == "classify")
-    assert set(classify_branch["required"]) == {"action", "answer", *CLASSIFICATION_SCHEMA["required"]}
+def test_no_schema_passed_to_structured_call_has_top_level_combinator():
+    for schema in (TRIAGE_SCHEMA, CLASSIFICATION_SCHEMA, QUICK_ANSWER_SCHEMA):
+        for combinator in ("oneOf", "allOf", "anyOf", "if"):
+            assert combinator not in schema
 
 
 def test_task_prompt_includes_answered_questions_only_when_present(make_task):

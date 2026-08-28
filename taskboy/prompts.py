@@ -30,7 +30,8 @@ QUICK_ANSWER_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-# if/then and oneOf aren't in Claude's json_schema subset, so classification fields are required via anyOf
+# top-level anyOf/oneOf/allOf/if are rejected by the api; quick.py's validate_classification() enforces the
+# classify-branch fields instead
 TRIAGE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -40,10 +41,6 @@ TRIAGE_SCHEMA: dict[str, Any] = {
     },
     "required": ["action", "answer"],
     "additionalProperties": False,
-    "anyOf": [
-        {"properties": {"action": {"const": "answer"}}, "required": ["action", "answer"]},
-        {"properties": {"action": {"const": "classify"}}, "required": ["action", "answer", *CLASSIFICATION_SCHEMA["required"]]},
-    ],
 }
 
 
@@ -168,6 +165,7 @@ def task_prompt(
     other_bot_name: str = "Reviewer",
     is_reviewer: bool = False,
     thread_context: str | None = None,
+    failed_repo_clones: list[str] | None = None,
     cloned_repos: list[str] | None = None,
     skill: dict | None = None,
     conventions: bool = False,
@@ -217,6 +215,10 @@ You previously asked the requester follow-up questions and they have answered. W
         if cloned_repos:
             paths = ", ".join(f"./{repo.split('/')[-1]}" for repo in cloned_repos)
             cloned_line = f"\n- These repositories are already cloned in your workspace: {paths} — work in them directly; fetch/pull/push work normally (auth handled)."
+        failed_clone_line = ""
+        if failed_repo_clones:
+            names = ", ".join(failed_repo_clones)
+            failed_clone_line = f"\n- These target repos could not be pre-cloned (clone them yourself with git; auth is handled): {names}."
         self_repo_line = f"\n- {self_repo} is your own source code — the service you are running as. Changes merged to main deploy automatically. Work only on your `agent/` branch and open a pull request for human review; never attempt to merge it yourself." if self_repo else ""
         no_delegate_line = (
             f"\n- When your job is to change code — including addressing pull request review comments — make the changes yourself. Do not request a {other_persona} review or spawn {other_persona}; {other_persona} reviews pull requests only through the GitHub review-request flow."
@@ -226,12 +228,12 @@ You previously asked the requester follow-up questions and they have answered. W
         sections.append(
             f"""## GitHub work rules
 - Use git via Bash for clone/commit/push (auth is handled for you); use the mcp__github__* tools for pull request operations.
-- Create branches named `agent/{task.task_id}-<short-slug>`. Never push to protected branches — it is blocked at multiple layers and will fail.
+- Create branches named `agent/{task.task_id}-<short-slug>`. Pushes may only target `agent/` branches — anything else is blocked at multiple layers and will fail.
 - Docker is available: build and run project images and Makefile targets that use docker compose as needed.
 - Before pushing code changes, run the repository's checks — `make check` (lint, format, mypy, tests) when the Makefile defines it — and fix failures until they pass. Never push code that fails its checks.
 - When you change code to address a pull request review comment, reply to that comment with mcp__github__reply_to_pr_comment as {bot_name}: one or two plain sentences saying what you changed and why it fixes the finding. Only resolve a review thread with mcp__github__resolve_pr_thread that you or {other_persona} started, and only once the code verifiably fixes it.
 - Pull request bodies must contain: Summary, Testing performed, Known limitations. Before opening a PR, check whether one already exists for your branch.
-- Include the pull request link in your `## Reply` when you opened or reviewed one.{no_delegate_line}{jira_line}{cloned_line}{self_repo_line}"""
+- Include the pull request link in your `## Reply` when you opened or reviewed one.{no_delegate_line}{jira_line}{cloned_line}{failed_clone_line}{self_repo_line}"""
         )
     if jira:
         sections.append(

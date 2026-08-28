@@ -13,12 +13,14 @@ import time
 import traceback
 
 from slack_bolt.async_app import AsyncApp
+from slack_sdk.errors import SlackApiError
 
 from taskboy import settings, skills
 from taskboy.config import Config, Role, SlackConfig, role_for
 from taskboy.models import BLOCKED, EFFORT_LEVELS, QUEUED, Task
 from taskboy.mrkdwn import to_mrkdwn
 from taskboy.orchestrator import accept_task
+from taskboy.personality import load as load_text_file
 from taskboy.redact import redactor
 from taskboy.slack_users import cached_user_profile
 from taskboy.started_messages import pick as pick_started_message
@@ -30,6 +32,10 @@ THREAD_CONTEXT_MAX_MESSAGES = 30
 THREAD_CONTEXT_MAX_CHARS = 6000
 THREAD_CONTEXT_BOT_MESSAGE_MAX_CHARS = 500
 SNIPPET_THRESHOLD = 3500
+
+# non-transient channel-delivery failures (#83): the channel stays read-only/gone on retry, so
+# these are worth a fallback delivery instead of a raise-and-lose-the-message loop.
+UNDELIVERABLE_CHANNEL_ERRORS = frozenset({"restricted_action_read_only_channel", "channel_not_found", "not_in_channel", "is_archived"})
 
 
 def authorization_failure(slack: SlackConfig, roles: dict[str, Role], team_id: str, channel_id: str, user_id: str, channel_type: str | None = None, bot_name: str = "Agent") -> str | None:
@@ -49,6 +55,17 @@ def authorization_failure(slack: SlackConfig, roles: dict[str, Role], team_id: s
 
 def clean_text(text: str, bot_user_id: str) -> str:
     return re.sub(rf"<@{re.escape(bot_user_id)}>", "", text).strip()
+
+
+def is_help_request(text: str) -> bool:
+    """narrow on purpose: broader matching (e.g. "please help me") would swallow ordinary task requests."""
+    stripped = text.strip().lower()
+    return stripped == "help" or bool(re.match(r"/help(\s|$)", stripped))
+
+
+def help_text(config: Config) -> str:
+    loaded = load_text_file(config.help_path)
+    return loaded[0] if loaded else ""
 
 
 def normalize_effort(raw: str | None) -> str | None:
@@ -224,6 +241,11 @@ async def handle_mention(store: Store, config: Config, notifier, event: dict, ev
         await notifier.refuse_intake(channel_id, thread_ts, reason)
         return None, "empty"
 
+    if is_help_request(text) and (guide := help_text(config)):
+        await notifier.answer(channel_id, thread_ts, guide)
+        if debug is not None:
+            await debug.post(debug_thread_ts, "Answered `/help` — no task created.")
+        return None, "help"
     invocation = skills.parse_invocation(text)
     if text.startswith("/"):
         names = skills.available(settings.SKILLS_ROOT)
@@ -329,6 +351,9 @@ async def handle_dm(store: Store, config: Config, notifier, event: dict, event_i
         return "unauthorized"
     if not text:
         return "ignored"
+    if is_help_request(text) and (guide := help_text(config)):
+        await notifier.answer(channel_id, None, guide)
+        return "help"
     if quick is None:
         await notifier.answer(channel_id, None, f"This needs a full task. Mention `@{config.agent_name}` to start one.")
         return "escalate"
@@ -361,8 +386,24 @@ class SlackNotifier:
         if self.store is not None:
             self.store.add_error("slack", type(error).__name__, str(error), task_id=task_id, traceback=traceback.format_exc(), context={"operation": operation})
 
+    async def _deliver_fallback(self, user_id: str, text: str, task_id: str | None = None) -> None:
+        """dm the requester when the channel is read-only/gone (#83); debug feed if that fails."""
+        if user_id:
+            try:
+                opened = await self.client.conversations_open(users=user_id)
+                channel_id = str((opened.get("channel") or {}).get("id") or "")
+                if not channel_id:
+                    raise RuntimeError("slack did not return a dm channel")
+                await self.client.chat_postMessage(channel=channel_id, text=f"_(the original channel is read-only or unreachable, so I'm DMing you instead)_\n{text}")
+                return
+            except Exception as e:
+                self._record_error("dm_fallback", e, task_id)
+        if self.debug is not None:
+            await self.debug.system_error("slack", f"channel is read-only/unreachable and no DM fallback landed; message: {text}")
+
     async def _post(self, task: Task, text: str, **kwargs) -> None:
-        post = {"channel": task.slack_channel_id, "text": redactor.redact(to_mrkdwn(text)), **kwargs}
+        redacted = redactor.redact(to_mrkdwn(text))
+        post = {"channel": task.slack_channel_id, "text": redacted, **kwargs}
         if task.slack_team_id == "github":
             if not task.slack_channel_id:
                 return
@@ -372,6 +413,11 @@ class SlackNotifier:
             await self.client.chat_postMessage(**post)
         except Exception as e:
             self._record_error("chat_postMessage", e, task.task_id)
+            if isinstance(e, SlackApiError) and e.response.get("error") in UNDELIVERABLE_CHANNEL_ERRORS:
+                # system-origin tasks (slack_team_id = "github", slack_user_id = "cli") have no real Slack user to DM — go straight to debug
+                fallback_user_id = task.slack_user_id if task.slack_team_id != "github" else ""
+                await self._deliver_fallback(fallback_user_id, redacted, task.task_id)
+                return
             raise
 
     async def progress(self, task: Task, message: str) -> None:
@@ -500,14 +546,18 @@ class SlackNotifier:
         await self._post(task, f"*Blocked*\n{task.blocked_reason or ''}\nReply in this thread to continue.")
 
     async def issue_blocked(self, task: Task, issue: dict) -> None:
-        """this task is cancelled and its issue reopened as `proposed` (#76); points at the issue instead of the now-inert thread reply."""
+        """this task is cancelled and its issue is either reopened as `proposed` or, if it had already opened a PR,
+        left tracking that PR instead (#87); points at the issue instead of the now-inert thread reply."""
         self._last_progress.pop(task.task_id, None)
         if self.debug is not None:
             await self.debug.blocked(task)
         if task.schedule_name:
             return  # debug feed already threads this into the debug channel; skip the duplicate top-level post
         reason = task.blocked_reason or "the task could not continue"
-        text = f"*Blocked* — reopened issue #{issue['id']} as `proposed` so you can pick up where this left off.\n{reason}"
+        if issue.get("status") == "in_review":
+            text = f"*Blocked* — it had already opened {issue['pr_url']}, so I'm tracking that PR on issue #{issue['id']} instead of reopening it.\n{reason}"
+        else:
+            text = f"*Blocked* — reopened issue #{issue['id']} as `proposed` so you can pick up where this left off.\n{reason}"
         if self.dashboard_url:
             text += f"\n{self.dashboard_url}/issues?issue={issue['id']}"
         await self._post(task, text)
@@ -566,7 +616,7 @@ async def build(store: Store, config: Config, bot_token: str) -> tuple[AsyncApp,
     if (config.raw.get("quick_answer") or {}).get("enabled"):
         from taskboy.quick import QuickAnswer
 
-        quick = QuickAnswer(store, config)
+        quick = QuickAnswer(store, config, debug=debug)
     try:
         auth = await app.client.auth_test()
     except Exception as e:

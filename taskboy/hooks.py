@@ -19,6 +19,7 @@ TOOL_CLASSIFICATION = {
     "Glob": "read",
     "WebFetch": "read",
     "WebSearch": "read",
+    "ToolSearch": "read",  # loads deferred tool schemas only; per-tool allowlisting still gates execution (#94)
     "Bash": "write",  # conservative: bash can do anything
     "Write": "write",
     "Edit": "write",
@@ -26,6 +27,7 @@ TOOL_CLASSIFICATION = {
     "mcp__harness__report_progress": "read",
     "mcp__harness__report_blocked": "read",
     "mcp__harness__request_permission": "read",
+    "mcp__harness__ask_questions": "read",
     "mcp__issues__list_task_feedback": "read",
     "mcp__issues__list_failed_tasks": "read",
     "mcp__issues__list_recent_errors": "read",
@@ -118,8 +120,16 @@ def repo_grantable(target: str, approved_repos: list[str], accessible_repos: set
     return True
 
 
+# git allows global options between "git" and the subcommand (issue #106); this skips a bounded, quote-aware set of them.
+_GIT_OPT_WORD = r"(?:[^\s'\"]|'[^']*'|\"[^\"]*\")+"
+_GIT_GLOBAL_OPT = rf"(?:-c|-C|--git-dir|--work-tree|--namespace|--config-env|--attr-source)\s+(?!-){_GIT_OPT_WORD}|-{_GIT_OPT_WORD}"
+_GIT_PUSH = rf"\bgit\b(?:\s+(?:{_GIT_GLOBAL_OPT}))*\s+['\"]?push\b"
+
+
 def bash_denial(command: str, protected_branches: list[str]) -> str | None:
     """returns a denial reason, or None when the command is allowed."""
+    command = command.replace("\\\n", "")  # join backslash-continued lines before scanning
+    command = re.sub(r"\s(?:\d*>{1,2}|&>{1,2})\s*(?:&\d+|[^\s;&|<>]+)", " ", command)  # strip redirects so a redirect target isn't scanned as guard content
     if "169.254.169.254" in command:
         return "access to the instance metadata service is blocked"
     # deliberately non-exhaustive defense-in-depth; host controls remain authoritative.
@@ -127,10 +137,24 @@ def bash_denial(command: str, protected_branches: list[str]) -> str | None:
         return "dumping the process environment is blocked"
     if re.search(r"\bprintenv\b", command) or re.search(r"(^|[;&|]\s*)env\s*($|[;&|>])", command.strip()):
         return "dumping the process environment is blocked"
-    if re.search(r"\bgit\s+push\b[^;&|]*(\s--force\b|\s-f\b)", command):
+    # a wildcard refspec updates a protected branch without naming it, exactly like --all/--mirror
+    if re.search(rf"{_GIT_PUSH}[^;&|\n]*\s['\"]?(?:--(?:all|mirror)\b|\S*\*)", command):
+        return "pushing with --all, --mirror, or a wildcard refspec is blocked"
+    if re.search(rf"{_GIT_PUSH}[^;&|\n]*(?:\s['\"]?--force\b|\s['\"]?-\w*f\w*\b|\s['\"]?\+\S)", command):
         return "force pushes are blocked"
+    # --no-verify (git accepts unambiguous abbreviations) or a hook-config override would dodge the workspace pre-push hook
+    if re.search(r"\bgit\b[^;&|\n]*\bpush\b[^;&|\n]*\s--no-veri[a-z]*\b", command):
+        return "pushing with --no-verify is blocked"
+    if (
+        re.search(r"(?:-c\s*[\"']?|--config-env=)core\.hookspath=", command, re.IGNORECASE)
+        or re.search(r"\bgit\b[^;&|\n]*\bconfig\b[^;&|\n]*core\.hookspath", command, re.IGNORECASE)
+        or re.search(r"(?:^|[;&|(\n])\s*(?:(?:env|export)\s+|\w+=\S*\s+)*GIT_CONFIG_\w+=", command)
+        or re.search(r"\benv\s+-u\s+GIT_CONFIG_\w+", command)
+    ):
+        return "overriding git hook configuration is blocked"
     for branch in protected_branches:
-        if re.search(rf"\bgit\s+push\b[^;&|]*\b{re.escape(branch)}\b", command):
+        # a protected name inside a longer ref (agent/t123-main-guard-fix) is not a push to it.
+        if re.search(rf"{_GIT_PUSH}[^;&|\n]*(?<![\w.-]){re.escape(branch)}(?![\w.-])", command):
             return f"pushing to protected branch '{branch}' is blocked"
     return None
 

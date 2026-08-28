@@ -20,7 +20,7 @@ from taskboy.config import KNOWN_SERVICES, Config, load_config
 from taskboy.dashboard.render import SECRET_KEY
 from taskboy.redact import redactor
 
-EDITABLE_KINDS = ("config", "service", "personality", "reviewer_personality", "started", "skill", "conventions")
+EDITABLE_KINDS = ("config", "service", "personality", "reviewer_personality", "help", "started", "skill", "conventions")
 
 
 class EditorError(Exception):
@@ -43,6 +43,8 @@ def target_for(config: Config, kind: str, name: str | None) -> tuple[Path, str, 
         return Path(config.personality_path), f"config/{Path(config.personality_path).name}", "Personality"
     if kind == "reviewer_personality" and config.reviewer.personality_path:
         return Path(config.reviewer.personality_path), f"config/{Path(config.reviewer.personality_path).name}", "Reviewer personality"
+    if kind == "help" and config.help_path:
+        return Path(config.help_path), f"config/{Path(config.help_path).name}", "Help"
     if kind == "started" and config.slack.task_started_messages_path:
         return Path(config.slack.task_started_messages_path), f"config/{Path(config.slack.task_started_messages_path).name}", "Task Started messages"
     if kind == "conventions" and config.conventions_path:
@@ -96,13 +98,13 @@ def validate(kind: str, name: str | None, content: str, target: Path) -> None:
             (scratch / "services").mkdir(exist_ok=True)
             (scratch / "services" / f"{name}.yaml").write_text(content)
             load_config(str(scratch / config_path.name))
-    elif kind in ("personality", "reviewer_personality"):
+    elif kind in ("personality", "reviewer_personality", "help"):
         handle, temp_name = tempfile.mkstemp(prefix=".dashboard-validate-", suffix=".md", dir=target.parent)
         os.close(handle)
         try:
             Path(temp_name).write_text(content)
             if personality.load(temp_name) is None:
-                raise ValueError("personality must contain non-whitespace text")
+                raise ValueError(f"{kind} must contain non-whitespace text")
         finally:
             Path(temp_name).unlink(missing_ok=True)
     elif kind == "started":

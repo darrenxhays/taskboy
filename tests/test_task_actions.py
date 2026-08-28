@@ -123,11 +123,11 @@ def test_cancel_issue_backed_task_reopens_its_issue(store, make_task):
     task = make_task()
     store.transition(task.task_id, RECEIVED, QUEUED)
     store.transition(task.task_id, QUEUED, RUNNING)
-    row = store.record_issue("x", "redzone-co/agent-red", "s", "organization", "d", 50)
+    row = store.record_issue("x", "example-org/taskboy", "s", "organization", "d", 50)
     store.decide_issue(row["id"], "approved", "boss")
     store.start_issue(row["id"], task.task_id, "the spec")
 
-    cancelled, status = cancel_task(store, task.task_id, "boss@redzone.co")
+    cancelled, status = cancel_task(store, task.task_id, "boss@example.com")
 
     assert status == "cancelled"
     assert cancelled.state == CANCELLED
@@ -170,7 +170,7 @@ async def test_retry_rejects_an_issue_backed_task(store, make_task, notifier):
     # with no spec, which just re-blocks it immediately — re-approving the issue is the correct path (#76)
     task = make_task("/spec2pr 42")
     store.transition(task.task_id, RECEIVED, FAILED, "boom", error="boom")
-    same, status = await retry_task(store, make_config(), notifier, task.task_id, "boss@redzone.co")
+    same, status = await retry_task(store, make_config(), notifier, task.task_id, "boss@example.com")
     assert status == "cannot retry an issue-backed task — re-approve its issue instead"
     assert same.task_id == task.task_id
     assert "ack" not in notifier.kinds()

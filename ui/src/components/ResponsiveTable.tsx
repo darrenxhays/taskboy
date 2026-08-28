@@ -38,9 +38,9 @@ export function CardMeta({ children }: { children: ReactNode }) {
 }
 
 /** Touch-friendly action row, right-aligned with a separating hairline. Stops propagation so it works inside a tappable RowCard. */
-export function CardActions({ children }: { children: ReactNode }) {
+export function CardActions({ children, className = "justify-end" }: { children: ReactNode; className?: string }) {
   return (
-    <div className="mt-2.5 flex flex-wrap items-center justify-end gap-2 border-t pt-2.5" style={{ borderColor: "var(--hairline)" }} onClick={(event) => event.stopPropagation()}>
+    <div className={`mt-2.5 flex flex-wrap items-center gap-2 border-t pt-2.5 ${className}`} style={{ borderColor: "var(--hairline)" }} onClick={(event) => event.stopPropagation()}>
       {children}
     </div>
   );

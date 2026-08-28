@@ -1,10 +1,11 @@
 """viewer identity from the alb's signed oidc header.
 
 the alb runs the auth0 sign-in flow at the edge; every forwarded request carries
-x-amzn-oidc-data, an ES256 jwt signed by the alb. the instance security group only
-admits traffic from the alb, so a request bearing a valid header is a signed-in
-user. the app still verifies the signature (defense in depth) and enforces the
-email domain because auth0 cannot restrict it at the alb.
+x-amzn-oidc-data, an ES256 jwt signed by the alb. the regional key endpoint serves
+signing keys for every alb in the region across all aws accounts, so a validly-signed
+token alone doesn't prove it came from our alb (sg misconfig, vpc pivot, ssrf) - pinning
+the header's signer claim to dashboard.expected_alb_arn is what makes it trustworthy.
+the app also enforces the email domain because auth0 cannot restrict it at the alb.
 
 read access: any account under dashboard.allowed_email_domain.
 write access: emails listed in dashboard.admin_emails (config.yaml).
@@ -69,6 +70,9 @@ async def viewer_from_request(request: Request) -> Viewer:
     try:
         header = json.loads(_b64url_decode(token.split(".")[0]))
         kid = header["kid"]
+        # the regional key endpoint serves every alb in the region, so pin the signer
+        if header.get("signer") != config.expected_alb_arn:
+            raise NotAuthenticated("identity header signer does not match the expected alb")
         key = await _public_key(request, kid)
         claims = jwt.decode(token, key, algorithms=["ES256"])
     except (jwt.PyJWTError, KeyError, ValueError, IndexError, binascii.Error, json.JSONDecodeError) as e:

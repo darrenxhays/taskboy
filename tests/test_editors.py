@@ -53,6 +53,29 @@ def test_reviewer_personality_missing_path_is_not_a_target():
         target_for(config, "reviewer_personality", None)
 
 
+# -- /help: curated help.md is editable like personality --------------------
+
+
+def test_help_is_editable(tmp_path):
+    help_file = tmp_path / "help.md"
+    help_file.write_text("Here's how to work with the agent.")
+    config = make_config(help_path=str(help_file))
+
+    assert "help" in EDITABLE_KINDS
+    target, repo_path, title = target_for(config, "help", None)
+    assert target == help_file and repo_path == "config/help.md" and title == "Help"
+
+    validate("help", None, "Updated usage guide.", target)  # non-empty passes
+    with pytest.raises(ValueError):
+        validate("help", None, "   \n  ", target)  # whitespace-only rejected
+
+
+def test_help_missing_path_is_not_a_target():
+    config = make_config(help_path=None)
+    with pytest.raises(EditorError):
+        target_for(config, "help", None)
+
+
 # -- conventions doc is editable --------------------------------------------
 
 

@@ -12,10 +12,33 @@ from taskboy.store import Store
 logger = logging.getLogger("taskboy.workspace")
 
 
+# task workspaces may only push agent/ branches (#95); git hands the hook the resolved refs
+PRE_PUSH_HOOK = """#!/bin/sh
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$remote_ref" in
+        refs/heads/agent/*) ;;
+        *)
+            echo "push to $remote_ref is blocked: task workspaces may only push agent/ branches" >&2
+            exit 1
+            ;;
+    esac
+done
+exit 0
+"""
+
+
+def hooks_dir(workspace: Path) -> Path:
+    return workspace / "githooks"
+
+
 def create(workspaces_root: str, task_id: str) -> Path:
     workspace = Path(workspaces_root) / task_id
-    for sub in ("repo", "notes", "home"):
+    for sub in ("repo", "notes", "home", "githooks"):
         (workspace / sub).mkdir(parents=True, exist_ok=True)
+    # advisory: the session can rewrite this file — remote branch protection is the enforcement point
+    hook = hooks_dir(workspace) / "pre-push"
+    hook.write_text(PRE_PUSH_HOOK)
+    hook.chmod(0o755)
     workspace.chmod(0o700)
     return workspace
 
@@ -27,7 +50,7 @@ def delete(workspaces_root: str, task_id: str) -> None:
 
 
 def sweep_once(store: Store, workspaces_root: str, memory_root: str, retention: dict) -> dict:
-    """delete expired workspaces, memory summaries, and dedup rows per the retention config.
+    """delete expired workspaces, memory summaries, dedup rows, and error rows per the retention config.
 
     completed workspaces go early; failed/cancelled are kept longer for diagnosis (REL-007).
     blocked tasks are not terminal and are never swept — their workspace is needed for resume.
@@ -53,9 +76,10 @@ def sweep_once(store: Store, workspaces_root: str, memory_root: str, retention: 
                 memories += 1
 
     events = store.purge_slack_events(_cutoff(now, retention.get("slack_events_days", 7)))
-    if workspaces or memories or events:
-        logger.info("retention sweep: %s workspaces, %s memory files, %s slack events removed", workspaces, memories, events)
-    return {"workspaces": workspaces, "memories": memories, "slack_events": events}
+    errors = store.purge_errors(_cutoff(now, retention.get("errors_days", 30)))
+    if workspaces or memories or events or errors:
+        logger.info("retention sweep: %s workspaces, %s memory files, %s slack events, %s errors removed", workspaces, memories, events, errors)
+    return {"workspaces": workspaces, "memories": memories, "slack_events": events, "errors": errors}
 
 
 def _cutoff(now: datetime, days: int) -> str:

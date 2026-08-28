@@ -428,7 +428,7 @@ def step_dashboard(data, env) -> None:
 
 
 def step_content(data, env) -> None:
-    say("\n== Conventions & personality ==")
+    say("\n== Conventions, personality & help ==")
     conventions = data.setdefault("conventions", {})
     current = str(conventions.get("file") or "")
     if ask_yes("Set up an engineering-conventions doc? (injected into every repo task)", default=not current):
@@ -449,6 +449,18 @@ def step_content(data, env) -> None:
         if not target.exists():
             shutil.copyfile(TEMPLATES_ROOT / "personality_reviewer.example.md", target)
         reviewer["personality_file"] = ask("Reviewer personality file", str(reviewer.get("personality_file") or "personality_reviewer.md"))
+    help_section = data.setdefault("help", {})
+    if ask_yes("Set up a curated /help reply? (answered instantly in Slack, no task created)", default=bool(help_section.get("file"))):
+        target = CONFIG_PATH.parent / "help.md"
+        if not target.exists():
+            content = (TEMPLATES_ROOT / "help.example.md").read_text()
+            # drop the instruction-comment header; it's for readers of the template, not slack users
+            content = "\n".join(line for line in content.splitlines() if not line.startswith("#")).lstrip("\n") + "\n"
+            content = content.replace("{{agent_name}}", str((data.get("agent") or {}).get("name") or "Agent"))
+            content = content.replace("Dashboard: {{dashboard_url}}\n\n", f"Dashboard: {data['dashboard']['public_url']}\n\n" if (data.get("dashboard") or {}).get("public_url") else "")
+            target.write_text(content)
+            say(f"  created {target} from the template — trim it to the skills you actually installed.")
+        help_section["file"] = ask("Help file (relative to config.yaml)", str(help_section.get("file") or "help.md"))
 
 
 def template_variables(data) -> dict[str, str]:

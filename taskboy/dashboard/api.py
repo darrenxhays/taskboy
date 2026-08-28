@@ -18,7 +18,7 @@ from taskboy.dashboard import gitops
 from taskboy.dashboard.auth import Viewer, require_admin, require_viewer, require_viewer_write
 from taskboy.dashboard.editors import EDITABLE_KINDS, atomic_write, contains_secret_submission, content_hash, target_for, unified_diff, validate
 from taskboy.dashboard.render import bounded_text, redact_bounded_value, redact_value, safe_text
-from taskboy.issue_runs import start_implementation_run, start_issue_task, start_refine_task
+from taskboy.issue_runs import IMPLEMENTATION_BATCH_SIZE, start_implementation_run, start_issue_task, start_refine_task
 from taskboy.models import CANCELLED, EFFORT_LEVELS, FAILED, RUNNING, STATES, TERMINAL_STATES, Task, utcnow
 from taskboy.scheduler import fire_schedule_now, next_run_after
 from taskboy.skills import SkillError
@@ -382,6 +382,35 @@ async def refine_issue(request: Request, issue_id: int, viewer: Viewer = Depends
     return {"status": status, "task_id": task_id}
 
 
+@router.post("/api/issues/{issue_id}/implement")
+async def implement_issue(request: Request, issue_id: int, viewer: Viewer = Depends(require_admin)) -> dict:
+    """the per-issue rocket action: approve (if needed) and jump the queue for this one issue."""
+    store = request.app.state.store
+    existing = store.get_issue(issue_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="issue not found")
+    if existing["status"] not in ("proposed", "approved"):
+        raise HTTPException(status_code=409, detail="issue is not eligible for implementation")
+    task, status, active_task_id = await start_implementation_run(
+        store,
+        request.app.state.config,
+        request.app.state.notifier,
+        issue_ids=[issue_id],
+        actor=viewer.email,
+        thread_key=f"dashboard-implement:{viewer.email}@{utcnow()}",
+    )
+    task_id = task.task_id if task else active_task_id
+    if status == "already_running":
+        raise HTTPException(status_code=409, detail=f"implementation already running: {task_id}")
+    if status == "no_approved_issues":
+        raise HTTPException(status_code=409, detail="issue is not eligible for implementation")
+    store.add_admin_event(viewer.email, "issue_implement", str(issue_id), status, {"task_id": task_id})
+    orchestrator = request.app.state.orchestrator
+    if orchestrator is not None:
+        orchestrator.wake.set()
+    return {"status": status, "task_id": task_id}
+
+
 @router.delete("/api/issues/{issue_id}")
 async def delete_issue(request: Request, issue_id: int, viewer: Viewer = Depends(require_admin)) -> dict:
     store = request.app.state.store
@@ -406,25 +435,51 @@ async def bulk_issues(request: Request, viewer: Viewer = Depends(require_admin))
     action = str(body.get("action") or "")
     if not isinstance(ids, list) or not ids or not all(isinstance(value, int) and not isinstance(value, bool) for value in ids):
         raise HTTPException(status_code=400, detail="ids must be a non-empty list of integers")
-    if action not in ("approve", "deny", "refine", "delete"):
-        raise HTTPException(status_code=400, detail="action must be approve, deny, refine, or delete")
+    if action not in ("approve", "deny", "refine", "delete", "implement"):
+        raise HTTPException(status_code=400, detail="action must be approve, deny, refine, delete, or implement")
     store = request.app.state.store
+    unique_ids = list(dict.fromkeys(ids))
     results = []
-    for issue_id in dict.fromkeys(ids):
-        if action in ("approve", "deny"):
-            row = store.decide_issue(issue_id, "approved" if action == "approve" else "denied", viewer.email)
-            results.append({"id": issue_id, "status": ("approved" if action == "approve" else "denied") if row else "skipped"})
-        elif action == "delete":
-            # delete_issue already refuses in_progress/in_review rows
-            results.append({"id": issue_id, "status": "deleted" if store.delete_issue(issue_id) else "skipped"})
-        elif store.get_issue(issue_id) is None:
-            results.append({"id": issue_id, "status": "not_found"})
-        else:
-            task, status, active_task_id = await start_refine_task(store, request.app.state.config, request.app.state.notifier, issue_id, source=f"dashboard-bulk:{viewer.email}")
-            results.append({"id": issue_id, "status": status, "task_id": task.task_id if task else active_task_id})
+    if action == "implement":
+        eligible_ids = []
+        for issue_id in unique_ids:
+            row = store.get_issue(issue_id)
+            if row is None:
+                results.append({"id": issue_id, "status": "not_found"})
+            elif row["status"] not in ("proposed", "approved"):
+                results.append({"id": issue_id, "status": "skipped"})
+            else:
+                eligible_ids.append(issue_id)
+        # implement starts one coordinator scoped to the whole selection, so an over-cap selection is rejected outright rather than silently truncated
+        if len(eligible_ids) > IMPLEMENTATION_BATCH_SIZE:
+            raise HTTPException(status_code=400, detail=f"cannot implement more than {IMPLEMENTATION_BATCH_SIZE} issues at once ({len(eligible_ids)} eligible)")
+        if eligible_ids:
+            task, status, active_task_id = await start_implementation_run(
+                store,
+                request.app.state.config,
+                request.app.state.notifier,
+                issue_ids=eligible_ids,
+                actor=viewer.email,
+                thread_key=f"dashboard-bulk-implement:{viewer.email}@{utcnow()}",
+            )
+            task_id = task.task_id if task else active_task_id
+            results += [{"id": issue_id, "status": status, "task_id": task_id} for issue_id in eligible_ids]
+    else:
+        for issue_id in unique_ids:
+            if action in ("approve", "deny"):
+                row = store.decide_issue(issue_id, "approved" if action == "approve" else "denied", viewer.email)
+                results.append({"id": issue_id, "status": ("approved" if action == "approve" else "denied") if row else "skipped"})
+            elif action == "delete":
+                # delete_issue already refuses in_progress/in_review rows
+                results.append({"id": issue_id, "status": "deleted" if store.delete_issue(issue_id) else "skipped"})
+            elif store.get_issue(issue_id) is None:
+                results.append({"id": issue_id, "status": "not_found"})
+            else:
+                task, status, active_task_id = await start_refine_task(store, request.app.state.config, request.app.state.notifier, issue_id, source=f"dashboard-bulk:{viewer.email}")
+                results.append({"id": issue_id, "status": status, "task_id": task.task_id if task else active_task_id})
     store.add_admin_event(viewer.email, "issue_bulk", action, "completed", {"ids": ids, "results": results})
     orchestrator = request.app.state.orchestrator
-    if orchestrator is not None and action == "refine":
+    if orchestrator is not None and action in ("refine", "implement"):
         orchestrator.wake.set()
     return {"results": results}
 

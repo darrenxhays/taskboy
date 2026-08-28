@@ -18,7 +18,7 @@ Always inspect existing issues for this repo so you do not duplicate proposed, a
 
 For `{{self_repo}}`, also use `list_task_feedback`, `list_failed_tasks`, and `list_recent_errors` (limit 200) to study real task failures and recurring internal errors. For every other repo, ground findings in its current code, open pull requests/issues context available through GitHub tools, and recent `git log` history.
 
-Every tool response is capped around 4000 characters and truncates silently past that. `list_existing_issues` takes `offset` and `status` to page through the full table (add `keys_only: true` for compact id/dedupe_key/status rows when you just need to check for duplicates), and `list_recent_errors` takes `offset`, `component`, and `kind` to page to a specific recurring error and control the traceback tail length with `traceback_chars`. `list_failed_tasks` takes `offset`, `task_type`, and `query`. Make repeated calls with `offset` until a call returns fewer rows than `limit` to see the whole backlog.
+Every tool response is capped around 4000 characters and truncates silently past that. `list_existing_issues` takes `offset` and `status` to page through the full table (add `keys_only: true` for compact id/dedupe_key/status rows when you just need to check for duplicates), and `list_recent_errors` takes `offset`, `component`, and `kind` to page to a specific recurring error and control the traceback tail length with `traceback_chars`. `list_failed_tasks` takes `offset`, `task_type`, and `query`. `list_task_feedback` takes `offset`. Make repeated calls with `offset` until a call returns fewer rows than `limit` to see the whole backlog.
 
 ## Step 2 — Read the repository
 

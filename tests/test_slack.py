@@ -2,11 +2,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from slack_sdk.errors import SlackApiError
 
 from taskboy.config import Role, SlackConfig
 from taskboy.debug_feed import DebugFeed
 from taskboy.models import RECEIVED
-from taskboy.slack import THREAD_CONTEXT_MAX_CHARS, SlackNotifier, authorization_failure, clean_text, extract_overrides, fetch_dm_transcript, fetch_thread_transcript, handle_dm, handle_mention, normalize_effort
+from taskboy.slack import THREAD_CONTEXT_MAX_CHARS, SlackNotifier, authorization_failure, clean_text, extract_overrides, fetch_dm_transcript, fetch_thread_transcript, handle_dm, handle_mention, is_help_request, normalize_effort
 
 BOT = "UBOT"
 
@@ -176,6 +177,65 @@ async def test_unknown_skill_is_refused_with_available_list(store, config, notif
 
 
 @pytest.mark.asyncio
+async def test_help_mention_replies_immediately_without_task_or_model_call(store, config, notifier, tmp_path):
+    help_file = tmp_path / "help.md"
+    help_file.write_text("Usage guide for Red.")
+    config.help_path = str(help_file)
+    quick = AsyncMock()
+    task, status = await handle_mention(store, config, notifier, event(text="/help"), "Ev1", BOT, quick=quick)
+    assert task is None
+    assert status == "help"
+    assert store.count_tasks(RECEIVED) == 0
+    quick.try_answer.assert_not_awaited()
+    assert notifier.calls == [("answer", "C1", "100.1", "Usage guide for Red.")]
+
+
+@pytest.mark.asyncio
+async def test_help_mention_falls_through_when_no_help_file_configured(store, config, notifier):
+    assert config.help_path is None
+    task, status = await handle_mention(store, config, notifier, event(text="/help"), "Ev1", BOT)
+    assert status == "unknown_skill"
+    assert task is None
+
+
+@pytest.mark.asyncio
+async def test_help_mention_posts_outcome_to_debug_thread(store, config, tmp_path):
+    # every other early return in handle_mention posts an outcome to the debug thread — /help must too
+    help_file = tmp_path / "help.md"
+    help_file.write_text("Usage guide for Red.")
+    config.help_path = str(help_file)
+    client = AsyncMock()
+    client.users_info.return_value = {"user": {"team_id": "T1", "name": "ada", "profile": {}}}
+    client.chat_postMessage.return_value = {"ts": "900.1"}
+    client.chat_getPermalink.return_value = {"permalink": "https://slack.test/debug/900"}
+    debug = DebugFeed(client, store, "CDEBUG")
+    notifier = SlackNotifier(client, debug=debug, store=store)
+    task, status = await handle_mention(store, config, notifier, event(text="/help"), "Ev1", BOT, client=client)
+    assert task is None
+    assert status == "help"
+    posted_texts = [call.kwargs.get("text") for call in client.chat_postMessage.await_args_list]
+    assert any("Answered `/help`" in (text or "") for text in posted_texts)
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("/help", True),
+        ("/help me with a PR", True),
+        ("help", True),
+        ("HELP", True),
+        ("  help  ", True),
+        ("helpme", False),
+        ("please help me", False),
+        ("/helper", False),
+        ("investigate PROJ-123", False),
+    ],
+)
+def test_is_help_request_matches_narrowly(text, expected):
+    assert is_help_request(text) is expected
+
+
+@pytest.mark.asyncio
 async def test_model_override_honored_for_admins_only(store, config, notifier):
     admin_task, _ = await handle_mention(store, config, notifier, event(text="model:opus fix it", user="U1", ts="1.1"), "Ev1", BOT)
     assert admin_task.model_override == "opus"
@@ -227,9 +287,18 @@ class FakeSlackClient:
         self.history_calls = []
         self.reaction_error = None
         self.upload_error = None
+        self.conversations_open_result = None
+        self.conversations_open_error = None
+        self.conversations_open_calls = []
 
     async def chat_postMessage(self, **kwargs):
         self.posts.append(kwargs)
+
+    async def conversations_open(self, **kwargs):
+        self.conversations_open_calls.append(kwargs)
+        if self.conversations_open_error:
+            raise self.conversations_open_error
+        return self.conversations_open_result or {"channel": {"id": "DFALLBACK"}}
 
     async def reactions_add(self, **kwargs):
         if self.reaction_error:
@@ -360,6 +429,80 @@ async def test_notifier_post_failure_is_recorded_without_retry(store, make_task)
     assert store.recent_errors(1)[0]["task_id"] == task.task_id
 
 
+@pytest.mark.asyncio
+async def test_read_only_channel_falls_back_to_dm_instead_of_raising(store, make_task):
+    client = FakeSlackClient()
+    task = make_task("fix the bug")
+    original_post = client.chat_postMessage
+
+    async def failing_first_post(**kwargs):
+        if kwargs.get("channel") == task.slack_channel_id:
+            raise SlackApiError("read only", {"ok": False, "error": "restricted_action_read_only_channel"})
+        await original_post(**kwargs)
+
+    client.chat_postMessage = failing_first_post
+    notifier = SlackNotifier(client, ack_reaction=False, store=store)
+
+    await notifier.started(task)  # must not raise (#83)
+
+    assert client.conversations_open_calls == [{"users": "U1"}]
+    assert len(client.posts) == 1
+    assert client.posts[0]["channel"] == "DFALLBACK"
+    assert "DMing you instead" in client.posts[0]["text"]
+    errors = store.errors_for(task.task_id)
+    assert len(errors) == 1  # the fallback landed on the first try, so no dm_fallback row was added
+    assert errors[0]["kind"] == "SlackApiError"
+
+
+@pytest.mark.asyncio
+async def test_read_only_channel_falls_back_to_debug_when_no_user_or_dm_fails(store, make_task):
+    client = FakeSlackClient()
+    client.conversations_open_error = RuntimeError("dm unavailable")
+    debug = AsyncMock()
+    task = make_task("fix the bug")
+    original_post = client.chat_postMessage
+
+    async def failing_first_post(**kwargs):
+        if kwargs.get("channel") == task.slack_channel_id:
+            raise SlackApiError("read only", {"ok": False, "error": "restricted_action_read_only_channel"})
+        await original_post(**kwargs)
+
+    client.chat_postMessage = failing_first_post
+    notifier = SlackNotifier(client, ack_reaction=False, store=store, debug=debug)
+
+    await notifier.started(task)
+
+    debug.system_error.assert_awaited_once()
+    assert "slack" in debug.system_error.await_args.args
+    assert client.posts == []  # the DM attempt itself failed, so nothing else was posted to slack
+    errors = store.errors_for(task.task_id)
+    assert len(errors) == 2  # the read-only channel post failure, plus the dm_fallback failure
+    assert errors[0]["kind"] == "SlackApiError"
+    assert errors[1]["kind"] == "RuntimeError"  # the conversations_open failure ("dm unavailable")
+
+
+@pytest.mark.asyncio
+async def test_read_only_channel_for_github_origin_task_skips_dm_and_goes_to_debug(store):
+    # slack_user_id is "github" for system-origin tasks (#83 review) — not a real slack user, so a DM attempt would just fail
+    task, created = store.create_task(slack_team_id="github", slack_channel_id="CREVIEWS", slack_thread_ts="org/a#1@sha", slack_message_ts="org/a#1@sha", slack_user_id="github", request_text="/review url")
+    assert created
+    client = FakeSlackClient()
+
+    async def failing_post(**kwargs):
+        raise SlackApiError("read only", {"ok": False, "error": "restricted_action_read_only_channel"})
+
+    client.chat_postMessage = failing_post
+    debug = AsyncMock()
+    notifier = SlackNotifier(client, ack_reaction=False, store=store, debug=debug)
+
+    await notifier.started(task)
+
+    assert client.conversations_open_calls == []  # no DM attempted for a system identity
+    debug.system_error.assert_awaited_once()
+    errors = store.errors_for(task.task_id)
+    assert [e["kind"] for e in errors] == ["SlackApiError"]  # no dm_fallback row — the DM was never attempted
+
+
 def test_config_fixture_has_slack_enabled(config):
     assert config.slack.enabled
 
@@ -470,6 +613,36 @@ async def test_plain_dm_answers_without_creating_a_queued_task_and_dedupes(store
     assert store.count_tasks(RECEIVED) == 0
     assert notifier.calls == [("answer", "D1", None, "Conversational answer.")]
     assert "earlier" in quick.chat.call_args.kwargs["history"]
+
+
+# Slack resolves a leading "/help" typed into a DM as a slash command and never delivers it as a
+# message event, so only the bare word "help" is exercised here for the DM path. Casing is already
+# covered exhaustively by test_is_help_request_matches_narrowly.
+@pytest.mark.asyncio
+async def test_help_dm_replies_without_consuming_a_quick_answer_slot(store, config, notifier, tmp_path):
+    help_file = tmp_path / "help.md"
+    help_file.write_text("Usage guide for Red.")
+    config.help_path = str(help_file)
+    client = AsyncMock()
+    quick = AsyncMock()
+    dm = {"text": "help", "channel": "D1", "channel_type": "im", "user": "U1", "ts": "1", "team": "T1"}
+    status = await handle_dm(store, config, notifier, dm, "EvDMHelp", BOT, quick, client)
+    assert status == "help"
+    assert store.count_tasks(RECEIVED) == 0
+    quick.chat.assert_not_awaited()
+    assert notifier.calls == [("answer", "D1", None, "Usage guide for Red.")]
+
+
+@pytest.mark.asyncio
+async def test_help_dm_works_even_without_quick_answer_enabled(store, config, notifier, tmp_path):
+    help_file = tmp_path / "help.md"
+    help_file.write_text("Usage guide for Red.")
+    config.help_path = str(help_file)
+    client = AsyncMock()
+    dm = {"text": "help", "channel": "D1", "channel_type": "im", "user": "U1", "ts": "1", "team": "T1"}
+    status = await handle_dm(store, config, notifier, dm, "EvDMHelp2", BOT, None, client)
+    assert status == "help"
+    assert notifier.calls == [("answer", "D1", None, "Usage guide for Red.")]
 
 
 @pytest.mark.asyncio
@@ -728,6 +901,24 @@ async def test_issue_blocked_links_to_the_reopened_issue(make_task):
 
 
 @pytest.mark.asyncio
+async def test_issue_blocked_reports_a_tracked_pr_instead_of_a_reopen(make_task):
+    # #87 review: reopen_issue_and_cancel refetches the issue after transition(), so a task cancelled after it
+    # already opened a PR must be worded as "tracking that PR", not the default "reopened as proposed"
+    task = make_task()
+    task.blocked_reason = "runner crashed"
+    issue = {"id": 42, "status": "in_review", "pr_url": "https://github.com/example-org/taskboy/pull/9"}
+    client = FakeSlackClient()
+    notifier = SlackNotifier(client, dashboard_url="https://dash.example.test")
+
+    await notifier.issue_blocked(task, issue)
+
+    text = client.posts[0]["text"]
+    assert "https://github.com/example-org/taskboy/pull/9" in text
+    assert "reopened" not in text
+    assert "as `proposed`" not in text
+
+
+@pytest.mark.asyncio
 async def test_mention_fetches_profile_and_persists_debug_thread(store, config):
     client = AsyncMock()
     client.users_info.return_value = {"user": {"team_id": "T1", "name": "ada", "real_name": "Ada Lovelace", "profile": {"email": "ada@example.test"}}}
@@ -774,6 +965,29 @@ async def test_mention_reply_answers_blocked_questions_and_resumes(store, config
     assert [(r["answer_text"], r["answered_by"]) for r in rounds] == [("1. staging", "U1")]
     assert store.count_tasks(RECEIVED) == 0  # the reply never became a new task
     assert ("answer", "C1", "100.1", "Got it — resuming with your answers.") in notifier.calls
+
+
+@pytest.mark.asyncio
+async def test_help_mention_inside_blocked_thread_shows_usage_instead_of_answering(store, config, notifier, tmp_path):
+    from taskboy.models import BLOCKED, QUEUED, RUNNING
+
+    help_file = tmp_path / "help.md"
+    help_file.write_text("Usage guide for Red.")
+    config.help_path = str(help_file)
+
+    root, _ = await handle_mention(store, config, notifier, event(ts="100.1"), "Ev1", BOT)
+    store.transition(root.task_id, RECEIVED, QUEUED, "classified")
+    store.transition(root.task_id, QUEUED, RUNNING, "dispatched")
+    store.ask_questions(root.task_id, "1. Which env?")
+    store.transition(root.task_id, RUNNING, BLOCKED, "runner blocked", session_id="s-q")
+
+    task, status = await handle_mention(store, config, notifier, event(text="/help", ts="100.2", thread_ts="100.1"), "Ev2", BOT)
+
+    assert task is None
+    assert status == "help"
+    assert store.get_task(root.task_id).state == BLOCKED  # /help never consumed as the pending answer
+    assert store.answered_questions_for(root.task_id) == []
+    assert notifier.calls[-1] == ("answer", "C1", "100.1", "Usage guide for Red.")
 
 
 @pytest.mark.asyncio

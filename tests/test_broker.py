@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import time
@@ -12,6 +13,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from taskboy import workspace
 from taskboy.adapters.github_api import GitHubStatusError
 from taskboy.broker import PROFILE_PERMISSIONS, CredentialBroker
 from taskboy.models import QUEUED, RECEIVED
@@ -49,25 +51,43 @@ def routed(store, make_task, profile="standard", targets=None):
 
 def test_register_scopes_token_to_profile_and_targets(store, make_task, broker):
     task = routed(store, make_task, profile="read_only", targets=["org/service-a"])
-    env = broker.register_task(task, APPROVED)
+    env = broker.register_task(task, APPROVED, hooks_path="/ws/t1/githooks")
     grant = broker.grants[task.task_id]
     assert grant.permissions == PROFILE_PERMISSIONS["read_only"]
     assert grant.repositories == ["service-a"]
     assert env["TASKBOY_TASK_NONCE"] == grant.nonce
     assert env["GIT_CONFIG_KEY_0"] == "credential.helper"
+    assert env["GIT_CONFIG_KEY_1"] == "core.hooksPath"
+    assert env["GIT_CONFIG_VALUE_1"] == "/ws/t1/githooks"
     assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_register_task_env_fires_workspace_pre_push_hook(store, make_task, broker, tmp_path):
+    """a real git push through the injected env must run the workspace hook."""
+    ws = workspace.create(str(tmp_path / "ws"), "t1")
+    env = broker.register_task(routed(store, make_task), APPROVED, hooks_path=str(workspace.hooks_dir(ws)))
+    remote, clone = tmp_path / "remote.git", tmp_path / "clone"
+    subprocess.run(["git", "init", "--bare", "-q", str(remote)], check=True)
+    subprocess.run(["git", "clone", "-q", str(remote), str(clone)], check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "x"], cwd=clone, check=True)
+    git_env = {**os.environ, **{key: value for key, value in env.items() if key.startswith("GIT_")}}
+    denied = subprocess.run(["git", "push", "origin", "HEAD:main"], cwd=clone, env=git_env, capture_output=True, text=True)
+    allowed = subprocess.run(["git", "push", "origin", "HEAD:agent/t1-ok"], cwd=clone, env=git_env, capture_output=True, text=True)
+    assert denied.returncode != 0
+    assert "may only push agent/ branches" in denied.stderr
+    assert allowed.returncode == 0, allowed.stderr
 
 
 def test_register_ignores_unapproved_targets(store, make_task, broker):
     task = routed(store, make_task, targets=["org/not-approved"])
-    broker.register_task(task, APPROVED)
+    broker.register_task(task, APPROVED, hooks_path="/ws/t1/githooks")
     # nothing approved matched: falls back to the full approved list, never the unapproved repo
     assert broker.grants[task.task_id].repositories == ["service-a", "service-b"]
 
 
 def test_register_includes_operator_granted_repos_in_token_scope(store, make_task, broker):
     task = routed(store, make_task, profile="read_only", targets=["org/service-a"])
-    broker.register_task(task, APPROVED, granted_repos=["org/service-b"])
+    broker.register_task(task, APPROVED, granted_repos=["org/service-b"], hooks_path="/ws/t1/githooks")
     # the operator-granted repo joins the classification target in the minted token's scope, so
     # mid-session git ops against it authenticate instead of 403ing (GIT-014, §8.4)
     assert broker.grants[task.task_id].repositories == ["service-a", "service-b"]
@@ -76,7 +96,7 @@ def test_register_includes_operator_granted_repos_in_token_scope(store, make_tas
 @pytest.mark.asyncio
 async def test_tokens_are_cached_and_refreshed_near_expiry(store, make_task, broker):
     task = routed(store, make_task)
-    broker.register_task(task, APPROVED)
+    broker.register_task(task, APPROVED, hooks_path="/ws/t1/githooks")
     token1 = await broker.token_for_task(task.task_id)
     token2 = await broker.token_for_task(task.task_id)
     assert token1 == token2
@@ -89,7 +109,7 @@ async def test_tokens_are_cached_and_refreshed_near_expiry(store, make_task, bro
 @pytest.mark.asyncio
 async def test_minted_tokens_are_redacted_and_released(store, make_task, broker):
     task = routed(store, make_task)
-    broker.register_task(task, APPROVED)
+    broker.register_task(task, APPROVED, hooks_path="/ws/t1/githooks")
     token = await broker.token_for_task(task.task_id)
     assert redactor.redact(f"log line with {token}") == "log line with [redacted]"
     broker.release_task(task.task_id)
@@ -145,7 +165,7 @@ def test_app_jwt_is_valid_rs256(rsa_key, broker):
 @pytest.mark.asyncio
 async def test_socket_roundtrip_and_helper_script(store, make_task, broker, tmp_path):
     task = routed(store, make_task)
-    env = broker.register_task(task, APPROVED)
+    env = broker.register_task(task, APPROVED, hooks_path="/ws/t1/githooks")
     await broker.start()
     try:
         # raw socket round-trip

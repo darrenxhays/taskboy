@@ -1,7 +1,7 @@
 """github pull-request operations as permission-aware in-process mcp tools (TOL-001/004/005/006/007).
 
 credentials never reach the model or the task env: every call fetches a fresh broker token.
-writes are idempotent (check the artifacts table, then github, before creating — ORC-012),
+writes are idempotent (check github, and the artifacts table where github can't tell — ORC-012),
 recorded as artifacts, and bounded before entering model context. git itself (clone/commit/
 push) stays in Bash via the credential helper; these tools cover the api surface.
 """
@@ -59,11 +59,8 @@ class GitHubAdapter:
         if not head:
             return _error("head branch is required")
 
-        # idempotency layer 1: we already made a pr for this head (ORC-012)
-        for artifact in self.store.artifacts_for(self.task.task_id):
-            if artifact["kind"] == "pull_request" and artifact["external_id"].startswith(f"{repo}#"):
-                return _text(f"a pull request already exists for this task: {artifact['url']} — update it instead of creating another")
-        # idempotency layer 2: check github for an open pr with this head (crash-after-create window)
+        # idempotency check: github's own open-pr-by-head state is authoritative, so a retry after
+        # close_pull_request or a crash-after-create just finds no open pr and proceeds (issue #113).
         owner = repo.split("/", 1)[0]
         existing = await self._request("GET", f"/repos/{repo}/pulls?head={owner}:{head}&state=open")
         if existing:
@@ -100,7 +97,7 @@ class GitHubAdapter:
         state = str(args.get("state") or "open").lower()
         if state not in {"open", "closed", "all"}:
             return _error("state must be open, closed, or all")
-        pulls = await self._request("GET", f"/repos/{repo}/pulls?state={state}&per_page=50&sort=created&direction=desc")
+        pulls = await self._request("GET", f"/repos/{repo}/pulls?state={state}&per_page=100&sort=created&direction=desc")
         lines = []
         for pr in pulls:
             status = str(pr.get("state") or "") + (", draft" if pr.get("draft") else "")

@@ -49,6 +49,7 @@ class DashboardConfig:
     allowed_email_domain: str = ""  # any member of this email domain can view; required when enabled
     admin_emails: list[str] = field(default_factory=list)  # only these emails can edit/cancel/retry
     dev_user_email: str | None = None  # local-only identity when no alb header is present
+    expected_alb_arn: str = ""  # oidc header's "signer" claim must match this; empty fails closed (no real alb token has an empty signer)
     public_url: str = ""  # e.g. https://agent.example.com; empty disables dashboard links in slack posts
     commit_repo: str = ""  # e.g. example-org/taskboy; empty disables auto-commit of edits
     commit_branch: str = "main"
@@ -92,6 +93,7 @@ class Config:
     agent_name: str = "Agent"  # the main agent's display name, used in all user-facing text
     conventions_path: str | None = None
     personality_path: str | None = None
+    help_path: str | None = None
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     reviewer: ReviewerConfig = field(default_factory=ReviewerConfig)
     cli_update: CliUpdateConfig = field(default_factory=CliUpdateConfig)
@@ -136,7 +138,8 @@ def load_config(path: str) -> Config:
     roles = _roles_config(raw, slack)
     _validate_skills(raw)
     agent_name, personality_path = _agent_config(raw, path)
-    conventions_path = _conventions_path(raw, path)
+    conventions_path = _file_path(raw, path, "conventions")
+    help_path = _file_path(raw, path, "help")
     dashboard = _dashboard_config(raw.get("dashboard"), agent_name)
     reviewer = _reviewer_config(raw.get("reviewer"), path)
     cli_update = _cli_update_config(raw.get("cli_update"))
@@ -152,6 +155,7 @@ def load_config(path: str) -> Config:
         agent_name=agent_name,
         conventions_path=conventions_path,
         personality_path=personality_path,
+        help_path=help_path,
         dashboard=dashboard,
         reviewer=reviewer,
         cli_update=cli_update,
@@ -315,6 +319,9 @@ def _dashboard_config(section: object, agent_name: str) -> DashboardConfig:
     dev_user_email = section.get("dev_user_email")
     if dev_user_email is not None and not isinstance(dev_user_email, str):
         raise ConfigError(f"dashboard.dev_user_email must be a string or null, got {dev_user_email!r}")
+    expected_alb_arn = section.get("expected_alb_arn", "")
+    if not isinstance(expected_alb_arn, str):
+        raise ConfigError(f"dashboard.expected_alb_arn must be a string, got {expected_alb_arn!r}")
     public_url = section.get("public_url", "")
     if not isinstance(public_url, str) or (public_url and not public_url.startswith(("http://", "https://"))):
         raise ConfigError(f"dashboard.public_url must be an http(s) url or empty, got {public_url!r}")
@@ -342,6 +349,7 @@ def _dashboard_config(section: object, agent_name: str) -> DashboardConfig:
         allowed_email_domain=domain.lower(),
         admin_emails=[item.lower() for item in admin_emails],
         dev_user_email=dev_user_email or None,
+        expected_alb_arn=expected_alb_arn,
         public_url=public_url.rstrip("/"),
         commit_repo=commit_repo,
         commit_branch=commit_branch,
@@ -485,20 +493,20 @@ def _validate_skills(raw: dict) -> None:
         raise ConfigError(f"skills.profile {profile!r} is not configured")
 
 
-def _conventions_path(raw: dict, config_path: str) -> str | None:
-    if "conventions" not in raw:
+def _file_path(raw: dict, config_path: str, section_name: str) -> str | None:
+    if section_name not in raw:
         return None
-    section = raw["conventions"]
+    section = raw[section_name]
     if not isinstance(section, dict):
-        raise ConfigError("conventions section must be a mapping")
+        raise ConfigError(f"{section_name} section must be a mapping")
     file_value = section.get("file")
     if not isinstance(file_value, str):
-        raise ConfigError(f"conventions.file must be a string, got {file_value!r}")
+        raise ConfigError(f"{section_name}.file must be a string, got {file_value!r}")
     if not file_value:
         return None
     resolved = (Path(config_path).resolve().parent / file_value).resolve()
     if not resolved.is_file():
-        raise ConfigError(f"conventions.file not found: {resolved}")
+        raise ConfigError(f"{section_name}.file not found: {resolved}")
     return str(resolved)
 
 

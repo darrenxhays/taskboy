@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -143,6 +144,108 @@ async def test_not_due_does_not_fire(store):
     make_schedule(store, kind="daily", at_time="13:00", tzname="America/Los_Angeles", next_run_at="2026-07-23T20:00:00+00:00")
     fired = await fire_due(store, make_config(), RecordingNotifier(), datetime(2026, 7, 22, 20, 0, 0, tzinfo=UTC))
     assert fired == 0
+
+
+# -- refused fires (intake paused / queue full) must not consume the slot (#111) --------------------
+
+
+@pytest.mark.asyncio
+async def test_paused_intake_does_not_consume_the_slot(store):
+    store.meta_set("intake_paused", "1")
+    sched = make_schedule(store, kind="daily", at_time="13:00", tzname="America/Los_Angeles", next_run_at="2026-07-22T20:00:00+00:00")
+    now = datetime(2026, 7, 22, 20, 0, 30, tzinfo=UTC)
+    notifier = RecordingNotifier()
+    notifier.debug = AsyncMock()
+    fired = await fire_due(store, make_config(), notifier, now)
+    assert fired == 0
+    row = store.get_schedule(sched["id"])
+    assert row["run_count"] == 0 and row["enabled"] == 1
+    assert row["next_run_at"] == "2026-07-22T20:00:00+00:00"  # slot untouched, will retry next tick
+    assert row["last_task_id"] is None
+    assert store.list_tasks(limit=50) == []
+    errors = store.recent_errors()
+    assert len(errors) == 1 and errors[0]["kind"] == "fire_refused"
+    notifier.debug.system_error.assert_awaited_once()
+
+    # a second tick while still paused must not re-notify (dedup per schedule+slot)
+    await fire_due(store, make_config(), notifier, now + timedelta(seconds=30))
+    assert len(store.recent_errors()) == 1
+    notifier.debug.system_error.assert_awaited_once()
+
+    # once intake is unpaused, the very next tick fires the retried slot exactly once
+    store.meta_set("intake_paused", "0")
+    fired = await fire_due(store, make_config(), notifier, now + timedelta(seconds=60))
+    assert fired == 1
+    row = store.get_schedule(sched["id"])
+    assert row["run_count"] == 1
+    assert row["last_task_id"] is not None
+    assert len(store.list_tasks(limit=50)) == 1
+
+
+@pytest.mark.asyncio
+async def test_queue_full_does_not_consume_the_slot(store):
+    config = make_config(queue_max=0)
+    sched = make_schedule(store, kind="daily", at_time="13:00", tzname="America/Los_Angeles", next_run_at="2026-07-22T20:00:00+00:00")
+    now = datetime(2026, 7, 22, 20, 0, 30, tzinfo=UTC)
+    notifier = RecordingNotifier()
+    notifier.debug = AsyncMock()
+    fired = await fire_due(store, config, notifier, now)
+    assert fired == 0
+    row = store.get_schedule(sched["id"])
+    assert row["run_count"] == 0
+    assert row["next_run_at"] == "2026-07-22T20:00:00+00:00"
+    # gated before the attempt, so accept_task is never called and never writes its own "intake/queue_full"
+    # row — only the scheduler-level "fire_refused" audit exists
+    kinds = [e["kind"] for e in store.recent_errors()]
+    assert kinds.count("fire_refused") == 1
+    assert kinds.count("queue_full") == 0
+    notifier.debug.system_error.assert_awaited_once()
+
+    # further ticks while the queue stays full must not re-attempt accept_task (no fresh intake/queue_full
+    # rows piling up) nor re-notify
+    for i in range(1, 5):
+        fired = await fire_due(store, config, notifier, now + timedelta(seconds=30 * i))
+        assert fired == 0
+    kinds = [e["kind"] for e in store.recent_errors()]
+    assert kinds.count("fire_refused") == 1
+    assert kinds.count("queue_full") == 0
+    notifier.debug.system_error.assert_awaited_once()
+
+    # capacity returns -> the retried slot fires exactly once
+    fired = await fire_due(store, make_config(), notifier, now + timedelta(seconds=180))
+    assert fired == 1
+    row = store.get_schedule(sched["id"])
+    assert row["run_count"] == 1 and row["last_task_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_refused_implementation_schedule_does_not_consume_the_slot_or_leave_issues_reserved(store):
+    # the paused/queue_full gate runs before the implementation-run dispatch, so start_implementation_run never runs at all here
+    issue = approve_an_issue(store)
+    store.meta_set("intake_paused", "1")
+    sched = make_schedule(store, kind="daily", at_time="13:00", tzname="America/Los_Angeles", next_run_at="2026-07-22T20:00:00+00:00", request_text="/implementapprovedissues")
+    now = datetime(2026, 7, 22, 20, 0, 30, tzinfo=UTC)
+    notifier = RecordingNotifier()
+    notifier.debug = AsyncMock()
+    fired = await fire_due(store, make_config(), notifier, now)
+    assert fired == 0
+    row = store.get_schedule(sched["id"])
+    assert row["run_count"] == 0 and row["enabled"] == 1
+    assert row["next_run_at"] == "2026-07-22T20:00:00+00:00"
+    assert row["last_task_id"] is None
+    assert store.list_tasks(limit=50) == []
+    assert store.get_issue(issue["id"])["status"] == "approved"  # never reserved — gate short-circuits before dispatch
+    errors = store.recent_errors()
+    assert len(errors) == 1 and errors[0]["kind"] == "fire_refused"
+    notifier.debug.system_error.assert_awaited_once()
+
+    # once intake is unpaused, the retried slot fires exactly once and actually reserves the issue
+    store.meta_set("intake_paused", "0")
+    fired = await fire_due(store, make_config(), notifier, now + timedelta(seconds=30))
+    assert fired == 1
+    row = store.get_schedule(sched["id"])
+    assert row["run_count"] == 1 and row["last_task_id"] is not None
+    assert store.issues_reserved_by(row["last_task_id"]) != []
 
 
 # -- single-coordinator guard on the implementation schedule -----------------

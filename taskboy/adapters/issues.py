@@ -47,20 +47,21 @@ class IssuesAdapter:
 
     async def list_task_feedback(self, args: dict) -> dict:
         limit = min(int(args.get("limit", 50) or 50), 200)
+        offset = max(int(args.get("offset", 0) or 0), 0)
         out = []
-        for row in self.store.recent_feedback(limit):
+        for row in self.store.recent_feedback(limit, offset=offset):
             source = self.store.get_task(row["task_id"])
             out.append(
                 {
                     "task_id": row["task_id"],
                     "rating": row["rating"],
-                    "comment": row["comment"],
+                    "comment": (row["comment"] or "")[:300],
                     "request": source.request_text[:300] if source else None,
                     "result": (source.result_summary or "")[:300] if source else None,
                     "state": source.state if source else None,
                 }
             )
-        self._audit("list_task_feedback", {"count": len(out)}, False)
+        self._audit("list_task_feedback", {"count": len(out), "offset": offset}, False)
         return _text(json.dumps(out, ensure_ascii=False) if out else "no task feedback recorded yet")
 
     async def list_failed_tasks(self, args: dict) -> dict:
@@ -338,7 +339,18 @@ def build_issues_server(adapter: IssuesAdapter):
     from claude_agent_sdk import create_sdk_mcp_server, tool
 
     tools = [
-        tool("list_task_feedback", "List recent requester feedback on tasks, with each task's request and result, to find where the system fell short.", {"limit": int})(wrap(adapter.list_task_feedback, logger)),
+        tool(
+            "list_task_feedback",
+            "List recent requester feedback on tasks, with each task's request and result, to find where the system fell short. " "Use offset to page past the ~4000-char response cap.",
+            {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer"},
+                    "offset": {"type": "integer", "description": "skip this many rows by recency — page through a large backlog"},
+                },
+                "additionalProperties": False,
+            },
+        )(wrap(adapter.list_task_feedback, logger)),
         tool(
             "list_failed_tasks",
             "List recent failed and blocked tasks with their error/blocked reason, to find recurring failure modes. " "Use offset to page past the ~4000-char response cap; task_type/query narrow further.",

@@ -40,6 +40,12 @@ def test_example_config_is_valid():
         assert "mcp__slack__user_info" in tools
         assert "mcp__slack__get_file" in tools
         assert "mcp__jira__search_users" in tools
+        assert "ToolSearch" in tools  # deferred-tool schema lookup must be allowed in every profile (#94)
+        # the base task prompt (prompts.py) teaches every session to call these regardless of profile (#108)
+        assert "mcp__harness__report_progress" in tools
+        assert "mcp__harness__report_blocked" in tools
+        assert "mcp__harness__request_permission" in tools
+        assert "mcp__harness__ask_questions" in tools
     assert "mcp__slack__send_dm" not in config.raw["profiles"]["read_only"]["allowed_tools"]
     assert "mcp__slack__send_dm" in config.raw["profiles"]["standard"]["allowed_tools"]
     assert "mcp__slack__send_dm" in config.raw["profiles"]["deep"]["allowed_tools"]
@@ -245,6 +251,36 @@ def test_agent_name_personality_and_started_messages_paths(tmp_path):
         load_config(str(path))
 
 
+def test_help_file_resolves_relative_to_config(tmp_path):
+    help_file = tmp_path / "help.md"
+    help_file.write_text("Here's how to work with the agent.")
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID + "\nhelp: {file: help.md}\n")
+    assert load_config(str(path)).help_path == str(help_file.resolve())
+
+
+@pytest.mark.parametrize("section", ["", '\nhelp:\n  file: ""\n'])
+def test_help_absent_or_empty_disables_curated_file(tmp_path, section):
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID + section)
+    assert load_config(str(path)).help_path is None
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        "help: []\n",
+        "help: {file: 123}\n",
+        "help: {file: missing.md}\n",
+    ],
+)
+def test_invalid_help_config_fails(tmp_path, section):
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID + "\n" + section)
+    with pytest.raises(ConfigError, match="help"):
+        load_config(str(path))
+
+
 def test_legacy_personality_and_bot_name_keys_fail_with_pointers(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text(VALID + "\npersonality: {file: voice.md}\n")
@@ -364,6 +400,18 @@ def test_cli_update_rejects_non_boolean_enabled(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text(VALID + "cli_update:\n  enabled: yes-please\n")
     with pytest.raises(ConfigError, match="cli_update.enabled"):
+        load_config(str(path))
+
+
+def test_dashboard_expected_alb_arn_configurable_and_validated(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID + "dashboard:\n  expected_alb_arn: arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app/red-dashboard/abc123\n")
+    config = load_config(str(path))
+    assert config.dashboard.expected_alb_arn == "arn:aws:elasticloadbalancing:us-east-1:111122223333:loadbalancer/app/red-dashboard/abc123"
+    path.write_text(VALID + "dashboard: {}\n")
+    assert load_config(str(path)).dashboard.expected_alb_arn == ""
+    path.write_text(VALID + "dashboard:\n  expected_alb_arn: 12\n")
+    with pytest.raises(ConfigError, match="dashboard.expected_alb_arn must be a string"):
         load_config(str(path))
 
 

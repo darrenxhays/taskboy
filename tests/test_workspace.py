@@ -1,3 +1,6 @@
+import os
+import subprocess
+
 from taskboy import workspace
 from taskboy.models import COMPLETED, FAILED, QUEUED, RECEIVED, RUNNING
 
@@ -49,9 +52,37 @@ def test_sweep_purges_old_memory_and_slack_events(store, tmp_path):
     store.conn.commit()
     store.slack_event_seen("EvFresh")
 
+    store.add_error("runner", "timeout", "old failure")
+    store.conn.execute("UPDATE errors SET ts = datetime('now', '-31 days')")
+    store.conn.commit()
+
     counts = workspace.sweep_once(store, str(tmp_path / "ws"), str(tmp_path / "memory"), RETENTION)
     assert counts["memories"] == 1
     assert counts["slack_events"] == 1
+    assert counts["errors"] == 1
     assert not old_file.exists()
     assert (memory_dir / "t2.md").exists()
     assert store.slack_event_seen("EvFresh") is True  # still deduped
+
+
+def test_create_writes_pre_push_hook(tmp_path):
+    ws = workspace.create(str(tmp_path / "ws"), "t1")
+    hook = workspace.hooks_dir(ws) / "pre-push"
+    assert hook.read_text() == workspace.PRE_PUSH_HOOK
+    assert os.access(hook, os.X_OK)
+
+
+def test_pre_push_hook_blocks_non_agent_refs(tmp_path):
+    hook = tmp_path / "pre-push"
+    hook.write_text(workspace.PRE_PUSH_HOOK)
+
+    def push_refs(*lines):
+        # stdin format git feeds pre-push: <local ref> <local sha> <remote ref> <remote sha>
+        stdin = "".join(f"{ref} 1111 {ref} 2222\n" for ref in lines)
+        return subprocess.run(["sh", str(hook)], input=stdin, text=True, capture_output=True).returncode
+
+    assert push_refs("refs/heads/agent/t123-fix") == 0
+    assert push_refs() == 0  # nothing to push
+    assert push_refs("refs/heads/main") != 0
+    assert push_refs("refs/tags/v1.2.3") != 0  # release tags go through mcp__github__create_release
+    assert push_refs("refs/heads/agent/t123-fix", "refs/heads/main") != 0  # one bad ref fails the whole push

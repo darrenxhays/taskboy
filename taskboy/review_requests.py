@@ -33,6 +33,23 @@ def _is_transient(error: Exception) -> bool:
     return False
 
 
+def _should_page_debug(count: int, transient: bool) -> bool:
+    """non-transient failures page at count 1, then both kinds join the N, N**2, N**3, ... progression."""
+    if not transient and count == 1:
+        return True
+    power = DEBUG_PAGE_AFTER_CONSECUTIVE_FAILURES
+    while power < count:
+        power *= DEBUG_PAGE_AFTER_CONSECUTIVE_FAILURES
+    return power == count
+
+
+def _failure_signature(error: Exception) -> str:
+    """identifies an error's *shape*, so a shape change gets its own error row without resetting the streak count."""
+    if isinstance(error, GitHubStatusError):
+        return f"http:{error.status}"
+    return type(error).__name__
+
+
 class ReviewRequestPoller:
     def __init__(self, store, config, broker, notifier, reviewer_broker=None):
         self.store = store
@@ -58,6 +75,7 @@ class ReviewRequestPoller:
         self.token_expires_at = 0.0
         self.etags: dict[str, str] = {}
         self.consecutive_failures: dict[str, int] = {}
+        self.failure_signatures: dict[str, str] = {}
 
     async def run(self) -> None:
         while True:
@@ -88,45 +106,54 @@ class ReviewRequestPoller:
             try:
                 await self._sweep_repo(repo, token)
                 self.consecutive_failures.pop(repo, None)
+                self.failure_signatures.pop(repo, None)
             except Exception as e:
-                if isinstance(e, GitHubStatusError) and e.status == 401:
-                    # the token is shared across repos: every remaining repo would fail identically.
-                    self.token, self.token_expires_at = None, 0.0
-                    if not reminted:
+                abort_sweep = False
+                signature = _failure_signature(e)
+                first_failure_this_streak = self.failure_signatures.get(repo) != signature
+                if isinstance(e, GitHubStatusError) and (e.status == 401 or (e.status == 403 and e.retry_after is None)):
+                    abort_sweep = e.status == 401
+                    # clear so a healed permission is picked up next sweep, but never discard a token this sweep already minted for another repo
+                    if abort_sweep or not reminted:
+                        self.token, self.token_expires_at = None, 0.0
+                    if first_failure_this_streak and not reminted:
                         reminted = True
                         try:
                             token = await self._token()  # re-mints immediately
                             await self._sweep_repo(repo, token)
                             self.consecutive_failures.pop(repo, None)
-                            logger.warning("github rejected the cached review-poller token (401) for %s — re-minted and recovered in-sweep", repo)
+                            self.failure_signatures.pop(repo, None)
+                            logger.warning("github rejected the cached review-poller token (%s) for %s — re-minted and recovered in-sweep", e.status, repo)
                             continue
                         except Exception as retry_error:  # mint failed or the repo failed again post-mint
                             e = retry_error
-                            self.token, self.token_expires_at = None, 0.0
-                    self.store.add_error("review_poller", type(e).__name__, str(e), traceback=traceback.format_exc(), context={"repository": repo})
-                    debug = getattr(self.notifier, "debug", None)
-                    if debug is not None:
-                        await debug.system_error("review_poller", f"{repo}: {e} — cached token cleared, ending sweep early")
-                    logger.warning("review-poller token still failing after re-mint for %s — cleared cache, ending sweep early", repo)
-                    break
-                self.store.add_error("review_poller", type(e).__name__, str(e), traceback=traceback.format_exc(), context={"repository": repo})
+                            signature = _failure_signature(e)
+                            first_failure_this_streak = self.failure_signatures.get(repo) != signature
+                            if abort_sweep:
+                                self.token, self.token_expires_at = None, 0.0
+                self.failure_signatures[repo] = signature
                 count = self.consecutive_failures.get(repo, 0) + 1
                 self.consecutive_failures[repo] = count
-                if not _is_transient(e) or count == DEBUG_PAGE_AFTER_CONSECUTIVE_FAILURES:
+                if first_failure_this_streak:
+                    # count keeps climbing across a shape change so a flapping error can't re-arm the page-on-first rule
+                    self.store.add_error("review_poller", type(e).__name__, str(e), traceback="".join(traceback.format_exception(e)), context={"repository": repo})
+                if _should_page_debug(count, _is_transient(e)):
                     debug = getattr(self.notifier, "debug", None)
                     if debug is not None:
                         await debug.system_error("review_poller", f"{repo}: {e}")
-                logger.exception("github review-request poll failed for %s", repo)
+                # exc_info=e (not logger.exception, which reads sys.exc_info()) so a re-mint retry that reassigned
+                # `e` above logs the same exception that was just recorded to sqlite, not the pre-retry one
+                logger.error("github review-request poll failed for %s", repo, exc_info=e)
+                if abort_sweep:
+                    break
 
     async def _sweep_repo(self, repo: str, token: str) -> None:
-        path = f"/repos/{repo}/pulls?state=open&per_page=50"
-        status, headers, pulls = await self._get_with_retry(path, token)
-        if status == 304:
-            return
-        etag = headers.get("ETag") or headers.get("etag")
-        # don't cache while auto-follow-up is on: a 304 would skip the per-PR stall check
-        if etag and not self.auto_address_agent_prs:
-            self.etags[path] = str(etag)
+        pulls = await self._list_open_pulls(repo, token)
+        if pulls is None:
+            return  # a real 304 on page 1 — nothing changed since the last sweep
+        # _list_open_pulls always walks every page, so `pulls` is the complete open-pulls set —
+        # a missing number here is genuinely closed/merged, never just pushed off page 1 (issue #88)
+        self._cleanup_followup_meta_for_closed_prs(repo, {int(pr["number"]) for pr in pulls})
         for pr in pulls:
             reviewers = [(reviewer or {}).get("login") for reviewer in pr.get("requested_reviewers") or []]
             number = int(pr["number"])
@@ -180,6 +207,28 @@ class ReviewRequestPoller:
             if self.auto_address_agent_prs and reviewer_available and author_login == self.bot_login:
                 await self._maybe_follow_up_agent(repo, pr, number, head_sha, token)
 
+    async def _list_open_pulls(self, repo: str, token: str) -> list[dict] | None:
+        """page through open PRs at 100/page until a short page ends the walk (mirrors `_get_reviews`)."""
+        page1_path = f"/repos/{repo}/pulls?state=open&per_page=100&page=1"
+        status, headers, page_pulls = await self._get_with_retry(page1_path, token)
+        if status == 304:
+            return None
+        page_pulls = page_pulls or []
+        etag = headers.get("ETag") or headers.get("etag")
+        # don't cache while auto-follow-up is on: a 304 would skip the per-PR stall check
+        # don't cache a full page 1 either: a 304 would exit before page 2 (issue #88)
+        if etag and not self.auto_address_agent_prs and len(page_pulls) < 100:
+            self.etags[page1_path] = str(etag)
+        pulls = list(page_pulls)
+        page = 1
+        while len(page_pulls) == 100:
+            page += 1
+            path = f"/repos/{repo}/pulls?state=open&per_page=100&page={page}"
+            _, _, page_pulls = await self._get_with_retry(path, token)
+            page_pulls = page_pulls or []
+            pulls.extend(page_pulls)
+        return pulls
+
     async def _maybe_follow_up_agent(self, repo: str, pr: dict, number: int, head_sha: str, token: str) -> None:
         """when the reviewer has reviewed the current push of an agent-authored PR and hasn't approved, spawn the main
         agent to address it — up to `round_cap` rounds, then stop and ping `notify_channel` once instead of pinging every sweep."""
@@ -189,8 +238,18 @@ class ReviewRequestPoller:
         round_key = f"review_followup_round:{repo}#{number}"
         capped_key = f"review_followup_capped:{repo}#{number}"
         stalled_key = f"review_followup_stalled:{repo}#{number}@{head_sha}"
-        if self.store.meta_get(capped_key) == "1" or self.store.meta_get(stalled_key) == "1":
-            return  # already escalated — stop paying a paged reviews GET per sweep; a new push re-arms a stalled loop
+
+        capped_at_sha = self.store.meta_get(capped_key)
+        if capped_at_sha is not None:
+            if capped_at_sha in (head_sha, "1"):
+                # "1" is the legacy sentinel from before this row stored a head_sha (pre-existing capped rows
+                # at deploy time) — treat it as still capped rather than re-arming with no push having landed
+                return  # still capped for this exact push — stop paying a paged reviews GET per sweep
+            # a new push landed after the cap fired: a human intervened (pushed a fix, re-requested review),
+            # so give the loop a fresh round budget for it instead of leaving it dead for the pr's whole life
+            self.store.meta_delete(capped_key)
+            self.store.meta_delete(round_key)
+
         reviews = await self._get_reviews(repo, number, token)
         reviewer_reviews = [review for review in reviews if (review.get("user") or {}).get("login") == self.reviewer_bot_login and review.get("state") in {"APPROVED", "CHANGES_REQUESTED"}]
         latest = reviewer_reviews[-1] if reviewer_reviews else None  # github returns reviews in submission order
@@ -212,7 +271,10 @@ class ReviewRequestPoller:
         round_number = int(self.store.meta_get(round_key) or "0") + 1
         if round_number > self.round_cap:
             await self._escalate_once(
-                capped_key, f"review follow-up loop hit its {self.round_cap}-round cap on {html_url} — stopping and escalating", f"{self._loop_name} review loop on {html_url} hit its {self.round_cap}-round cap without {self.config.reviewer.name} approving — needs a human look."
+                capped_key,
+                f"review follow-up loop hit its {self.round_cap}-round cap on {html_url} — stopping and escalating",
+                f"{self._loop_name} review loop on {html_url} hit its {self.round_cap}-round cap without {self.config.reviewer.name} approving — needs a human look.",
+                value=head_sha,
             )
             return
         key = f"{repo}#{number}@{head_sha}:review:{latest.get('id')}"
@@ -230,6 +292,7 @@ class ReviewRequestPoller:
         )
         if status == "created":
             self.store.meta_set(round_key, str(round_number))
+            self.store.meta_delete(stalled_key)  # forward progress made — clear any stale stall marker for this head
             logger.info("created follow-up task %s for %s (round %d/%d)", task.task_id if task else "", key, round_number, self.round_cap)
         elif status == "queue_full":
             logger.warning("follow-up task refused because the queue is full: %s", key)
@@ -249,10 +312,10 @@ class ReviewRequestPoller:
         # also the poller's intake message_ts, so _maybe_follow_up_agent can look the reviewer task back up
         return f"reviewer:{repo}#{number}@{head_sha}"
 
-    async def _escalate_once(self, escalation_key: str, log_message: str, notify_message: str) -> None:
+    async def _escalate_once(self, escalation_key: str, log_message: str, notify_message: str, value: str = "1") -> None:
         """fire a warning + a single human-facing notification per `escalation_key`, falling back to the debug
         notifier when no `notify_channel` is configured — otherwise the escalation is a log line no human sees."""
-        if self.store.meta_get(escalation_key) == "1":
+        if self.store.meta_get(escalation_key) is not None:
             return
         logger.warning(log_message)
         if self.notify_channel:
@@ -260,9 +323,23 @@ class ReviewRequestPoller:
         else:
             debug = getattr(self.notifier, "debug", None)
             if debug is not None:
-                await debug.system_error("review_poller", notify_message)
+                posted = await debug.system_error("review_poller", notify_message)
+                if not posted:
+                    return  # suppressed by the cooldown — nothing landed
         # marked sent only after the notification lands — a failed send must retry on the next sweep
-        self.store.meta_set(escalation_key, "1")
+        self.store.meta_set(escalation_key, value)
+
+    def _cleanup_followup_meta_for_closed_prs(self, repo: str, open_numbers: set[int]) -> None:
+        """sweep meta for any pr this repo still has follow-up rows for but that is no longer in the open list."""
+        for key in self.store.meta_keys_with_prefix("review_followup_"):
+            # key shapes: review_followup_{round,capped}:{repo}#{number}, review_followup_stalled:{repo}#{number}@{sha}
+            _, _, rest = key.partition(":")
+            pr_repo, _, suffix = rest.partition("#")
+            if pr_repo != repo:
+                continue
+            number_part = suffix.split("@", 1)[0]
+            if number_part.isdigit() and int(number_part) not in open_numbers:
+                self.store.meta_delete(key)
 
     async def _get_reviews(self, repo: str, number: int, token: str) -> list[dict]:
         reviews: list[dict] = []

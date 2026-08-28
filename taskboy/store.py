@@ -841,8 +841,8 @@ class Store:
         rows = self.conn.execute("SELECT * FROM task_feedback WHERE task_id = ? ORDER BY id", (task_id,)).fetchall()
         return [dict(row) for row in rows]
 
-    def recent_feedback(self, limit: int = 100) -> list[dict]:
-        rows = self.conn.execute("SELECT * FROM task_feedback ORDER BY updated_at DESC, id DESC LIMIT ?", (min(max(limit, 1), 1000),)).fetchall()
+    def recent_feedback(self, limit: int = 100, offset: int = 0) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM task_feedback ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?", (min(max(limit, 1), 1000), max(offset, 0))).fetchall()
         return [dict(row) for row in rows]
 
     # -- issues (issues loop: discovery -> approval -> implementation) --
@@ -978,7 +978,7 @@ class Store:
         return reopened
 
     def reopen_linked_issue(self, task: Task) -> dict | None:
-        """hand a task's linked issue back to `proposed`, clearing its claim; a no-op if not issue-backed or already left in_progress."""
+        """hand a task's linked issue back to `proposed`, or track its PR instead of reopening if one was already opened (#87)."""
         issue = self.issue_for_task(task.task_id)
         if issue is None:
             return None
@@ -987,26 +987,46 @@ class Store:
         pending = self.pending_questions_for(task.task_id)
         if pending is not None:
             parts.append(f"Open questions:\n{pending['questions']}")
+        # a task can touch more than one approved repo, so match this issue's repo; a close-then-recreate leaves
+        # an earlier closed-pr artifact alongside the new one, so take the most recently recorded match (#88)
+        matching_pr_artifacts = [a for a in self.artifacts_for(task.task_id) if a["kind"] == "pull_request" and a["url"] and a["external_id"].startswith(f"{issue['repo']}#")]
+        pr_artifact = matching_pr_artifacts[-1] if matching_pr_artifacts else None
+        if pr_artifact is not None:
+            if issue["status"] != "in_progress":
+                return None
+            # so issue_runs.sync_in_review's merge/close check decides its outcome instead of a blind reopen
+            tracked = self.finish_issue(issue["id"], "in_review", pr_artifact["url"])
+            if tracked is None:
+                return None
+            parts.append(f"it had already opened {pr_artifact['url']} — tracking that PR instead of reopening this issue")
+            self.add_issue_comment(issue["id"], "agent", "\n\n".join(parts))
+            return tracked
         return self._reopen_issue_row(issue["id"], "\n\n".join(parts))
 
-    def reopen_stranded_issues(self) -> int:
-        """startup safety net: reopens in_progress issues left behind by a task that finished terminally before transition()'s hook could catch it, or with no linked task at all."""
+    def reopen_stranded_issues(self) -> dict[str, int]:
+        """startup safety net: resolves in_progress issues left behind by a task that finished terminally before
+        transition()'s hook could catch it, or with no linked task at all. counts split by actual outcome —
+        'reopened' back to proposed vs. 'tracked' as in_review behind an already-open PR (#87) — so a caller logging
+        the result doesn't claim a reopen for a row that was actually left tracking a PR."""
         rows = self.conn.execute(
             """SELECT issues.id AS issue_id, issues.task_id FROM issues
                LEFT JOIN tasks ON tasks.task_id = issues.task_id
                WHERE issues.status = 'in_progress'
                  AND (issues.task_id IS NULL OR tasks.state IN ('failed', 'cancelled', 'refused', 'completed'))"""
         ).fetchall()
-        count = 0
+        counts = {"reopened": 0, "tracked": 0}
         for row in rows:
             if row["task_id"] is None:
                 if self._reopen_issue_row(row["issue_id"], "reopened: left in_progress with no linked task") is not None:
-                    count += 1
+                    counts["reopened"] += 1
                 continue
             task = self.get_task(row["task_id"])
-            if task is not None and self.reopen_linked_issue(task) is not None:
-                count += 1
-        return count
+            if task is None:
+                continue
+            result = self.reopen_linked_issue(task)
+            if result is not None:
+                counts["tracked" if result["status"] == "in_review" else "reopened"] += 1
+        return counts
 
     def active_implementation_run(self) -> str | None:
         """the id of a not-yet-terminal /implementapprovedissues coordinator task, if one exists. used to keep the
@@ -1045,6 +1065,19 @@ class Store:
         # bounded match, not a raw substring: require a non-digit (or end of string) after the fragment so .../pull/7 doesn't match .../pull/70, and escape the fragment so any _/% in a repo/org name aren't treated as wildcards
         pattern = re.compile(re.escape(fragment) + r"(?![0-9])")
         return any(row["request_text"] and pattern.search(row["request_text"]) for row in rows)
+
+    def reserve_issues_by_id(self, reserved_by: str, ids: list[int]) -> list[dict]:
+        """atomically reserve exactly these approved issues by id, skipping any that aren't currently approved."""
+        if not ids:
+            return []
+        placeholders = ",".join("?" * len(ids))
+        self.conn.execute(
+            f"""UPDATE issues SET status = 'implementation_queued', reserved_by = ?, updated_at = ?
+                WHERE status = 'approved' AND id IN ({placeholders})""",
+            (reserved_by, utcnow(), *ids),
+        )
+        self.conn.commit()
+        return self.issues_reserved_by(reserved_by)
 
     def reserve_issues(self, reserved_by: str, limit: int = 5) -> list[dict]:
         """atomically reserve up to `limit` highest-priority approved issues for one implementation run,
@@ -1316,6 +1349,11 @@ class Store:
         rows = self.conn.execute("SELECT * FROM errors WHERE task_id = ? ORDER BY id", (task_id,)).fetchall()
         return [dict(row) for row in rows]
 
+    def purge_errors(self, cutoff_iso: str) -> int:
+        cur = self.conn.execute("DELETE FROM errors WHERE ts < ?", (cutoff_iso,))
+        self.conn.commit()
+        return cur.rowcount
+
     # -- dashboard administration audit -------------------------------------
 
     def add_admin_event(self, actor: str, action: str, target: str, outcome: str, detail: dict | None = None) -> None:
@@ -1345,3 +1383,11 @@ class Store:
     def meta_set(self, key: str, value: str) -> None:
         self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
         self.conn.commit()
+
+    def meta_delete(self, key: str) -> None:
+        self.conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        self.conn.commit()
+
+    def meta_keys_with_prefix(self, prefix: str) -> list[str]:
+        rows = self.conn.execute("SELECT key FROM meta").fetchall()
+        return [row["key"] for row in rows if row["key"].startswith(prefix)]

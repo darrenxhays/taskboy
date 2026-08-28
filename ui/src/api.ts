@@ -303,8 +303,9 @@ export const api = {
       body: JSON.stringify({ priority }),
     }),
   refineIssue: (id: number) => request<{ status: string; task_id: string | null }>(`/api/issues/${id}/refine`, { method: "POST", headers: { "x-harness-dashboard": "1" } }),
+  implementIssue: (id: number) => request<{ status: string; task_id: string | null }>(`/api/issues/${id}/implement`, { method: "POST", headers: { "x-harness-dashboard": "1" } }),
   deleteIssue: (id: number) => request<{ status: string }>(`/api/issues/${id}`, { method: "DELETE", headers: { "x-harness-dashboard": "1" } }),
-  bulkIssues: (ids: number[], action: "approve" | "deny" | "refine" | "delete") =>
+  bulkIssues: (ids: number[], action: "approve" | "deny" | "refine" | "delete" | "implement") =>
     request<{ results: { id: number; status: string; task_id?: string | null }[] }>("/api/issues/bulk", {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-harness-dashboard": "1" },

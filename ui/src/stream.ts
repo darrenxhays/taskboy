@@ -40,48 +40,41 @@ export function useStreamSource(): StreamState {
 }
 
 // refetch helper: runs load() now and again whenever the stream version changes (throttled)
-export function useLiveData<T>(load: () => Promise<T>, deps: unknown[] = []): { data: T | null; error: string | null; reload: () => void } {
+export function useLiveData<T>(load: () => Promise<T>, deps: unknown[] = []): { data: T | null; error: string | null; reload: () => Promise<void> } {
   const { version } = useStream();
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [nonce, setNonce] = useState(0);
   const lastFetch = useRef(0);
-  const pending = useRef(false);
+  // bumped on every fetch (stream-driven or reload()); a response only applies if it's still the latest
+  const requestId = useRef(0);
+
+  const fetchNow = (): Promise<void> => {
+    lastFetch.current = Date.now();
+    const id = ++requestId.current;
+    return load()
+      .then((result) => {
+        if (id === requestId.current) {
+          setData(result);
+          setError(null);
+        }
+      })
+      .catch((e: Error) => {
+        if (id === requestId.current) setError(e.message);
+      });
+  };
 
   useEffect(() => {
-    let cancelled = false;
     const now = Date.now();
-    const run = () => {
-      lastFetch.current = Date.now();
-      pending.current = false;
-      load()
-        .then((result) => {
-          if (!cancelled) {
-            setData(result);
-            setError(null);
-          }
-        })
-        .catch((e: Error) => {
-          if (!cancelled) setError(e.message);
-        });
-    };
     // throttle stream-driven refetches to one per 1.5s
     const elapsed = now - lastFetch.current;
     if (elapsed >= 1500) {
-      run();
-    } else if (!pending.current) {
-      pending.current = true;
-      const timer = setTimeout(run, 1500 - elapsed);
-      return () => {
-        cancelled = true;
-        clearTimeout(timer);
-      };
+      fetchNow();
+    } else {
+      const timer = setTimeout(fetchNow, 1500 - elapsed);
+      return () => clearTimeout(timer);
     }
-    return () => {
-      cancelled = true;
-    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [version, nonce, ...deps]);
+  }, [version, ...deps]);
 
-  return { data, error, reload: () => setNonce((n) => n + 1) };
+  return { data, error, reload: fetchNow };
 }

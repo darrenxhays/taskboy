@@ -21,11 +21,15 @@ logger = logging.getLogger("taskboy.quick")
 
 TASK_ID_RE = re.compile(r"\bt\d{8}-[0-9a-f]{8}\b")
 
+# page once per streak so a total quick-answer outage isn't found only by reading the errors table (#97)
+QUICK_PAGE_AFTER_CONSECUTIVE_FAILURES = 5
+
 
 class QuickAnswer:
-    def __init__(self, store: Store, config: Config):
+    def __init__(self, store: Store, config: Config, debug=None):
         self.store = store
         self.config = config
+        self.debug = debug
         section = config.raw.get("quick_answer") or {}
         tier = section.get("tier", "haiku")
         models = config.raw.get("models") or {}
@@ -36,6 +40,7 @@ class QuickAnswer:
         self.timeout_seconds = float(section.get("timeout_seconds", 20))
         self.max_per_user_per_hour = int(section.get("max_per_user_per_hour", 30))
         self._attempts: dict[str, deque[float]] = {}
+        self._consecutive_failures = {"triage": 0, "dm": 0}
 
     async def try_answer(
         self,
@@ -82,8 +87,10 @@ class QuickAnswer:
                 classification = {key: validated[key] for key in CLASSIFICATION_SCHEMA["required"]}
                 if usage:
                     classification["_triage_usage"] = usage
+                self._consecutive_failures["triage"] = 0
                 return None, classification
             if result.get("action") != "answer" or not str(result.get("answer") or "").strip():
+                self._consecutive_failures["triage"] = 0
                 return None, None
             answer = str(result["answer"]).strip()
             latency = time.monotonic() - started
@@ -107,10 +114,12 @@ class QuickAnswer:
             if usage:
                 self.store.add_usage(task.task_id, "quick_answer", self.model_id, **usage)
             logger.info("quick answer completed for %s in %.3fs", task.task_id, latency)
+            self._consecutive_failures["triage"] = 0
             return task, None
         except Exception as e:
             logger.warning("quick answer escalated after failure: %s", e)
             self.store.add_error("quick_answer", type(e).__name__, str(e), traceback=traceback.format_exc(), context={"user_id": user_id, "channel_id": channel_id})
+            await self._on_model_failure("triage", str(e))
             return None, None
 
     async def chat(
@@ -139,6 +148,7 @@ class QuickAnswer:
             async with asyncio.timeout(self.timeout_seconds):
                 result, usage = await self._call_chat_model(prompt)
             if result.get("action") != "answer" or not str(result.get("answer") or "").strip():
+                self._consecutive_failures["dm"] = 0
                 return None, "escalate"
             answer = str(result["answer"]).strip()
             task = self.store.record_quick_answer(
@@ -157,11 +167,20 @@ class QuickAnswer:
                 self.store.add_event(task.task_id, "personality", {"hash": personality[1], "path": self.config.personality_path})
             if usage:
                 self.store.add_usage(task.task_id, "quick_answer", self.model_id, **usage)
+            self._consecutive_failures["dm"] = 0
             return task, "answer"
         except Exception as e:
             logger.warning("quick chat escalated after failure: %s", e)
             self.store.add_error("quick_answer", type(e).__name__, str(e), traceback=traceback.format_exc(), context={"user_id": user_id, "channel_id": channel_id, "mode": "dm"})
+            await self._on_model_failure("dm", str(e))
             return None, "escalate"
+
+    async def _on_model_failure(self, path: str, message: str) -> None:
+        """page the debug channel once per streak, per path, once failures reach the threshold."""
+        self._consecutive_failures[path] += 1
+        count = self._consecutive_failures[path]
+        if count == QUICK_PAGE_AFTER_CONSECUTIVE_FAILURES and self.debug is not None:
+            await self.debug.system_error("quick_answer", f"quick answer {path} path has failed {count} times in a row: {message}")
 
     def _allow_attempt(self, user_id: str, now: float) -> bool:
         cutoff = now - 3600

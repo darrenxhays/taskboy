@@ -169,14 +169,29 @@ class ClaudeRunner:
             self.store.add_event(task.task_id, "permissions_applied", applied_permissions)
         broker_env: dict[str, str] = {}
         cloned_repos: list[str] = []
+        failed_repo_clones: list[str] = []
         if task_broker is not None:
             for repo in scoped_targets:
-                if await repocache.refresh_one(task_broker, settings.REPOS_ROOT, repo, timeout=60) and await repocache.clone_from_mirror(settings.REPOS_ROOT, repo, ws / "repo" / repo.split("/", 1)[-1]):
+                dest = ws / "repo" / repo.split("/", 1)[-1]
+                if (dest / ".git").is_dir():
+                    # clone_from_mirror rmtrees dest on failure — don't re-clone over a prior attempt's tree
                     cloned_repos.append(repo)
+                    continue
+                refreshed = await repocache.refresh_one(task_broker, settings.REPOS_ROOT, repo, timeout=60)
+                cloned = refreshed and await repocache.clone_from_mirror(settings.REPOS_ROOT, repo, dest)
+                if cloned:
+                    cloned_repos.append(repo)
+                else:
+                    failed_repo_clones.append(repo)
+                    stage = "refresh" if not refreshed else "clone"
+                    detail = {"repository": repo, "stage": stage}
+                    self.store.add_error("runner", "repo_seed_failed", f"failed to pre-clone {repo} into workspace ({stage} step failed)", task_id=task.task_id, context=detail)
+                    self.store.add_event(task.task_id, "repo_seed_failed", detail)
         if task_broker is not None:
             # granted_repos are passed through so the live credential token is scoped to them too,
             # not just the task's original classification — otherwise mid-session git ops 403 (§8.4)
-            broker_env = task_broker.register_task(task, scoped_repos, granted_repos=granted_repos)
+            # git resolves core.hooksPath against its own cwd, so the path must be absolute (#75)
+            broker_env = task_broker.register_task(task, scoped_repos, granted_repos=granted_repos, hooks_path=str(workspace.hooks_dir(ws).resolve()))
         conventions_path = self.config.conventions_path
         inject_conventions = bool(scoped_targets) and conventions_path is not None
         if inject_conventions:
@@ -202,6 +217,7 @@ class ClaudeRunner:
             is_reviewer=is_reviewer,
             thread_context=task.thread_context,
             cloned_repos=cloned_repos,
+            failed_repo_clones=failed_repo_clones,
             skill=skill_prompt,
             conventions=inject_conventions,
             personality=personality[0] if personality else None,
@@ -319,8 +335,10 @@ class ClaudeRunner:
         final = None
         limit_resets_at: int | None = None
         saw_rejected_rate_limit = False
+        limit_minutes = task.max_runtime_minutes or 60
+        running_usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
         try:
-            async with asyncio.timeout((task.max_runtime_minutes or 60) * 60):
+            async with asyncio.timeout(limit_minutes * 60):
                 async with ClaudeSDKClient(options=options) as client:
                     await client.query(prompt)
                     async for message in client.receive_response():
@@ -338,22 +356,44 @@ class ClaudeRunner:
                                 saw_rejected_rate_limit = True
                         if is_result(message):
                             final = message
+                            continue
+                        # assistant frames carry per-turn usage; the result frame's is cumulative
+                        message_usage = getattr(message, "usage", None) or {}
+                        for key in running_usage:
+                            running_usage[key] += message_usage.get(key) or 0
         except TimeoutError:
-            error = f"exceeded the {task.max_runtime_minutes} minute runtime limit"
+            error = f"exceeded the {limit_minutes} minute runtime limit"
             self.store.add_error("runner", "timeout", error, task_id=task.task_id)
             return Outcome(state=FAILED, error=error, session_id=session_id)
         except Exception as e:
             if looks_model_unavailable(e):
                 raise ModelUnavailable(str(e)) from e
             raise
+        finally:
+            # the result frame's cumulative usage/cost are exact, unlike the running per-turn sum; record
+            # whichever we have, so this is the single site that persists usage either way (issue #101, #91)
+            record_usage = getattr(final, "usage", None) or running_usage
+            record_cost = getattr(final, "total_cost_usd", None)
+            if record_cost or any(record_usage.get(key) or 0 for key in running_usage):
+                self.store.add_usage(
+                    task.task_id,
+                    "subagent",
+                    model_id,
+                    input_tokens=record_usage.get("input_tokens"),
+                    output_tokens=record_usage.get("output_tokens"),
+                    cache_read_tokens=record_usage.get("cache_read_input_tokens"),
+                    cache_write_tokens=record_usage.get("cache_creation_input_tokens"),
+                    cost_usd=record_cost,
+                )
 
         cost = float(getattr(final, "total_cost_usd", 0) or 0)
         turns = int(getattr(final, "num_turns", 0) or 0)
-        usage = getattr(final, "usage", None) or {}
-        if usage or cost:
-            self.store.add_usage(task.task_id, "subagent", model_id, input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"), cache_read_tokens=usage.get("cache_read_input_tokens"), cache_write_tokens=usage.get("cache_creation_input_tokens"), cost_usd=cost)
         if blocked:
             return Outcome(state=BLOCKED, blocked_reason=blocked.get("reason", "blocked"), session_id=session_id, cost_usd=cost, num_turns=turns)
+        if final is None:
+            error = "session ended without a result message"
+            self.store.add_error("runner", "missing_result", error, task_id=task.task_id)
+            return Outcome(state=FAILED, error=error, session_id=session_id, cost_usd=cost, num_turns=turns)
         text = str(getattr(final, "result", "") or "")
         if getattr(final, "is_error", False):
             error = text or f"session ended with {getattr(final, 'subtype', 'an error')}"

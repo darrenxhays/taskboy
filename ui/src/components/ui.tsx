@@ -26,6 +26,17 @@ export function TrashIcon() {
   return <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3.5 4.5h9M6.5 4.5V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5M6 7.5v4M10 7.5v4M4.5 4.5l.6 8a1 1 0 0 0 1 .9h3.8a1 1 0 0 0 1-.9l.6-8" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" /></svg>;
 }
 
+export function RocketIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M8 1.3c2.1 1.2 3.4 3.6 3.4 6.2 0 1.6-.4 2.9-1 3.9H5.6c-.6-1-1-2.3-1-3.9 0-2.6 1.3-5 3.4-6.2z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
+      <circle cx="8" cy="6.8" r="1" fill="currentColor" />
+      <path d="M5.6 9.4L3.6 11l.5 2.2 1.9-1.2M10.4 9.4l2 1.6-.5 2.2-1.9-1.2" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M6.8 11.4c-.2.9-.2 1.8.2 2.6M9.2 11.4c.2.9.2 1.8-.2 2.6" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 export function PencilIcon() {
   return <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M11 2.5l2.5 2.5L5 13.5H2.5V11z" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" /></svg>;
 }
