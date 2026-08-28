@@ -173,7 +173,16 @@ async def test_unknown_skill_is_refused_with_available_list(store, config, notif
     assert task is None
     assert status == "unknown_skill"
     assert store.count_tasks(RECEIVED) == 0
-    assert notifier.calls == [("refuse_intake", "C1", "100.1", "unknown skill /nope — available: /monitor, /review")]
+    # installed skills plus the built-ins, sorted; /review is installed AND built-in — listed once
+    assert notifier.calls == [("refuse_intake", "C1", "100.1", "unknown skill /nope — available: /discoverissues, /implementapprovedissues, /monitor, /refineissue, /review, /spec2pr")]
+
+
+@pytest.mark.asyncio
+async def test_builtin_skill_invocation_is_accepted_without_an_installed_copy(store, config, notifier, tmp_path, monkeypatch):
+    monkeypatch.setattr("taskboy.settings.SKILLS_ROOT", str(tmp_path))  # empty: nothing installed
+    task, status = await handle_mention(store, config, notifier, event(text="/review https://github.com/org/a/pull/1"), "Ev1", BOT)
+    assert status == "created"
+    assert task is not None and task.request_text.startswith("/review ")
 
 
 @pytest.mark.asyncio

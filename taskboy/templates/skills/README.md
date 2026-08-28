@@ -1,9 +1,11 @@
 # Skill templates
 
-These directories are **templates**, not installed skills. The agent never loads them directly — they are instantiated into the top-level `skills/` directory, either by the `taskboy setup` wizard (the skills picker step fills in every variable from your answers) or by hand:
+These directories are **templates**. Most are instantiated into the top-level `skills/` directory before use, either by the `taskboy setup` wizard (the skills picker step fills in every variable from your answers) or by hand:
 
 1. Copy the template directory into `skills/` (keep the `<name>/SKILL.md` layout).
-2. Replace every `{{variable}}` placeholder in the copied `SKILL.md` with your value. No placeholder may remain — the loader does not substitute variables at runtime.
+2. Replace every `{{variable}}` placeholder in the copied `SKILL.md` with your value. No placeholder may remain in an installed skill — the loader does not substitute variables in `skills/` at runtime.
+
+**Exception — the built-ins.** The five skills the application itself invokes (`review`, `discoverissues`, `refineissue`, `spec2pr`, `implementapprovedissues`) are loaded straight from these templates when no copy exists in `skills/`, with their variables filled from live config at task time. Installing a copy into `skills/` overrides the packaged version.
 
 ## Variables
 

@@ -277,6 +277,20 @@ async def test_blue_persona_is_not_stamped_when_disabled_or_not_a_review(store, 
 
 
 @pytest.mark.asyncio
+async def test_builtin_skill_fast_paths_without_an_installed_copy(store, config, make_task, tmp_path, monkeypatch):
+    # /review is module-invoked (the review poller), so it must classify as a skill task even when the
+    # operator never installed the template — the packaged built-in resolves it
+    monkeypatch.setattr("taskboy.settings.SKILLS_ROOT", str(tmp_path))  # empty skills dir
+    classifier = make_classifier(store, config)
+    classifier._call_model = AsyncMock(side_effect=AssertionError("model should not run"))
+    fields = await classifier.classify(make_task("/review https://github.com/org/core/pull/1"))
+    classification = json.loads(fields["classification_json"])
+    assert fields["task_type"] == "skill"
+    assert classification["skill"] == "review"
+    classifier._call_model.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_unknown_skill_falls_through_to_model_classifier(store, config, make_task, tmp_path, monkeypatch):
     monkeypatch.setattr("taskboy.settings.SKILLS_ROOT", str(tmp_path))
     classifier = make_classifier(store, config)

@@ -79,10 +79,10 @@ class Classifier:
         if role is None:
             raise RoleRefusal(f"user {task.slack_user_id!r} has no configured role")
         invocation = skills.parse_invocation(task.request_text)
-        if invocation and invocation[0] in skills.available(settings.SKILLS_ROOT):
+        loaded = skills.resolve(settings.SKILLS_ROOT, invocation[0], skills.runtime_variables(self.config)) if invocation else None
+        if invocation and loaded is not None:
             name, args = invocation
             skill_config = self.config.raw.get("skills") or {}
-            loaded = skills.load(settings.SKILLS_ROOT, name)
             profile = str(loaded.profile or skill_config.get("profile", "standard"))
             approved_repos = ((self.config.raw.get("github") or {}).get("approved_repos") or []) if self.config.service_enabled("github") else []
             if role.repos is not None:

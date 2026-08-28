@@ -14,6 +14,12 @@ class SkillError(ValueError):
 # in-process capability servers a skill may opt into via `internal_tools:` frontmatter (wired by the runner)
 KNOWN_INTERNAL_TOOLS = {"issues", "enqueue"}
 
+# skills the application itself invokes — the review poller (/review), the issues pipeline
+# (/refineissue, /spec2pr, /implementapprovedissues), and scheduler seeds (/discoverissues).
+# resolve() falls back to the packaged template for these, so an operator who never installed
+# them still gets working app-driven features; installing a copy in SKILLS_ROOT overrides.
+BUILTIN_SKILLS = ("discoverissues", "implementapprovedissues", "refineissue", "review", "spec2pr")
+
 
 @dataclass
 class Skill:
@@ -38,6 +44,35 @@ def available(root: str | Path) -> list[str]:
     if not path.is_dir():
         return []
     return sorted(child.name for child in path.iterdir() if child.is_dir() and (child / "SKILL.md").is_file())
+
+
+def runtime_variables(config) -> dict[str, str]:
+    """the {{var}} values the built-in templates use, derived from live config at task time.
+    duck-typed on purpose: importing Config here would be circular."""
+    github = (config.raw.get("github") or {}) if config.service_enabled("github") else {}
+    return {
+        "agent_name": config.agent_name,
+        "self_repo": str(github.get("self_repo") or ""),
+        # the injected workspace copy is always named CONVENTIONS.md, so that reads fine when no file is configured
+        "conventions_file": str((config.raw.get("conventions") or {}).get("file") or "CONVENTIONS.md"),
+    }
+
+
+def resolve(root: str | Path, name: str, variables: dict[str, str] | None = None) -> Skill | None:
+    """an operator-installed skill always wins; module-invoked built-ins fall back to the packaged
+    template rendered with `variables`. returns None for a name that is neither installed nor built-in."""
+    if name in available(root):
+        return load(root, name)
+    if name not in BUILTIN_SKILLS:
+        return None
+    from taskboy import assets
+
+    skill = load(assets.TEMPLATES_ROOT / "skills", name)
+    description, body = skill.description, skill.body
+    for key, value in (variables or {}).items():
+        description = description.replace("{{" + key + "}}", value)
+        body = body.replace("{{" + key + "}}", value)
+    return Skill(name=skill.name, description=description, body=body, requires=skill.requires, model=skill.model, profile=skill.profile, internal_tools=skill.internal_tools)
 
 
 def load(root: str | Path, name: str) -> Skill:
@@ -79,8 +114,10 @@ def load(root: str | Path, name: str) -> Skill:
     return Skill(name=skill_name, description=description, body=match.group(2).rstrip(), requires=requires, model=model or None, profile=profile or None, internal_tools=internal_tools)
 
 
-def render(root: str | Path, name: str) -> str:
-    first = load(root, name)
+def render(root: str | Path, name: str, variables: dict[str, str] | None = None) -> str:
+    first = resolve(root, name, variables)
+    if first is None:
+        raise SkillError(f"skill /{name} is not installed")
     rendered = [first.body]
     seen = {name}
     queue = list(first.requires)
@@ -88,7 +125,10 @@ def render(root: str | Path, name: str) -> str:
         required_name = queue.pop(0)
         if required_name in seen:
             continue
-        required = load(root, required_name)
+        # requires resolve through the built-ins too, so an installed skill may depend on /review without a local copy
+        required = resolve(root, required_name, variables)
+        if required is None:
+            raise SkillError(f"skill /{required_name} is not installed")
         seen.add(required_name)
         rendered.append(f"### Included skill: /{required_name}\n{required.body}")
         queue.extend(required.requires)

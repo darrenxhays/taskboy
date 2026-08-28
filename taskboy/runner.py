@@ -132,8 +132,11 @@ class ClaudeRunner:
         if classification.get("skill"):
             name = str(classification["skill"])
             try:
-                skill = skills.load(settings.SKILLS_ROOT, name)
-                instructions = skills.render(settings.SKILLS_ROOT, name)
+                variables = skills.runtime_variables(self.config)
+                skill = skills.resolve(settings.SKILLS_ROOT, name, variables)
+                if skill is None:
+                    raise skills.SkillError(f"skill /{name} is not installed")
+                instructions = skills.render(settings.SKILLS_ROOT, name, variables)
             except (OSError, ValueError) as e:
                 self.store.add_error("runner", type(e).__name__, str(e), task_id=task.task_id, context={"skill": name})
                 return Outcome(state=FAILED, error=str(e))

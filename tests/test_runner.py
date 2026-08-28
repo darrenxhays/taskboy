@@ -459,15 +459,30 @@ async def test_skill_task_renders_instructions_into_prompt(store, config, make_t
 
 @pytest.mark.asyncio
 async def test_missing_skill_returns_failed_outcome(store, config, make_task, tmp_path, monkeypatch):
+    # a non-builtin name: built-ins like /review resolve from the packaged templates even with no skills dir
     monkeypatch.setattr("taskboy.settings.SKILLS_ROOT", str(tmp_path / "missing"))
     runner = make_runner(store, config, tmp_path)
     runner._run_session = AsyncMock()
     task = routed_task(store, make_task)
-    store.set_fields(task.task_id, classification_json='{"skill": "review", "skill_args": ""}')
+    store.set_fields(task.task_id, classification_json='{"skill": "slack2pr", "skill_args": ""}')
     outcome = await runner.run(store.get_task(task.task_id))
     assert outcome.state == FAILED
-    assert outcome.error == "skill /review is not installed"
+    assert outcome.error == "skill /slack2pr is not installed"
     runner._run_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_builtin_skill_runs_without_an_installed_copy(store, config, make_task, tmp_path, monkeypatch):
+    monkeypatch.setattr("taskboy.settings.SKILLS_ROOT", str(tmp_path / "missing"))
+    runner = make_runner(store, config, tmp_path)
+    runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
+    task = routed_task(store, make_task)
+    store.set_fields(task.task_id, classification_json='{"skill": "review", "skill_args": "https://example.test/pr/1"}')
+    outcome = await runner.run(store.get_task(task.task_id))
+    assert outcome.state == COMPLETED
+    prompt = runner._run_session.call_args.args[3]
+    assert "### Skill: /review" in prompt
+    assert "{{" not in prompt  # runtime variables substituted from config
 
 
 @pytest.mark.asyncio
