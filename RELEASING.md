@@ -1,8 +1,30 @@
 # Releasing TaskBoy to GitHub and PyPI
 
-How a change in this repository becomes a published `taskboy==X.Y.Z` package that operators can install. The short version: **merge to `main`, push a `vX.Y.Z` tag, and GitHub Actions does the rest** — it builds the dashboard UI, builds the wheel, verifies the packaged data, and publishes to PyPI with [trusted publishing](https://docs.pypi.org/trusted-publishers/) (no API tokens anywhere).
+How a change in this repository becomes a published `taskboy==X.Y.Z` package that operators can install. The short version: **land changes on `develop`, then `git hf release finish` — hubflow merges to `main`, tags `vX.Y.Z`, and pushes; the tag push triggers GitHub Actions**, which builds the dashboard UI, builds the wheel, verifies the packaged data, and publishes to PyPI with [trusted publishing](https://docs.pypi.org/trusted-publishers/) (no API tokens anywhere).
 
 Operators never install from this repo directly. They pin `taskboy==X.Y.Z` in a private deployment repo created from the `taskboy-shell` template, and upgrade with a one-line version bump there.
+
+---
+
+## Branching model (HubFlow)
+
+Both repos follow GitFlow via [HubFlow](https://datasift.github.io/gitflow/):
+
+- `develop` — the integration branch. All feature PRs target it; CI runs the full check suite on every PR (`.github/workflows/pull_request_checks.yaml` triggers on PRs to both `develop` and `main`).
+- `main` — release history only. It moves **only** when `git hf release finish` or `git hf hotfix finish` merges and pushes it. Nothing is deployed or published from `develop`.
+- `feature/*`, `release/*`, `hotfix/*` — standard hubflow prefixes.
+
+One-time per clone, initialize hubflow and set the version tag prefix so finished releases produce the `vX.Y.Z` tags the release workflow listens for:
+
+```bash
+git hf init
+# production branch:  main
+# integration branch: develop
+# prefixes:           accept the defaults (feature/, release/, hotfix/, support/)
+# Version tag prefix: v          ← important: makes `git hf release finish 0.1.0` tag v0.1.0
+```
+
+(If you skip the prefix, name your releases with the `v` included — `git hf release start v0.1.0` — so the tag still matches `v*.*.*`.)
 
 ---
 
@@ -18,44 +40,34 @@ Operators never install from this repo directly. They pin `taskboy==X.Y.Z` in a 
 
 ### 1.1 Push the application repository
 
-This checkout already has a remote: `https://github.com/darrenxhays/taskboy.git`. If that's the repo you want to publish from, just push:
+This checkout's remote is `https://github.com/darrenxhays/taskboy.git`. Push both hubflow branches:
 
 ```bash
 cd taskboy            # this repository
-git push origin main
+git push -u origin main develop
 ```
 
-If you'd rather publish under a different name/org, create the repo first and repoint the remote:
-
-```bash
-gh repo create <owner>/taskboy --public --source . --push
-# or manually:
-git remote set-url origin https://github.com/<owner>/<repo>.git
-git push -u origin main
-```
+(If the repo doesn't exist yet: `gh repo create darrenxhays/taskboy --public --source . --push`, then push `develop` too.)
 
 > Whatever owner/repo you end up with, **write it down** — the PyPI trusted publisher in Part 2 must name it exactly.
 
-### 1.2 Protect `main`
+### 1.2 Protect the branches
 
-In the GitHub repo: **Settings → Branches → Add branch ruleset** (or classic protection rule) for `main`:
+In the GitHub repo, **Settings → Branches** — the two branches need *different* rules, because hubflow pushes `main` directly (a require-PR rule on `main` would reject every `git hf release finish`):
 
-- Require a pull request before merging.
-- Require status checks to pass: `checks` and `ui` (the two jobs in `.github/workflows/pull_request_checks.yaml` — they run flake8, black/isort, mypy, the full pytest suite, the dashboard build, and a wheel package-data verification).
+- **`develop`**: require a pull request before merging; require the `checks` and `ui` status checks (the jobs in `pull_request_checks.yaml` — flake8, black/isort, mypy, full pytest, dashboard build, wheel package-data verification).
+- **`main`**: block direct pushes for everyone *except* the release manager — use a ruleset with a bypass list (or admin bypass) rather than a require-PR rule. Required status checks are fine to keep; PR requirement is not.
 
 ### 1.3 Push the shell template repository
 
-`taskboy-shell` (sibling directory to this repo) is the deployment template operators start from. It has no remote yet:
+`taskboy-shell` (sibling directory to this repo) is the deployment template operators start from. Its remote is `https://github.com/darrenxhays/taskboy-shell.git`:
 
 ```bash
 cd ../taskboy-shell
-gh repo create <owner>/taskboy-shell --public --source . --push
-# or create it in the UI, then:
-git remote add origin https://github.com/<owner>/taskboy-shell.git
-git push -u origin main
+git push -u origin main develop
 ```
 
-Then in that repo's GitHub **Settings → General**, check **Template repository**. Operators use "Use this template" (not a fork) to create their private deployment repo, per its `SETUP.md`.
+Then in that repo's GitHub **Settings → General**, check **Template repository**. Operators use "Use this template" (not a fork) to create their private deployment repo, per its `SETUP.md`. Apply the same branch-protection split as 1.2 (the shell's deploy fires on pushes to `main`, which hubflow release/hotfix finishes produce).
 
 ---
 
@@ -86,9 +98,9 @@ If you ever rename the GitHub repo or move it to an org, update the trusted publ
 
 ## Part 3 — Cutting a release
 
-### 3.1 Make sure `main` is green
+### 3.1 Make sure `develop` is green
 
-Everything you want to ship must be merged to `main` and passing CI. To double-check locally (same commands CI runs):
+Everything you want to ship must be merged to `develop` (via `git hf feature` branches + PRs) and passing CI. To double-check locally (same commands CI runs):
 
 ```bash
 make check          # dockerized lint + type + format + test
@@ -99,22 +111,24 @@ cd ui && npm ci && npm run build     # dashboard must build
 
 ### 3.2 Choose the version
 
-Semver, prefixed with `v`. There are no tags yet, so the first release is whatever you want to call it — `v0.1.0` is the conventional opener. After that:
+Semver, without the `v` (the tag prefix adds it). There are no tags yet, so the first release is whatever you want to call it — `0.1.0` is the conventional opener. After that:
 
-- **patch** (`v0.1.1`) — fixes, no config surface changes
-- **minor** (`v0.2.0`) — new features, new config keys with safe defaults
+- **patch** (`0.1.1`) — fixes, no config surface changes
+- **minor** (`0.2.0`) — new features, new config keys with safe defaults
 - **major** — breaking config or behavior changes an operator must act on
 
-### 3.3 Tag and push
+### 3.3 Run the hubflow release
 
 ```bash
 cd taskboy
-git checkout main && git pull
-git tag -a v0.1.0 -m "v0.1.0: first public release"
-git push origin v0.1.0
+git hf update && git checkout develop && git hf pull
+git hf release start 0.1.0
+# release/0.1.0 now exists — do release-only polish here if needed (notes, last-minute fixes);
+# anything committed on the release branch reaches BOTH main and develop at finish
+git hf release finish 0.1.0
 ```
 
-Pushing the tag is the deploy button. The `release` workflow now runs:
+`finish` merges `release/0.1.0` into `main` **and** back into `develop`, creates the `v0.1.0` tag (via the `v` version-tag prefix from `git hf init`), pushes all of it, and deletes the release branch. The tag push is the deploy button — the `release` workflow now runs:
 
 1. checkout with full history (setuptools-scm needs the tag),
 2. `npm ci && npm run build` → dashboard into `taskboy/ui_dist/`,
@@ -137,27 +151,39 @@ taskboy setup --local && taskboy run   # then, in another shell: taskboy inject 
 
 - Optionally create a GitHub Release from the tag with human-readable notes: `gh release create v0.1.0 --generate-notes` (PyPI publishing does not depend on this).
 
-### 3.5 If a release fails
+### 3.5 Hotfixes
 
-- **Workflow failed before the publish step** (lint, build, package-data check): fix on `main` via PR, then tag the *next* patch version. Don't delete and re-push a tag that ran CI — versions are cheap, ambiguity isn't.
+For an urgent fix that can't wait for the next develop release, branch off `main`:
+
+```bash
+git hf hotfix start 0.1.1
+# commit the fix on hotfix/0.1.1
+git hf hotfix finish 0.1.1     # merges to main + develop, tags v0.1.1, pushes → publishes
+```
+
+### 3.6 If a release fails
+
+- **Workflow failed before the publish step** (lint, build, package-data check): fix on `develop` via the normal flow, then cut the *next* patch release. Don't delete and re-push a tag that ran CI — versions are cheap, ambiguity isn't.
 - **`invalid-publisher` at the publish step**: the PyPI trusted publisher fields don't match the repo owner/name/workflow filename — fix them on PyPI and re-run the job.
-- **Version already exists on PyPI**: PyPI never accepts re-uploads of the same version. Tag the next patch.
+- **Version already exists on PyPI**: PyPI never accepts re-uploads of the same version. Cut the next patch.
+- **Tag came out without the `v` prefix** (hubflow init skipped the prefix): the workflow won't trigger. Re-check `git config hubflow.prefix.versiontag`, then push a correctly-prefixed tag on the same commit: `git tag -a v0.1.0 <sha> && git push origin v0.1.0`.
 
 ---
 
 ## Part 4 — Shipping the release to operators
 
-Operator deployments live in shell repos and pin an exact version. To roll your own deployment forward:
+Operator deployments live in shell repos and pin an exact version. The shell repos run hubflow too — a merge to a shell repo's `main` (i.e. finishing a shell release) is what actually deploys. To roll your own deployment forward:
 
 ```bash
 cd <your shell repo>
-# requirements.txt: taskboy==0.1.0  →  taskboy==0.2.0
-git checkout -b bump-taskboy-0.2.0
+git hf feature start bump-taskboy-0.2.0
 sed -i '' 's/^taskboy==.*/taskboy==0.2.0/' requirements.txt
-git commit -am "bump taskboy to 0.2.0" && git push
+git commit -am "bump taskboy to 0.2.0"
+git hf feature finish bump-taskboy-0.2.0     # or push and PR into develop
+git hf release start 0.2.0 && git hf release finish 0.2.0   # merge to main = deploy
 ```
 
-Open a PR; on merge to `main`, the shell repo's deploy workflow ships the pinned version and your `config/` + `skills/` to the host (see the shell's `SETUP.md`, section 3c).
+The shell's PR checks validate `config/` against the pinned version before anything merges, and its deploy workflow ships the pinned version and your `config/` + `skills/` to the host on the `main` push (see the shell's `SETUP.md`, section 3c).
 
 **Release-notes discipline:** when a release adds or changes config keys, say so in the GitHub Release notes with the exact YAML the operator should add. For example, the current unreleased head requires dashboard operators to set `dashboard.expected_alb_arn` (the app now pins the ALB OIDC header's signer and fails closed), and newly supports an optional `help.file` and `retention.errors_days` / `retention.blocked_task_*` keys.
 
@@ -167,13 +193,20 @@ Open a PR; on merge to `main`, the shell repo's deploy workflow ships the pinned
 
 ```bash
 # one-time
-git push origin main                          # app repo on GitHub
-# + branch protection, shell template repo, PyPI pending publisher (Parts 1–2)
+git hf init                                   # production=main, integration=develop, version tag prefix=v
+git push -u origin main develop               # both repos on GitHub
+# + branch protection (PRs on develop; push-bypass on main), shell template repo,
+#   PyPI pending publisher (Parts 1–2)
+
+# day to day
+git hf feature start <name> … git hf feature finish <name>   # PRs into develop
 
 # every release
-git checkout main && git pull                 # green main
-git tag -a vX.Y.Z -m "vX.Y.Z: summary"
-git push origin vX.Y.Z                        # ← this publishes
+git hf release start X.Y.Z
+git hf release finish X.Y.Z                   # ← merges to main+develop, tags vX.Y.Z, pushes = publishes
 gh run watch                                  # verify Actions
 pip install taskboy==X.Y.Z                    # verify PyPI
+
+# emergency
+git hf hotfix start X.Y.Z … git hf hotfix finish X.Y.Z
 ```
