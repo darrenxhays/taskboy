@@ -46,7 +46,9 @@ jobs:
           python -m build --wheel
 
       - name: verify package data
-        run: python -c "import glob, zipfile; names = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist(); missing = [n for n in ['taskboy/templates/config.example.yaml', 'taskboy/templates/services/slack.yaml', 'taskboy/templates/services/github.yaml', 'taskboy/templates/services/jira.yaml', 'taskboy/templates/services/confluence.yaml', 'taskboy/templates/services/sentry.yaml', 'taskboy/templates/services/aws.yaml', 'taskboy/templates/skills/review/SKILL.md', 'taskboy/deploy/taskboy.service', 'taskboy/deploy/install.sh', 'taskboy/deploy/remote-update.sh', 'taskboy/deploy/git-cred-helper.py', 'taskboy/ui_dist/index.html'] if n not in names]; assert not missing, f'wheel is missing package data: {missing}'"
+        # block scalar on purpose: the inline python contains `: ` which breaks a plain yaml scalar
+        run: |
+          python -c "import glob, zipfile; names = zipfile.ZipFile(glob.glob('dist/*.whl')[0]).namelist(); missing = [n for n in ['taskboy/templates/config.example.yaml', 'taskboy/templates/services/slack.yaml', 'taskboy/templates/services/github.yaml', 'taskboy/templates/services/jira.yaml', 'taskboy/templates/services/confluence.yaml', 'taskboy/templates/services/sentry.yaml', 'taskboy/templates/services/aws.yaml', 'taskboy/templates/skills/review/SKILL.md', 'taskboy/deploy/taskboy.service', 'taskboy/deploy/install.sh', 'taskboy/deploy/remote-update.sh', 'taskboy/deploy/git-cred-helper.py', 'taskboy/ui_dist/index.html'] if n not in names]; assert not missing, f'wheel is missing package data: {missing}'"
 
       - name: publish to pypi
         uses: pypa/gh-action-pypi-publish@release/v1
