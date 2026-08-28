@@ -1,8 +1,10 @@
 name: pull request checks
 
+# hubflow (gitflow): feature PRs target develop; release/hotfix merges to main are
+# pushed by `git hf release|hotfix finish`, so both integration points get checked.
 on:
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 jobs:
   checks:
