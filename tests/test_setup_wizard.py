@@ -1,6 +1,8 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from taskboy import setup_checks, setup_wizard
 from taskboy.config import load_config
 
@@ -174,3 +176,69 @@ def test_service_sections_split_into_service_files(tmp_path, monkeypatch):
     assert merged["slack"]["team_id"] == "T123"  # later steps still see the merged view
     config = load_config(str(config_path))
     assert config.slack.enabled is True and config.services["github"] is False
+
+
+def test_scaffold_shell_clones_with_fresh_history(tmp_path, monkeypatch):
+    target = tmp_path / "my-agent"
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ["git", "clone"]:
+            (target / ".git").mkdir(parents=True)
+            (target / "SETUP.md").write_text("runbook")
+        return MagicMock(returncode=0, stderr="")
+
+    monkeypatch.setattr(setup_wizard.subprocess, "run", fake_run)
+    setup_wizard.scaffold_shell(target, "https://example.com/shell-template.git")
+
+    assert calls[0] == ["git", "clone", "--depth", "1", "https://example.com/shell-template.git", str(target)]
+    assert not (target / ".git").exists() or ["git", "init", "-q", "-b", "main"] in calls  # template history stripped before re-init
+    assert ["git", "init", "-q", "-b", "main"] in calls
+    assert ["git", "add", "-A"] in calls
+    assert any(cmd[:2] == ["git", "commit"] for cmd in calls)
+    assert (target / "SETUP.md").read_text() == "runbook"
+
+
+def test_scaffold_shell_refuses_a_nonempty_target(tmp_path):
+    target = tmp_path / "taken"
+    target.mkdir()
+    (target / "keep.txt").write_text("x")
+    with pytest.raises(RuntimeError, match="not empty"):
+        setup_wizard.scaffold_shell(target, "https://example.com/shell-template.git")
+
+
+def test_maybe_scaffold_skips_inside_an_existing_instance_dir(tmp_path, monkeypatch):
+    _wizard_paths(monkeypatch, tmp_path)  # creates config/ — the marker of an existing checkout
+    asker = MagicMock()
+    monkeypatch.setattr(setup_wizard, "ask_yes", asker)
+    setup_wizard.maybe_scaffold_shell()
+    asker.assert_not_called()
+
+
+def test_maybe_scaffold_creates_target_and_continues_inside_it(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(setup_wizard, "CONFIG_PATH", Path("config/config.yaml"))  # relative + absent: fresh directory
+    target = tmp_path / "agent-dir"
+    scaffolded = MagicMock(side_effect=lambda t, url: t.mkdir())
+    monkeypatch.setattr(setup_wizard, "scaffold_shell", scaffolded)
+    monkeypatch.setattr(setup_wizard, "ask_yes", MagicMock(return_value=True))
+    monkeypatch.setattr(setup_wizard, "ask", MagicMock(side_effect=[str(target), "https://example.com/tmpl.git"]))
+
+    setup_wizard.maybe_scaffold_shell()
+
+    scaffolded.assert_called_once_with(target, "https://example.com/tmpl.git")
+    assert Path.cwd() == target  # the rest of the wizard writes config/.env inside the new checkout
+
+
+def test_maybe_scaffold_declined_stays_in_the_current_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(setup_wizard, "CONFIG_PATH", Path("config/config.yaml"))
+    scaffolded = MagicMock()
+    monkeypatch.setattr(setup_wizard, "scaffold_shell", scaffolded)
+    monkeypatch.setattr(setup_wizard, "ask_yes", MagicMock(return_value=False))
+
+    setup_wizard.maybe_scaffold_shell()
+
+    scaffolded.assert_not_called()
+    assert Path.cwd() == tmp_path

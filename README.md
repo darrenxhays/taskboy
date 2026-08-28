@@ -30,9 +30,9 @@ Run the interactive setup wizard:
 taskboy setup
 ```
 
-It walks each step — agent identity, Claude auth, Slack app, GitHub App(s), optional Jira/Confluence/Sentry/AWS, dashboard, conventions, personalities, and the skills picker — printing the manual admin-console instructions where needed, validating every credential live, and writing `config/config.yaml` (comment-preserving) plus a sourceable `.env`. Every step is saved as you go, so you can quit and re-run anytime; `taskboy setup --check` re-validates everything non-interactively.
+Run it in an empty directory and it first offers to **scaffold your deployment checkout from the `taskboy-shell` template** — a fresh-history clone into a directory of your choosing — then continues inside it. From there it walks each step — agent identity, Claude auth, Slack app, GitHub App(s), optional Jira/Confluence/Sentry/AWS, dashboard, conventions, personalities, curated help, and the skills picker — printing the manual admin-console instructions where needed, validating every credential live, and writing `config/config.yaml` (comment-preserving) plus a sourceable `.env`. Every step is saved as you go, so you can quit and re-run anytime; `taskboy setup --check` re-validates everything non-interactively.
 
-This repository is the **application** — a versioned package published to PyPI on every `vX.Y.Z` tag; operators never fork it. Your deployment lives in a separate **shell repository** (created from the `taskboy-shell` template) that pins `taskboy==X.Y.Z` and holds your config, personalities, skills, infrastructure, and deploy pipeline. The shell template's `SETUP.md` carries the full operator runbook: setup, host deployment, CI/CD, and end-to-end verification. Upgrades are a one-line version-bump PR in the shell.
+This repository is the **application** — a versioned package published to PyPI on every `vX.Y.Z` tag; operators never fork it. Your deployment lives in a separate **shell repository** (scaffolded by the wizard, or created from the `taskboy-shell` template on GitHub) that pins `taskboy==X.Y.Z` and holds your config, personalities, skills, infrastructure, and deploy pipeline. The shell template's `SETUP.md` carries the full operator runbook: setup, host deployment, CI/CD, and end-to-end verification. Upgrades are a one-line version-bump PR in the shell.
 
 ## Features
 
