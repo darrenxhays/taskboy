@@ -585,7 +585,7 @@ def step_skills(data, env) -> None:
     github = data.get("github") or {}
     jira_configured = service_enabled_in(data, "jira")
     self_repo = service_enabled_in(data, "github") and bool(github.get("self_repo"))
-    say("  Available templates (× = needs an integration you haven't configured):")
+    say("  Available templates (× = needs an integration you haven't configured; ◆ = built-in — already active, installing creates an editable override):")
     disabled: dict[str, str] = {}
     for name in available:
         needs_jira = name in ("jira2pr", "slack2jira")
@@ -596,7 +596,8 @@ def step_skills(data, env) -> None:
             disabled[name] = "needs github.self_repo"
     for i, name in enumerate(available, 1):
         note = f"  × {disabled[name]}" if name in disabled else ""
-        say(f"    {i:2}. /{name}{note}")
+        marker = " ◆" if name in skills.BUILTIN_SKILLS else ""
+        say(f"    {i:2}. /{name}{marker}{note}")
     answer = ask("Install which? (numbers/names, comma-separated, or 'all')", "all")
     if answer.strip().lower() == "all":
         selected = [name for name in available if name not in disabled]
@@ -615,7 +616,8 @@ def step_skills(data, env) -> None:
         content = (templates_dir / name / "SKILL.md").read_text()
         # transitive requires must be installed too, or the skill fails to render at task time
         for required in skills.load(str(templates_dir), name).requires:
-            if required not in selected and required not in skills.available(str(skills_root)):
+            # built-ins satisfy a requires without a local copy, so don't force an override install
+            if required not in selected and required not in skills.available(str(skills_root)) and required not in skills.BUILTIN_SKILLS:
                 selected.append(required)
         for key, value in variables.items():
             content = content.replace("{{" + key + "}}", value)

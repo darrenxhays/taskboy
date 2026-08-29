@@ -248,7 +248,7 @@ async def handle_mention(store: Store, config: Config, notifier, event: dict, ev
         return None, "help"
     invocation = skills.parse_invocation(text)
     if text.startswith("/"):
-        names = skills.available(settings.SKILLS_ROOT)
+        names = sorted(set(skills.available(settings.SKILLS_ROOT)) | set(skills.BUILTIN_SKILLS))
         name = invocation[0] if invocation else ""
         if invocation is None or name not in names:
             available = ", ".join(f"/{item}" for item in names)

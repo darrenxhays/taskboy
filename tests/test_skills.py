@@ -111,3 +111,54 @@ def test_unknown_internal_tool_rejected(tmp_path):
     (tmp_path / "bad" / "SKILL.md").write_text("---\nname: bad\ndescription: d\ninternal_tools: [nope]\n---\n\nbody\n")
     with pytest.raises(skills.SkillError, match="internal_tools"):
         skills.load(tmp_path, "bad")
+
+
+# -- built-in skills: packaged fallback with operator override ----------------
+
+
+def test_builtin_resolves_from_packaged_template_when_not_installed(tmp_path):
+    loaded = skills.resolve(tmp_path, "review", {"agent_name": "Scout", "conventions_file": "CONVENTIONS.md", "self_repo": ""})
+    assert loaded is not None and loaded.name == "review"
+    assert "Scout" in loaded.body
+    assert "{{" not in loaded.body and "{{" not in loaded.description
+
+
+def test_installed_skill_overrides_the_builtin(tmp_path):
+    write_skill(tmp_path, "review", "my custom review procedure")
+    loaded = skills.resolve(tmp_path, "review", {"agent_name": "Scout"})
+    assert loaded is not None and loaded.body == "my custom review procedure"
+
+
+def test_resolve_returns_none_for_unknown_non_builtin(tmp_path):
+    assert skills.resolve(tmp_path, "slack2pr") is None
+    assert skills.resolve(tmp_path, "nope") is None
+
+
+@pytest.mark.parametrize("name", skills.BUILTIN_SKILLS)
+def test_every_builtin_renders_cleanly_with_runtime_variables(tmp_path, name):
+    from tests.conftest import make_config
+
+    variables = skills.runtime_variables(make_config())
+    body = skills.render(tmp_path, name, variables)
+    assert body
+    assert "{{" not in body, f"builtin /{name} has a template variable runtime_variables doesn't provide"
+
+
+def test_render_resolves_requires_through_builtins(tmp_path):
+    (tmp_path / "watch").mkdir()
+    (tmp_path / "watch" / "SKILL.md").write_text("---\nname: watch\ndescription: d\nrequires: [review]\n---\n\nwatch body\n")
+    rendered = skills.render(tmp_path, "watch", {"agent_name": "Scout", "conventions_file": "CONVENTIONS.md", "self_repo": ""})
+    assert "watch body" in rendered
+    assert "### Included skill: /review" in rendered
+
+
+def test_runtime_variables_derive_from_config():
+    from tests.conftest import make_config
+
+    variables = skills.runtime_variables(make_config())
+    assert variables["agent_name"] == "Agent"
+    assert variables["self_repo"] == "example-org/taskboy"
+    assert variables["conventions_file"] == "CONVENTIONS.md"  # unset conventions falls back to the injected filename
+
+    disabled_github = make_config(services={"github": False, "slack": True, "jira": True, "confluence": True, "sentry": True, "aws": True})
+    assert skills.runtime_variables(disabled_github)["self_repo"] == ""  # a disabled service leaks nothing into prompts

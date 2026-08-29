@@ -67,7 +67,7 @@ cd ../taskboy-shell
 git push -u origin main develop
 ```
 
-Then in that repo's GitHub **Settings → General**, check **Template repository**. Operators use "Use this template" (not a fork) to create their private deployment repo, per its `SETUP.md`. Apply the same branch-protection split as 1.2 (the shell's deploy fires on pushes to `main`, which hubflow release/hotfix finishes produce).
+Then in that repo's GitHub **Settings → General**, check **Template repository**. Operators use "Use this template" (not a fork) to create their private deployment repo, per its `SETUP.md`. Apply the same branch-protection split as 1.2. The shell's deploy workflow fires on pushes to `main` (which hubflow release/hotfix finishes produce) but is gated on the `DEPLOY_ENVIRONMENT` repository variable — instances set it during setup, so the template repo itself never attempts a deploy.
 
 ---
 
