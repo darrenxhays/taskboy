@@ -1,5 +1,7 @@
+import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -206,11 +208,24 @@ async def test_retry_failed_task(dashboard, make_task, store):
 
 @pytest.mark.asyncio
 async def test_task_detail_includes_permission_requests(dashboard, make_task, store):
-    client, _, _ = dashboard
+    client, config, _ = dashboard
+    config.raw = {
+        **config.raw,
+        "profiles": {"read_only": {"allowed_tools": ["Read", "Bash", "mcp__jira__get_issue", "mcp__jira__search_issues"]}},
+    }
     task = make_task()
+    store.set_fields(task.task_id, profile="read_only")
     store.request_permission(task.task_id, "tool", "mcp__jira__add_comment", "post findings")
+    store.request_permission(task.task_id, "tool", "mcp__jira__get_issue", "read issue")
+    store.request_permission(task.task_id, "access", "aws:production", "read production logs")
+    store.request_permission(task.task_id, "tool", "mcp__jira__search_issues", "[profile escalation needed for visibility] search issues")
     detail = (await client.get(f"/api/tasks/{task.task_id}", headers=identity(VIEWER))).json()
-    assert [(r["kind"], r["target"], r["status"]) for r in detail["permission_requests"]] == [("tool", "mcp__jira__add_comment", "pending")]
+    requests = {(row["kind"], row["target"]): row for row in detail["permission_requests"]}
+    assert {row["status"] for row in requests.values()} == {"pending"}
+    assert requests[("tool", "mcp__jira__add_comment")]["escalation"] is True
+    assert requests[("tool", "mcp__jira__get_issue")]["escalation"] is False
+    assert requests[("access", "aws:production")]["escalation"] is False
+    assert requests[("tool", "mcp__jira__search_issues")]["escalation"] is False
 
 
 @pytest.mark.asyncio
@@ -227,6 +242,81 @@ async def test_grant_permission_endpoint_resumes_blocked_task(dashboard, make_ta
     assert result.json() == {"status": "granted", "state": "queued"}
     assert store.granted_permissions_for(task.task_id)["tools"] == ["mcp__jira__add_comment"]
     assert any(row["action"] == "permission_granted" for row in store.admin_events(10))
+
+
+@pytest.mark.asyncio
+async def test_grant_access_permission_endpoint_resumes_blocked_task(dashboard, make_task, store):
+    client, _, _ = dashboard
+    task = make_task()
+    store.transition(task.task_id, RECEIVED, QUEUED)
+    store.transition(task.task_id, QUEUED, RUNNING, session_id="s1")
+    store.request_permission(task.task_id, "access", "aws:production", "AssumeRole denied")
+    store.transition(task.task_id, RUNNING, "blocked", "needs permission")
+    detail = (await client.get(f"/api/tasks/{task.task_id}", headers=identity(VIEWER))).json()
+    assert detail["can_resume"] is False  # a pending decision has its own path; resume is for the report_blocked case
+    result = await client.post(f"/api/tasks/{task.task_id}/permissions", headers=admin_headers(), json={"kind": "access", "target": "aws:production", "decision": "granted"})
+    assert result.json() == {"status": "granted", "state": "queued"}
+    assert store.granted_permissions_for(task.task_id)["access"] == ["aws:production"]
+
+
+@pytest.mark.asyncio
+async def test_resume_endpoint_requeues_a_blocked_task(dashboard, make_task, store):
+    client, _, _ = dashboard
+    app = client._transport.app
+    wake = asyncio.Event()
+    app.state.orchestrator = SimpleNamespace(wake=wake)
+    task = make_task()
+    store.transition(task.task_id, RECEIVED, QUEUED)
+    store.transition(task.task_id, QUEUED, RUNNING, session_id="s7")
+    store.transition(task.task_id, RUNNING, "blocked", "needs production logs")
+    detail = (await client.get(f"/api/tasks/{task.task_id}", headers=identity(VIEWER))).json()
+    assert detail["can_resume"] is True
+    viewer_attempt = await client.post(f"/api/tasks/{task.task_id}/resume", headers={**identity(VIEWER), "x-harness-dashboard": "1"})
+    result = await client.post(f"/api/tasks/{task.task_id}/resume", headers=admin_headers())
+    assert viewer_attempt.status_code == 403
+    assert result.json() == {"status": "resumed", "state": "queued"}
+    assert wake.is_set()
+    assert store.get_task(task.task_id).resume_session_id == "s7"
+    assert any(row["action"] == "task_resume" for row in store.admin_events(10))
+    again = await client.post(f"/api/tasks/{task.task_id}/resume", headers=admin_headers())
+    assert again.status_code == 200
+    assert again.json()["status"] == "not blocked (queued)"
+
+
+@pytest.mark.asyncio
+async def test_task_detail_does_not_offer_resume_while_questions_are_pending(dashboard, make_task, store):
+    client, _, _ = dashboard
+    task = make_task()
+    store.transition(task.task_id, RECEIVED, QUEUED)
+    store.transition(task.task_id, QUEUED, RUNNING, session_id="s8")
+    store.ask_questions(task.task_id, "Which environment?")
+    store.transition(task.task_id, RUNNING, "blocked", "waiting for requester")
+
+    detail = (await client.get(f"/api/tasks/{task.task_id}", headers=identity(VIEWER))).json()
+    assert detail["can_resume"] is False
+
+    store.answer_questions(task.task_id, "Production", task.slack_user_id)
+    detail = (await client.get(f"/api/tasks/{task.task_id}", headers=identity(VIEWER))).json()
+    assert detail["can_resume"] is True
+
+
+@pytest.mark.asyncio
+async def test_config_view_reports_aws_environment_health(dashboard, monkeypatch):
+    from taskboy.adapters import aws_read
+
+    client, config, _ = dashboard
+    config.raw = {**config.raw, "aws": {"allowed_services": ["logs"], "diagnostics_role_arns": {"staging": "arn:s", "production": "arn:p"}}}
+    config.services["aws"] = True  # the probe is gated on the service being enabled, not just configured
+    aws_read._self_check_cache.clear()
+
+    def probe(role_arn):
+        if role_arn == "arn:p":
+            raise RuntimeError("AccessDenied: not authorized to perform sts:AssumeRole")
+
+    monkeypatch.setattr(aws_read, "_probe_assume", probe)
+    view = (await client.get("/api/config", headers=identity(VIEWER))).json()
+    assert view["aws_environments"] == {"production": "AccessDenied: not authorized to perform sts:AssumeRole", "staging": "ok"}
+    aws_read._self_check_cache.clear()
 
 
 @pytest.mark.asyncio
@@ -256,11 +346,12 @@ async def test_usage_cards_shape(dashboard, make_task, store):
     client, config, _ = dashboard
     config.raw["usage_limits"] = {"five_hour_tokens": 1000, "weekly_tokens": 0, "fable_weekly_tokens": 500}
     task = make_task()
-    store.add_usage(task.task_id, "subagent", "claude-fable-5", input_tokens=100, output_tokens=40, cost_usd=2.0)
+    store.add_usage(task.task_id, "subagent", "claude-fable-5-1", input_tokens=100, output_tokens=40, cost_usd=2.0)
     store.record_rate_limit("five_hour", "allowed_warning", 0.83, int(time.time()) + 3600)
     store.record_rate_limit("seven_day", "allowed_warning", 0.6, int(time.time()) - 1)
     store.record_rate_limit("seven_day_fable", "rejected", 1.0, int(time.time()) + 7200)
     usage = (await client.get("/api/usage", headers=identity(VIEWER))).json()
+    assert "_".join(("fable", "model")) not in usage
     assert usage["cards"]["five_hour"]["total_tokens"] == 140
     assert usage["cards"]["five_hour"]["limit_tokens"] == 1000
     assert usage["cards"]["weekly"]["limit_tokens"] is None
@@ -269,13 +360,20 @@ async def test_usage_cards_shape(dashboard, make_task, store):
     assert usage["cards"]["weekly"]["observed"] is None
     assert usage["cards"]["fable"]["observed"]["status"] == "rejected"
     assert usage["cards"]["fable"]["totals"]["cost_usd"] == 2.0
-    assert usage["timeseries"][0]["model"] == "claude-fable-5"
+    assert usage["timeseries"][0]["model"] == "claude-fable-5-1"
+    # the fable card counts the whole family: the alias new runs record under, and the pinned ids older rows carry
+    store.add_usage(task.task_id, "subagent", "fable", input_tokens=10, output_tokens=10, cost_usd=1.0)
+    store.add_usage(task.task_id, "subagent", "claude-fable-5", input_tokens=10, output_tokens=10, cost_usd=0.5)
+    store.add_usage(task.task_id, "subagent", "opus", input_tokens=10, output_tokens=10, cost_usd=9.0)
+    usage = (await client.get("/api/usage", headers=identity(VIEWER))).json()
+    assert usage["cards"]["fable"]["totals"]["cost_usd"] == 3.5
+    assert {row["model"] for row in usage["cards"]["fable"]["by_model"]} == {"claude-fable-5-1", "fable", "claude-fable-5"}
 
 
 @pytest.mark.asyncio
 async def test_config_view_masks_secrets(dashboard):
     client, config, _ = dashboard
-    config.raw["models"] = {"fable": {"id": "claude-fable-5"}}
+    config.raw["models"] = {"fable": {"id": "claude-fable-5-1"}}
     config.raw["github"] = {"api_token": "ghp_0123456789abcdef0123456789abcdef1234"}
     view = (await client.get("/api/config", headers=identity(VIEWER))).json()
     assert view["policy"]["github"]["api_token"] == "••••••••"
@@ -567,13 +665,24 @@ async def test_issue_priority_refine_and_bulk_endpoints(dashboard, store):
     assert (await client.post("/api/issues/bulk", headers=admin_headers(), json={"ids": [], "action": "approve"})).status_code == 400
     assert (await client.post("/api/issues/bulk", headers=admin_headers(), json={"ids": [editable["id"]], "action": "bogus"})).status_code == 400
 
+    locked_refine = await client.post(f"/api/issues/{locked['id']}/refine", headers=admin_headers())
+    assert locked_refine.status_code == 409 and locked_refine.json()["detail"] == "issue is not editable"
+
+    bulk_target = store.record_issue("bulk-refine-target", "example-org/service-a", "bulk refine target", "bug", "d", 50)
+    bulk_refine = await client.post("/api/issues/bulk", headers=admin_headers(), json={"ids": [bulk_target["id"], locked["id"], 9999], "action": "refine"})
+    assert bulk_refine.status_code == 200
+    bulk_refine_results = {row["id"]: row for row in bulk_refine.json()["results"]}
+    assert bulk_refine_results[locked["id"]] == {"id": locked["id"], "status": "skipped"}
+    assert bulk_refine_results[9999] == {"id": 9999, "status": "not_found"}
+    assert bulk_refine_results[bulk_target["id"]]["status"] == "created" and bulk_refine_results[bulk_target["id"]]["task_id"]
+
 
 @pytest.mark.asyncio
 async def test_bulk_issues_delete_action_skips_active_and_missing(dashboard, store):
     client, _, _ = dashboard
-    first = store.record_issue("bulk-delete-1", "redzone-co/agent-red", "s", "bug", "d", 50)
-    second = store.record_issue("bulk-delete-2", "redzone-co/agent-red", "s", "bug", "d", 50)
-    active = store.record_issue("bulk-delete-active", "redzone-co/agent-red", "s", "bug", "d", 50)
+    first = store.record_issue("bulk-delete-1", "example-org/service-a", "s", "bug", "d", 50)
+    second = store.record_issue("bulk-delete-2", "example-org/service-a", "s", "bug", "d", 50)
+    active = store.record_issue("bulk-delete-active", "example-org/service-a", "s", "bug", "d", 50)
     store.decide_issue(active["id"], "approved", ADMIN)
     [reserved] = store.reserve_issues("coordinator", 1)
     store.start_issue(reserved["id"], None, "spec")

@@ -58,6 +58,33 @@ async def retry_task(store: Store, config: Config, notifier, source_task_id: str
     return retried, status
 
 
+def resume_task(store: Store, task_id: str, actor: str) -> tuple[Task | None, str]:
+    """requeue a BLOCKED task on the same session after an operator fixed its blocker out of band (an IAM change,
+    a config value, a service outage). tasks waiting on a permission decision or requester answers have their own
+    resume paths, so this is for the report_blocked case that used to be a dead end."""
+    task = store.get_task(task_id)
+    if task is None:
+        return None, "not found"
+    if task.state != BLOCKED:
+        store.add_event(task_id, "operator_action", {"actor": actor, "action": "resume", "outcome": "noop", "state": task.state})
+        return task, f"not blocked ({task.state})"
+    if store.has_pending_permission_request(task_id):
+        store.add_event(task_id, "operator_action", {"actor": actor, "action": "resume", "outcome": "noop", "waiting": "permission"})
+        return task, "waiting on a permission decision — grant or deny it instead"
+    if store.pending_questions_for(task_id) is not None:
+        store.add_event(task_id, "operator_action", {"actor": actor, "action": "resume", "outcome": "noop", "waiting": "questions"})
+        return task, "waiting on requester answers — reply in the Slack thread instead"
+    try:
+        resumed = store.transition(task_id, BLOCKED, QUEUED, f"operator resume by {actor}", resume_session_id=task.session_id)
+    except TransitionRaced:
+        current = store.get_task(task_id)
+        if current is not None:
+            store.add_event(task_id, "operator_action", {"actor": actor, "action": "resume", "outcome": "raced", "state": current.state})
+        return current, f"already {current.state}" if current else "not found"
+    store.add_event(task_id, "operator_action", {"actor": actor, "action": "resume", "outcome": "resumed", "session_id": task.session_id})
+    return resumed, "resumed"
+
+
 async def decide_permission(store: Store, notifier, task_id: str, kind: str, target: str, decision: str, actor: str) -> tuple[Task | None, str]:
     """grant or deny a sub-agent's permission request: granting a blocked task resumes it, denying reopens and cancels its issue-backed task instead of stranding it (#76)."""
     if decision not in ("granted", "denied"):

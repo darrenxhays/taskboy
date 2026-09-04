@@ -2,7 +2,7 @@ import time
 
 import pytest
 
-from taskboy.hooks import TaskHooks, bash_denial, classify_tool, profile_permits_writes, repo_grantable, tool_grantable
+from taskboy.hooks import TaskHooks, bash_denial, classify_tool, is_profile_escalation, profile_permits_writes, repo_grantable, tool_grantable
 
 PROTECTED = ["main", "develop"]
 
@@ -32,19 +32,22 @@ def test_profile_permits_writes_ignores_read_and_unknown_tools():
     assert profile_permits_writes(WRITE_TOOLS) is True
 
 
-def test_tool_grantable_gates_writes_by_tier():
-    # read-only tier: read tools grantable, write tools never
-    assert tool_grantable("mcp__jira__get_issue", READ_ONLY_TOOLS) is True
-    assert tool_grantable("mcp__slack__get_file", READ_ONLY_TOOLS) is True
-    assert tool_grantable("Write", READ_ONLY_TOOLS) is False
-    assert tool_grantable("Edit", READ_ONLY_TOOLS) is False
-    assert tool_grantable("mcp__jira__add_comment", READ_ONLY_TOOLS) is False
-    assert tool_grantable("mcp__github__resolve_pr_thread", READ_ONLY_TOOLS) is False
-    # unrecognized targets are never grantable regardless of tier
-    assert tool_grantable("mcp__brandnew__unknown_tool", WRITE_TOOLS) is False
-    # write-capable tier: write tools grantable
-    assert tool_grantable("mcp__jira__add_comment", WRITE_TOOLS) is True
-    assert tool_grantable("mcp__github__resolve_pr_thread", WRITE_TOOLS) is True
+def test_tool_grantable_admits_any_recognized_tool():
+    # any recognized tool may be granted by an operator — including a write tool on a read-only tier
+    # (operator decision 2026-09-02: fewer dead-end blocked tasks; the escalation is labelled, not refused)
+    assert tool_grantable("mcp__jira__get_issue") is True
+    assert tool_grantable("mcp__slack__get_file") is True
+    assert tool_grantable("Write") is True
+    assert tool_grantable("mcp__jira__add_comment") is True
+    # unrecognized targets are never grantable regardless of tier: nothing to allowlist, nothing to audit against
+    assert tool_grantable("mcp__brandnew__unknown_tool") is False
+
+
+def test_is_profile_escalation_flags_write_tools_on_read_only_tiers_only():
+    assert is_profile_escalation("Write", READ_ONLY_TOOLS) is True
+    assert is_profile_escalation("mcp__github__resolve_pr_thread", READ_ONLY_TOOLS) is True
+    assert is_profile_escalation("mcp__jira__get_issue", READ_ONLY_TOOLS) is False  # a read tool widens nothing
+    assert is_profile_escalation("Write", WRITE_TOOLS) is False  # the tier already writes
 
 
 def test_repo_grantable_allows_same_org_repos_outside_approved_list():
@@ -174,6 +177,7 @@ def test_tool_classification_defaults_to_write():
     assert classify_tool("mcp__github__list_pull_requests") == "read"
     assert classify_tool("mcp__github__list_pr_files") == "read"
     assert classify_tool("mcp__github__resolve_pr_thread") == "write"
+    assert classify_tool("mcp__github__update_pull_request") == "write"
     assert classify_tool("mcp__github__close_pull_request") == "write"
     assert classify_tool("mcp__github__delete_branch") == "write"
     assert classify_tool("mcp__github__create_release") == "write"

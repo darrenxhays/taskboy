@@ -115,13 +115,16 @@ export function TaskDetailPage({ admin }: { admin: boolean }) {
     }
   };
 
-  const act = async (action: "cancel" | "retry") => {
+  const act = async (action: "cancel" | "retry" | "resume") => {
     setBusy(true);
     setActionNote(null);
     try {
       if (action === "cancel") {
         const result = await api.cancel(taskId);
         setActionNote(`cancel: ${result.status}`);
+      } else if (action === "resume") {
+        const result = await api.resume(taskId);
+        setActionNote(`resume: ${result.status}`);
       } else {
         const result = await api.retry(taskId);
         setActionNote(`retry: ${result.status}`);
@@ -149,6 +152,7 @@ export function TaskDetailPage({ admin }: { admin: boolean }) {
         </Link>
         {admin && data.can_cancel && <ActionButton label="CANCEL" tone="var(--status-critical)" onClick={() => act("cancel")} busy={busy} />}
         {admin && data.can_retry && <ActionButton label="RETRY" tone="var(--accent)" onClick={() => act("retry")} busy={busy} />}
+        {admin && data.can_resume && <ActionButton label="RESUME" tone="var(--status-good)" onClick={() => act("resume")} busy={busy} />}
       </header>
       {actionNote && (
         <div className="rounded-md border px-3 py-2 text-[12px]" style={{ borderColor: "var(--hairline-strong)", color: "var(--text-secondary)" }}>
@@ -203,6 +207,11 @@ export function TaskDetailPage({ admin }: { admin: boolean }) {
                 <span className="mono rounded border px-1 py-px text-[10px]" style={{ borderColor: "var(--hairline)", color: "var(--text-muted)" }}>
                   {permission.kind}
                 </span>
+                {permission.escalation && (
+                  <span className="rounded border px-1 py-px text-[10px] font-semibold" style={{ borderColor: "var(--status-warning)", color: "var(--status-warning)" }} title="a write tool requested by a task routed read-only; granting widens it beyond its routed risk level">
+                    ESCALATION
+                  </span>
+                )}
                 <span className="mono min-w-0 break-all" style={{ color: "var(--text-primary)" }}>
                   {permission.target}
                 </span>

@@ -1,7 +1,11 @@
+import json
+from unittest.mock import patch
+
 import pytest
 
 from taskboy.models import BLOCKED, CANCELLED, COMPLETED, FAILED, QUEUED, RECEIVED, RUNNING
-from taskboy.task_actions import cancel_task, decide_permission, retry_task
+from taskboy.store import TransitionRaced
+from taskboy.task_actions import cancel_task, decide_permission, resume_task, retry_task
 from tests.conftest import make_config
 
 
@@ -23,6 +27,85 @@ async def test_grant_permission_resumes_blocked_task(store, make_task, notifier)
     assert updated.resume_session_id == "sess-1"
     assert store.granted_permissions_for(task.task_id)["tools"] == ["mcp__jira__add_comment"]
     assert "permission_decision" in [event["kind"] for event in store.events_for(task.task_id)]
+
+
+@pytest.mark.asyncio
+async def test_grant_access_permission_resumes_blocked_task(store, make_task, notifier):
+    # an 'access' grant changes nothing inside taskboy (the operator fixed IAM/config out of band); it just resumes
+    task = _blocked_task_with_request(store, make_task, kind="access", target="aws:production")
+    updated, status = await decide_permission(store, notifier, task.task_id, "access", "aws:production", "granted", "boss@example.com")
+    assert status == "granted"
+    assert updated.state == QUEUED
+    assert updated.resume_session_id == "sess-1"
+    assert store.granted_permissions_for(task.task_id)["access"] == ["aws:production"]
+
+
+def test_resume_task_requeues_a_blocked_task_on_its_session(store, make_task):
+    # report_blocked used to be a dead end: after fixing the blocker an operator can now continue the same session
+    task = make_task()
+    store.transition(task.task_id, RECEIVED, QUEUED)
+    store.transition(task.task_id, QUEUED, RUNNING, session_id="sess-9")
+    store.transition(task.task_id, RUNNING, BLOCKED, "needs production logs")
+    resumed, status = resume_task(store, task.task_id, "boss@example.com")
+    assert status == "resumed"
+    assert resumed.state == QUEUED
+    assert resumed.resume_session_id == "sess-9"
+    state_changes = [json.loads(e["detail_json"]) for e in store.events_for(task.task_id) if e["kind"] == "state_change"]
+    assert state_changes[-1]["reason"].startswith("operator resume")
+    actions = [json.loads(e["detail_json"]) for e in store.events_for(task.task_id) if e["kind"] == "operator_action"]
+    assert actions[-1]["action"] == "resume" and actions[-1]["outcome"] == "resumed"
+
+
+def test_resume_task_is_a_noop_unless_blocked(store, make_task):
+    task = make_task()
+    store.transition(task.task_id, RECEIVED, QUEUED)
+    same, status = resume_task(store, task.task_id, "boss@example.com")
+    assert status == "not blocked (queued)"
+    assert same.state == QUEUED
+    assert resume_task(store, "t20260101-deadbeef", "boss@example.com") == (None, "not found")
+
+
+def test_resume_task_handles_a_raced_transition(store, make_task):
+    task = make_task()
+    store.transition(task.task_id, RECEIVED, QUEUED)
+    store.transition(task.task_id, QUEUED, RUNNING)
+    store.transition(task.task_id, RUNNING, BLOCKED, "needs production logs")
+
+    with patch.object(store, "transition", side_effect=TransitionRaced("resume raced")):
+        current, status = resume_task(store, task.task_id, "boss@example.com")
+
+    assert current == store.get_task(task.task_id)
+    assert status == "already blocked"
+    actions = [json.loads(e["detail_json"]) for e in store.events_for(task.task_id) if e["kind"] == "operator_action"]
+    assert actions[-1]["outcome"] == "raced"
+
+
+def test_resume_task_is_a_noop_with_pending_permission(store, make_task):
+    task = make_task()
+    store.transition(task.task_id, RECEIVED, QUEUED)
+    store.transition(task.task_id, QUEUED, RUNNING)
+    store.request_permission(task.task_id, "access", "aws:production", "denied")
+    store.transition(task.task_id, RUNNING, BLOCKED, "needs permission")
+
+    same, status = resume_task(store, task.task_id, "boss@example.com")
+
+    assert same.state == BLOCKED
+    assert "permission" in status
+    actions = [json.loads(e["detail_json"]) for e in store.events_for(task.task_id) if e["kind"] == "operator_action"]
+    assert actions[-1]["outcome"] == "noop"
+
+
+def test_resume_task_is_a_noop_with_unanswered_questions(store, make_task):
+    task = make_task()
+    store.transition(task.task_id, RECEIVED, QUEUED)
+    store.transition(task.task_id, QUEUED, RUNNING)
+    store.ask_questions(task.task_id, "1. Which environment?")
+    store.transition(task.task_id, RUNNING, BLOCKED, "needs requester answers")
+
+    same, status = resume_task(store, task.task_id, "boss@example.com")
+
+    assert same.state == BLOCKED
+    assert "answers" in status
 
 
 @pytest.mark.asyncio

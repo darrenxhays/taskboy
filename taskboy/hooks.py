@@ -44,6 +44,7 @@ TOOL_CLASSIFICATION = {
     "mcp__issues__finish_issue": "write",
     "mcp__enqueue__enqueue_spec_pr": "write",
     "mcp__github__get_pull_request": "read",
+    "mcp__github__update_pull_request": "write",
     "mcp__github__list_pull_requests": "read",
     "mcp__github__list_pr_files": "read",
     "mcp__github__list_pr_comments": "read",
@@ -87,22 +88,24 @@ def classify_tool(tool_name: str) -> str:
 
 
 def profile_permits_writes(allowed_tools: list[str]) -> bool:
-    """a profile tier is write-capable if its base allowlist holds a *recognized* write tool other than Bash.
-    Bash is present in every tier for investigation and is separately policed (hooks + read-only git token),
-    so its presence does not make an otherwise read-only profile eligible to gain Write/Edit/write-MCP tools.
-    Unrecognized tools are deliberately NOT treated as write here: an unclassified read tool in a read-only
-    profile (e.g. mcp__slack__user_info) must not flip the tier to write-capable and reopen the gate (§8.4)."""
+    """whether a profile tier's base allowlist holds a recognized write tool other than Bash. used by
+    is_profile_escalation to label a write-tool request from a read-only task for the operator. Bash is in every
+    tier for investigation and is policed separately, so it does not count; unrecognized tools do not count either."""
     return any(TOOL_CLASSIFICATION.get(tool_name) == "write" and tool_name != "Bash" for tool_name in allowed_tools)
 
 
-def tool_grantable(tool_name: str, profile_allowed_tools: list[str]) -> bool:
-    """whether a mid-task grant may admit this tool: it must be recognized, and a read-only profile
-    tier can only ever gain read tools — never a write tool it was deliberately denied (§8.4)."""
-    if tool_name not in TOOL_CLASSIFICATION:
-        return False
-    if classify_tool(tool_name) == "read":
-        return True
-    return profile_permits_writes(profile_allowed_tools)
+def tool_grantable(tool_name: str) -> bool:
+    """whether a mid-task grant may admit this tool. any recognized tool can be granted — an operator decides,
+    including a write tool for a task routed read-only (fewer dead-end blocked tasks); that case is flagged as
+    a profile escalation via is_profile_escalation so the request is labelled for review. unrecognized tools
+    are never grantable: there is nothing to allowlist and no classification to audit against (§8.4)."""
+    return tool_name in TOOL_CLASSIFICATION
+
+
+def is_profile_escalation(tool_name: str, profile_allowed_tools: list[str]) -> bool:
+    """a write tool requested by a task whose base profile tier is read-only — grantable, but the operator
+    should see that granting it widens the task beyond its routed risk level."""
+    return classify_tool(tool_name) == "write" and not profile_permits_writes(profile_allowed_tools)
 
 
 def repo_grantable(target: str, approved_repos: list[str], accessible_repos: set[str] | None) -> bool:

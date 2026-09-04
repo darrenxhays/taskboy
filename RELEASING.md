@@ -185,7 +185,7 @@ git hf release start 0.2.0 && git hf release finish 0.2.0   # merge to main = de
 
 The shell's PR checks validate `config/` against the pinned version before anything merges, and its deploy workflow ships the pinned version and your `config/` + `skills/` to the host on the `main` push (see the shell's `SETUP.md`, section 3c).
 
-**Release-notes discipline:** when a release adds or changes config keys, say so in the GitHub Release notes with the exact YAML the operator should add. For example, the current unreleased head requires dashboard operators to set `dashboard.expected_alb_arn` (the app now pins the ALB OIDC header's signer and fails closed), and newly supports an optional `help.file` and `retention.errors_days` / `retention.blocked_task_*` keys.
+**Release-notes discipline:** when a release adds or changes config keys, say so in the GitHub Release notes with the exact YAML the operator should add. For example, `0.4.0` adds `mcp__github__update_pull_request` to the `standard`/`deep` profile allowlists, switches `models.fable` to the bare `fable` alias, needs the `files:read` Slack scope, and requires a `taskboy:account_id` key in each shell Pulumi stack file.
 
 ---
 

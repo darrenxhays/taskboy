@@ -46,6 +46,16 @@ def test_task_prompt_names_repos_that_failed_to_preclone(make_task):
     assert "./service-a" in with_failure  # the successfully-cloned repo line is unaffected
 
 
+def test_task_prompt_names_repos_seeded_from_a_stale_mirror(make_task):
+    task = make_task()
+    without = task_prompt(task, None, [], github=True, cloned_repos=["org/service-a"])
+    with_stale = task_prompt(task, None, [], github=True, cloned_repos=["org/service-a", "org/service-b"], stale_repos=["org/service-b"])
+    assert "behind origin" not in without
+    assert "behind origin" in with_stale
+    assert "org/service-b" in with_stale
+    assert "./service-a" in with_stale  # the freshly-refreshed repo line is unaffected
+
+
 def test_task_prompt_self_repo_rules_only_when_present(make_task):
     task = make_task()
     without = task_prompt(task, None, [], github=True)
@@ -85,6 +95,16 @@ def test_task_prompt_includes_pr_jira_link_and_progress_rules(make_task):
     assert "## Jira work rules" not in task_prompt(make_task(), None, [])
 
 
+def test_task_prompt_explains_permission_requests_and_unfixable_blockers(make_task):
+    prompt = task_prompt(make_task(), None, [])
+
+    assert "request_permission" in prompt
+    assert "kind `access`" in prompt
+    assert "system:scope" in prompt
+    assert "aws:production" in prompt
+    assert "Call `report_blocked` only when no operator action could unblock you" in prompt
+
+
 def test_task_prompt_includes_github_pre_push_and_review_comment_rules(make_task):
     prompt = task_prompt(make_task(), None, [], github=True, bot_name="Red")
 
@@ -94,6 +114,7 @@ def test_task_prompt_includes_github_pre_push_and_review_comment_rules(make_task
     assert "`make check` (lint, format, mypy, tests)" in prompt
     assert "reply to that comment with mcp__github__reply_to_pr_comment as Red" in prompt
     assert "mcp__github__resolve_pr_thread that you or Reviewer started" in prompt
+    assert "keep the title and body current with mcp__github__update_pull_request" in prompt
 
 
 def test_task_prompt_tells_red_not_to_delegate_but_not_blue(make_task):

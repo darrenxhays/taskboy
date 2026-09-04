@@ -5,7 +5,7 @@ import logging
 import re
 from html.parser import HTMLParser
 
-from taskboy.adapters._util import _error, _text, wrap
+from taskboy.adapters._util import AccessDenied, _error, _text, wrap
 from taskboy.models import Task
 from taskboy.redact import redactor
 from taskboy.store import Store
@@ -53,6 +53,9 @@ class ConfluenceAdapter:
         auth = aiohttp.BasicAuth(self.email, self.api_token)
         async with aiohttp.ClientSession(auth=auth) as session:
             async with session.request(method, self.site + path, params=params, headers={"Accept": "application/json"}) as response:
+                if response.status in (401, 403):
+                    body = redactor.redact(await response.text())[:300]
+                    raise AccessDenied("confluence", self.site.split("://", 1)[-1], f"confluence api {method} {path} denied: {response.status} — {body}")
                 if response.status >= 300:
                     body = redactor.redact(await response.text())[:300]
                     raise RuntimeError(f"confluence api {method} {path} failed: {response.status} — {body}")

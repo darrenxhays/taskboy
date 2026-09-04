@@ -4,7 +4,8 @@
 #
 # keep the scopes in lockstep with what the service actually uses (taskboy/slack.py):
 # intake needs app_mentions:read + the history scopes; replies need chat:write; the 👀 ack
-# needs reactions:write; long replies upload snippets via files:write; DM chat needs im:*;
+# needs reactions:write; long replies upload snippets via files:write; reading files shared in a
+# task thread (mcp__slack__get_file) needs files:read; DM chat needs im:*;
 # requester display names need users:read + users:read.email.
 #
 # after creating the app:
@@ -29,6 +30,7 @@ oauth_config:
       - channels:history
       - groups:history # needed when any allowed channel is private
       - reactions:write
+      - files:read
       - files:write
       - im:history
       - im:write

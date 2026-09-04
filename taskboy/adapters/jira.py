@@ -8,8 +8,9 @@ projects and issue types are validated against config (JIR-010).
 
 import json
 import logging
+import re
 
-from taskboy.adapters._util import _error, _text, wrap
+from taskboy.adapters._util import AccessDenied, _error, _text, wrap
 from taskboy.models import Task
 from taskboy.redact import redactor
 from taskboy.store import Store
@@ -114,15 +115,14 @@ class JiraAdapter:
             fields["assignee"] = {"accountId": assignee}
         if parent_key:
             fields["parent"] = {"key": parent_key.upper()}
-        points_note = ""
-        if story_points > 0:
-            if self.story_points_field:
-                fields[self.story_points_field] = story_points
-            else:
-                points_note = " — story points not set — configure jira.story_points_field"
+        if story_points > 0 and self.story_points_field:
+            fields[self.story_points_field] = story_points
         payload = {"fields": fields}
         created = await self._request("POST", "/rest/api/3/issue", payload)
         key = str(created["key"])
+        points_note = ""
+        if story_points > 0 and not self.story_points_field:
+            points_note = f" — story points were not set: an operator must set story_points_field in services/jira.yaml. this is an access problem an operator can fix: call request_permission with kind='access' and target='jira:story_points_field', quoting this message as the reason, then stop working. Once granted, call set_story_points with key {key} and points {story_points:g} instead of calling create_issue again; the issue already exists."
         self._record_issue(key)
         if self.on_milestone:
             await self.on_milestone(f"Created Jira issue {key}")
@@ -157,7 +157,7 @@ class JiraAdapter:
 
     async def set_story_points(self, args: dict) -> dict:
         if not self.story_points_field:
-            return _error("story points field is not configured — set jira.story_points_field")
+            raise AccessDenied("jira", "story_points_field", "story points field is not configured — an operator must set story_points_field in services/jira.yaml (the Story Points custom field id)")
         key = str(args.get("key", "")).strip().upper()
         points = float(args.get("points") or 0)
         await self._request("PUT", f"/rest/api/3/issue/{key}", {"fields": {self.story_points_field: points}})
@@ -198,6 +198,9 @@ class JiraAdapter:
         auth = aiohttp.BasicAuth(self.email, self.api_token)
         async with aiohttp.ClientSession(auth=auth) as session:
             async with session.request(method, self.site + path, json=payload, params=params, headers={"Accept": "application/json"}) as response:
+                if response.status in (401, 403):
+                    body = redactor.redact(await response.text())[:300]
+                    raise AccessDenied("jira", _project_scope(path, payload), f"jira api {method} {path} denied: {response.status} — {body}")
                 if response.status >= 300:
                     body = redactor.redact(await response.text())[:300]
                     raise RuntimeError(f"jira api {method} {path} failed: {response.status} — {body}")
@@ -261,3 +264,12 @@ def build_jira_server(adapter: JiraAdapter):
         tool("link_pr", "Attach a GitHub pull request link to a Jira issue.", {"key": str, "pr_url": str, "title": str})(wrap(adapter.link_pr, logger)),
     ]
     return create_sdk_mcp_server(name="jira", version="1.0.0", tools=tools)
+
+
+def _project_scope(path: str, payload: dict | None) -> str:
+    """best-effort project key for an access target: from the create payload, else the issue key in the path, else the api."""
+    project = ((payload or {}).get("fields") or {}).get("project") or {}
+    if isinstance(project, dict) and project.get("key"):
+        return str(project["key"])
+    match = re.search(r"/issue/([A-Za-z][A-Za-z0-9_]+)-\d+", path)
+    return match.group(1).upper() if match else "api"

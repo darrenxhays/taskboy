@@ -43,10 +43,14 @@ def create(workspaces_root: str, task_id: str) -> Path:
     return workspace
 
 
-def delete(workspaces_root: str, task_id: str) -> None:
+def delete(workspaces_root: str, task_id: str) -> bool:
+    """delete a task's workspace; returns whether the directory is gone afterward."""
     workspace = Path(workspaces_root) / task_id
+    shutil.rmtree(workspace, ignore_errors=True)
     if workspace.exists():
-        shutil.rmtree(workspace, ignore_errors=True)
+        logger.warning("workspace %s could not be fully removed; some files may be root-owned", workspace)
+        return False
+    return True
 
 
 def sweep_once(store: Store, workspaces_root: str, memory_root: str, retention: dict) -> dict:
@@ -62,9 +66,9 @@ def sweep_once(store: Store, workspaces_root: str, memory_root: str, retention: 
     for task in store.terminal_tasks_updated_before(max(completed_cutoff, failed_cutoff)):
         cutoff = completed_cutoff if task.state == COMPLETED else failed_cutoff
         if task.updated_at < cutoff:
-            delete(workspaces_root, task.task_id)
-            store.set_fields(task.task_id, workspace_path=None)
-            workspaces += 1
+            if delete(workspaces_root, task.task_id):
+                store.set_fields(task.task_id, workspace_path=None)
+                workspaces += 1
 
     memories = 0
     memory_deadline = time.time() - retention.get("memory_days", 90) * 86400

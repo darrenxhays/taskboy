@@ -1,10 +1,56 @@
 import asyncio
 import itertools
+import sys
+from types import SimpleNamespace
 
 import pytest
 
 from taskboy.config import KNOWN_SERVICES, Config, Role, SlackConfig
 from taskboy.store import Store
+
+
+@pytest.fixture
+def fake_aiohttp(monkeypatch):
+    def install(status, *, headers=None, body="", payload=None, content=b""):
+        class FakeResponse:
+            def __init__(self):
+                self.status = status
+                self.headers = headers or {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def text(self):
+                return body
+
+            async def json(self):
+                return payload
+
+            async def read(self):
+                return content
+
+        response = FakeResponse()
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            def request(self, *args, **kwargs):
+                return response
+
+            def get(self, *args, **kwargs):
+                return response
+
+        module = SimpleNamespace(BasicAuth=lambda username, password: (username, password), ClientSession=lambda *args, **kwargs: FakeSession())
+        monkeypatch.setitem(sys.modules, "aiohttp", module)
+
+    return install
 
 
 def make_config(**overrides) -> Config:

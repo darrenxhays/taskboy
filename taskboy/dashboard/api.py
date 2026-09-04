@@ -13,16 +13,18 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Uplo
 from fastapi.responses import RedirectResponse, StreamingResponse
 
 from taskboy import memory, settings, skills
+from taskboy.adapters import aws_read
 from taskboy.config import KNOWN_SERVICES, ConfigError
 from taskboy.dashboard import gitops
 from taskboy.dashboard.auth import Viewer, require_admin, require_viewer, require_viewer_write
 from taskboy.dashboard.editors import EDITABLE_KINDS, atomic_write, contains_secret_submission, content_hash, target_for, unified_diff, validate
 from taskboy.dashboard.render import bounded_text, redact_bounded_value, redact_value, safe_text
+from taskboy.hooks import is_profile_escalation
 from taskboy.issue_runs import IMPLEMENTATION_BATCH_SIZE, start_implementation_run, start_issue_task, start_refine_task
-from taskboy.models import CANCELLED, EFFORT_LEVELS, FAILED, RUNNING, STATES, TERMINAL_STATES, Task, utcnow
+from taskboy.models import BLOCKED, CANCELLED, EFFORT_LEVELS, FAILED, RUNNING, STATES, TERMINAL_STATES, Task, utcnow
 from taskboy.scheduler import fire_schedule_now, next_run_after
 from taskboy.skills import SkillError
-from taskboy.task_actions import cancel_task, decide_permission, retry_task
+from taskboy.task_actions import cancel_task, decide_permission, resume_task, retry_task
 
 router = APIRouter()
 TASK_ID = re.compile(r"^t[0-9]{8}-[a-f0-9]{8}$")
@@ -31,6 +33,8 @@ TASK_ID = re.compile(r"^t[0-9]{8}-[a-f0-9]{8}$")
 ISSUE_SKILLS = {"discoverissues", "implementapprovedissues"}
 # ranked statuses get a 1..N importance order; decided-and-done ones drop out of the ranking
 RANKED_STATUSES = ("proposed", "approved", "in_progress")
+# issues in these statuses can still be refined/edited; anything else is locked (running, terminal, etc.)
+EDITABLE_STATUSES = ("proposed", "approved")
 MAX_ISSUE_UPLOAD_BYTES = 5 * 1024 * 1024
 
 
@@ -140,6 +144,11 @@ async def task_detail(request: Request, task_id: str, event_page: int = 1, viewe
     names: dict[str, str | None] = {}
     own_memory = memory.read_summary(settings.MEMORY_ROOT, task_id)
     parent_memory = memory.read_summary(settings.MEMORY_ROOT, task.parent_task_id) if task.parent_task_id else None
+    profile_allowed_tools = ((config.raw.get("profiles") or {}).get(task.profile) or {}).get("allowed_tools") or []
+    permission_requests = []
+    for row in store.permission_requests_for(task_id):
+        row["escalation"] = row["kind"] == "tool" and is_profile_escalation(row["target"], profile_allowed_tools)
+        permission_requests.append(redact_bounded_value(row))
     return {
         "task": redact_bounded_value(asdict(task)),
         "bot_name": config.agent_name,
@@ -153,13 +162,15 @@ async def task_detail(request: Request, task_id: str, event_page: int = 1, viewe
         "usage": [redact_bounded_value(row) for row in store.usage_for(task_id)],
         "timings": [redact_bounded_value(row) for row in store.events_for_kinds(task_id, {"timing"})],
         "artifacts": [redact_bounded_value(row) for row in store.artifacts_for(task_id)],
-        "permission_requests": [redact_bounded_value(row) for row in store.permission_requests_for(task_id)],
+        "permission_requests": permission_requests,
         "questions": [redact_bounded_value(row) for row in store.questions_for(task_id)],
         "feedback": [redact_bounded_value(row) for row in store.feedback_for(task_id)],
         "own_memory": bounded_text(own_memory, 100000) if own_memory else None,
         "parent_memory": bounded_text(parent_memory, 100000) if parent_memory else None,
         "can_cancel": task.state not in TERMINAL_STATES,
         "can_retry": task.state in (FAILED, CANCELLED),
+        # a blocked task with no pending decision or question is only resumable by an operator saying "fixed, go again"
+        "can_resume": task.state == BLOCKED and not store.has_pending_permission_request(task_id) and store.pending_questions_for(task_id) is None,
     }
 
 
@@ -173,6 +184,19 @@ async def task_cancel(request: Request, task_id: str, viewer: Viewer = Depends(r
     orchestrator = request.app.state.orchestrator
     if orchestrator is not None:
         orchestrator.wake.set()  # same process: pick up the cancel now instead of on the next poll
+    return {"status": status, "state": task.state if task else None}
+
+
+@router.post("/api/tasks/{task_id}/resume")
+async def task_resume(request: Request, task_id: str, viewer: Viewer = Depends(require_admin)) -> dict:
+    if not TASK_ID.fullmatch(task_id):
+        raise HTTPException(status_code=404, detail="task not found")
+    store = request.app.state.store
+    task, status = resume_task(store, task_id, viewer.email)
+    store.add_admin_event(viewer.email, "task_resume", task_id, status)
+    orchestrator = request.app.state.orchestrator
+    if orchestrator is not None:
+        orchestrator.wake.set()
     return {"status": status, "state": task.state if task else None}
 
 
@@ -200,8 +224,8 @@ async def task_permission(request: Request, task_id: str, viewer: Viewer = Depen
     kind = str(body.get("kind") or "")
     target = str(body.get("target") or "")
     decision = str(body.get("decision") or "")
-    if kind not in ("tool", "repo"):
-        raise HTTPException(status_code=400, detail="kind must be tool or repo")
+    if kind not in ("tool", "repo", "access"):
+        raise HTTPException(status_code=400, detail="kind must be tool, repo, or access")
     if decision not in ("granted", "denied"):
         raise HTTPException(status_code=400, detail="decision must be granted or denied")
     store = request.app.state.store
@@ -369,8 +393,11 @@ async def update_issue_priority(request: Request, issue_id: int, viewer: Viewer 
 @router.post("/api/issues/{issue_id}/refine")
 async def refine_issue(request: Request, issue_id: int, viewer: Viewer = Depends(require_admin)) -> dict:
     store = request.app.state.store
-    if store.get_issue(issue_id) is None:
+    existing = store.get_issue(issue_id)
+    if existing is None:
         raise HTTPException(status_code=404, detail="issue not found")
+    if existing["status"] not in EDITABLE_STATUSES:
+        raise HTTPException(status_code=409, detail="issue is not editable")
     task, status, active_task_id = await start_refine_task(store, request.app.state.config, request.app.state.notifier, issue_id, source=f"dashboard:{viewer.email}")
     task_id = task.task_id if task else active_task_id
     if status == "already_running":
@@ -389,7 +416,7 @@ async def implement_issue(request: Request, issue_id: int, viewer: Viewer = Depe
     existing = store.get_issue(issue_id)
     if existing is None:
         raise HTTPException(status_code=404, detail="issue not found")
-    if existing["status"] not in ("proposed", "approved"):
+    if existing["status"] not in EDITABLE_STATUSES:
         raise HTTPException(status_code=409, detail="issue is not eligible for implementation")
     task, status, active_task_id = await start_implementation_run(
         store,
@@ -446,7 +473,7 @@ async def bulk_issues(request: Request, viewer: Viewer = Depends(require_admin))
             row = store.get_issue(issue_id)
             if row is None:
                 results.append({"id": issue_id, "status": "not_found"})
-            elif row["status"] not in ("proposed", "approved"):
+            elif row["status"] not in EDITABLE_STATUSES:
                 results.append({"id": issue_id, "status": "skipped"})
             else:
                 eligible_ids.append(issue_id)
@@ -472,11 +499,15 @@ async def bulk_issues(request: Request, viewer: Viewer = Depends(require_admin))
             elif action == "delete":
                 # delete_issue already refuses in_progress/in_review rows
                 results.append({"id": issue_id, "status": "deleted" if store.delete_issue(issue_id) else "skipped"})
-            elif store.get_issue(issue_id) is None:
-                results.append({"id": issue_id, "status": "not_found"})
             else:
-                task, status, active_task_id = await start_refine_task(store, request.app.state.config, request.app.state.notifier, issue_id, source=f"dashboard-bulk:{viewer.email}")
-                results.append({"id": issue_id, "status": status, "task_id": task.task_id if task else active_task_id})
+                row = store.get_issue(issue_id)
+                if row is None:
+                    results.append({"id": issue_id, "status": "not_found"})
+                elif row["status"] not in EDITABLE_STATUSES:
+                    results.append({"id": issue_id, "status": "skipped"})
+                else:
+                    task, status, active_task_id = await start_refine_task(store, request.app.state.config, request.app.state.notifier, issue_id, source=f"dashboard-bulk:{viewer.email}")
+                    results.append({"id": issue_id, "status": status, "task_id": task.task_id if task else active_task_id})
     store.add_admin_event(viewer.email, "issue_bulk", action, "completed", {"ids": ids, "results": results})
     orchestrator = request.app.state.orchestrator
     if orchestrator is not None and action in ("refine", "implement"):
@@ -784,18 +815,17 @@ async def memory_detail(request: Request, task_id: str, viewer: Viewer = Depends
     return {"task_id": task_id, "content": bounded_text(content, 100000), "state": task.state if task else None}
 
 
-def _usage_card(store, label: str, since: datetime | None = None, model: str | None = None, limit_tokens: int | None = None, observed: dict | None = None) -> dict:
+def _usage_card(store, label: str, since: datetime | None = None, model_like: str | None = None, limit_tokens: int | None = None, observed: dict | None = None) -> dict:
     since_iso = _iso(since) if since else None
-    totals = store.usage_totals(since_iso=since_iso, model=model)
+    totals = store.usage_totals(since_iso=since_iso, model_like=model_like)
     total_tokens = totals["input_tokens"] + totals["output_tokens"] + totals["cache_read_tokens"] + totals["cache_write_tokens"]
-    return {"label": label, "since": since_iso, "totals": totals, "by_model": store.usage_by_model(since_iso=since_iso, model=model), "total_tokens": total_tokens, "limit_tokens": limit_tokens, "observed": observed}
+    return {"label": label, "since": since_iso, "totals": totals, "by_model": store.usage_by_model(since_iso=since_iso, model_like=model_like), "total_tokens": total_tokens, "limit_tokens": limit_tokens, "observed": observed}
 
 
 @router.get("/api/usage")
 async def usage(request: Request, viewer: Viewer = Depends(require_viewer)) -> dict:
     store = request.app.state.store
     now = _now()
-    fable_model = str((((request.app.state.config.raw.get("models") or {}).get("fable") or {}).get("id") or "claude-fable-5"))
     limits = request.app.state.config.raw.get("usage_limits") or {}
     windows = store.rate_limit_windows()
     now_epoch = int(now.timestamp())
@@ -821,11 +851,11 @@ async def usage(request: Request, viewer: Viewer = Depends(require_viewer)) -> d
 
     return {
         "generated_at": _iso(now),
-        "fable_model": fable_model,
         "cards": {
             "five_hour": _usage_card(store, "Rolling 5 hours", now - timedelta(hours=5), limit_tokens=configured_limit("five_hour_tokens"), observed=window_for("five_hour")),
             "weekly": _usage_card(store, "Rolling 7 days", now - timedelta(days=7), limit_tokens=configured_limit("weekly_tokens"), observed=window_for("weekly")),
-            "fable": _usage_card(store, "Fable — rolling 7 days", now - timedelta(days=7), model=fable_model, limit_tokens=configured_limit("fable_weekly_tokens"), observed=window_for("fable")),
+            # the fable card tracks the fable rate-limit pool, so it matches the whole family: the configured alias and any pinned id ever recorded
+            "fable": _usage_card(store, "Fable — rolling 7 days", now - timedelta(days=7), model_like="fable", limit_tokens=configured_limit("fable_weekly_tokens"), observed=window_for("fable")),
         },
         "timeseries": store.usage_timeseries(_iso(now - timedelta(days=7))),
     }
@@ -848,11 +878,14 @@ async def config_view(request: Request, viewer: Viewer = Depends(require_viewer)
     }
     secret_presence = {name: bool(getattr(app_secrets, name)) for name in app_secrets.__dataclass_fields__} if app_secrets else {}
     services_dir = Path(settings.CONFIG_PATH).parent / "services"
+    role_arns = (config.raw.get("aws") or {}).get("diagnostics_role_arns") or {}
+    aws_environments = await asyncio.to_thread(aws_read.check_environments, role_arns) if config.service_enabled("aws") and role_arns else {}
     return {
         "runtime": redact_value(runtime),
         "policy": redact_value(config.raw),
         "dashboard": redact_value(asdict(config.dashboard)),
         "secret_presence": secret_presence,
+        "aws_environments": aws_environments,  # "ok" or the assume-role error per configured environment
         "skills": skills.available(settings.SKILLS_ROOT),
         # editable = the section lives in its own services/<name>.yaml file (legacy inline sections are edited via config.yaml)
         "services": {name: {"enabled": config.service_enabled(name), "editable": (services_dir / f"{name}.yaml").is_file()} for name in KNOWN_SERVICES},

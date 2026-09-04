@@ -8,7 +8,7 @@ every access is attributable via the tool-call audit trail (SEN-006).
 import json
 import logging
 
-from taskboy.adapters._util import _error, _text, wrap
+from taskboy.adapters._util import AccessDenied, _error, _text, wrap
 from taskboy.models import Task
 from taskboy.redact import redactor
 from taskboy.store import Store
@@ -65,6 +65,9 @@ class SentryAdapter:
         headers = {"Authorization": f"Bearer {self.token}"}
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(SENTRY_API + path, params=params) as response:
+                if response.status in (401, 403):
+                    body = redactor.redact(await response.text())[:300]
+                    raise AccessDenied("sentry", self.organization, f"sentry api GET {path} denied: {response.status} — {body}")
                 if response.status >= 300:
                     body = redactor.redact(await response.text())[:300]
                     raise RuntimeError(f"sentry api GET {path} failed: {response.status} — {body}")

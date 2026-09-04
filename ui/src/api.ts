@@ -72,6 +72,7 @@ export type PermissionRequest = {
   kind: string;
   target: string;
   reason: string;
+  escalation: boolean;
   status: string;
   decided_by: string | null;
   requested_at: string;
@@ -107,11 +108,11 @@ export type TaskDetail = {
   parent_memory: string | null;
   can_cancel: boolean;
   can_retry: boolean;
+  can_resume: boolean;
 };
 
 export type Usage = {
   generated_at: string;
-  fable_model: string;
   cards: { five_hour: UsageCard; weekly: UsageCard; fable: UsageCard };
   timeseries: { bucket: string; model: string; total_tokens: number; output_tokens: number; cost_usd: number }[];
 };
@@ -264,6 +265,7 @@ export const api = {
   task: (taskId: string, eventPage = 1) => request<TaskDetail>(`/api/tasks/${taskId}?event_page=${eventPage}`),
   cancel: (taskId: string) => request<{ status: string; state: string | null }>(`/api/tasks/${taskId}/cancel`, { method: "POST", headers: { "x-harness-dashboard": "1" } }),
   retry: (taskId: string) => request<{ status: string; new_task_id: string | null }>(`/api/tasks/${taskId}/retry`, { method: "POST", headers: { "x-harness-dashboard": "1" } }),
+  resume: (taskId: string) => request<{ status: string; state: string | null }>(`/api/tasks/${taskId}/resume`, { method: "POST", headers: { "x-harness-dashboard": "1" } }),
   decidePermission: (taskId: string, body: { kind: string; target: string; decision: "granted" | "denied" }) =>
     request<{ status: string; state: string | null }>(`/api/tasks/${taskId}/permissions`, {
       method: "POST",
@@ -348,7 +350,7 @@ export const api = {
   memory: (q: string) => request<{ records: { task_id: string; modified: string; size: number; preview: string }[] }>(`/api/memory${q ? `?q=${encodeURIComponent(q)}` : ""}`),
   memoryDetail: (taskId: string) => request<{ task_id: string; content: string; state: string | null }>(`/api/memory/${taskId}`),
   usage: () => request<Usage>("/api/usage"),
-  config: () => request<{ runtime: Record<string, string>; policy: Record<string, unknown>; dashboard: Record<string, unknown>; secret_presence: Record<string, boolean>; skills: string[]; services: Record<string, { enabled: boolean; editable: boolean }> }>("/api/config"),
+  config: () => request<{ runtime: Record<string, string>; policy: Record<string, unknown>; dashboard: Record<string, unknown>; secret_presence: Record<string, boolean>; aws_environments: Record<string, string>; skills: string[]; services: Record<string, { enabled: boolean; editable: boolean }> }>("/api/config"),
   adminEvents: () => request<{ events: Record<string, unknown>[] }>("/api/admin-events"),
   manageRead: (kind: string, name?: string) => request<ManageTarget>(`/api/manage/${kind}${name ? `?name=${encodeURIComponent(name)}` : ""}`),
   manageWrite: (kind: string, body: { name?: string | null; content: string; base_hash: string; action: "preview" | "confirm" }) =>

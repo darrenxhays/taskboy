@@ -3,7 +3,10 @@ services:
     # full image, not -slim: tests exercise the real git cli (workspace pre-push hook)
     image: python:3.12
     working_dir: /app
+    # run as the invoking user so files the container creates in the checkout are not root-owned
+    user: "${HOST_UID:?set HOST_UID=$(id -u) HOST_GID=$(id -g), or run through make}:${HOST_GID:?set HOST_UID=$(id -u) HOST_GID=$(id -g), or run through make}"
     volumes:
       - .:/app
     environment:
       - ENVIRONMENT=local
+      - HOME=/tmp
