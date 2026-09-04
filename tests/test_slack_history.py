@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from taskboy.adapters._util import AccessDenied
 from taskboy.adapters.slack_history import HISTORY_MAX_LIMIT, SlackHistoryAdapter, build_slack_server
 
 
@@ -162,6 +163,50 @@ async def test_get_file_errors_when_download_directory_is_unset(store, make_task
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "requests_permission"),
+    [
+        ("missing_scope", True),
+        ("not_allowed_token_type", True),
+        ("not_authed", True),
+        ("invalid_auth", True),
+        ("account_inactive", True),
+        ("token_revoked", True),
+        ("no_permission", True),
+        ("ekm_access_denied", True),
+        ("file_not_found", False),
+    ],
+)
+async def test_get_file_maps_only_files_info_access_errors_to_permission_requests(monkeypatch, store, make_task, tmp_path, code, requests_permission):
+    class FilesInfoError(Exception):
+        response = {"ok": False, "error": code}
+
+    captured = []
+
+    def fake_tool(name, description, schema):
+        def decorate(fn):
+            captured.append(fn)
+            return fn
+
+        return decorate
+
+    monkeypatch.setattr("claude_agent_sdk.tool", fake_tool)
+    monkeypatch.setattr("claude_agent_sdk.create_sdk_mcp_server", lambda **kwargs: kwargs)
+    client = AsyncMock()
+    client.files_info = AsyncMock(side_effect=FilesInfoError(code))
+    adapter = SlackHistoryAdapter(store, make_task(), client, files_dir=tmp_path / "slack_files")
+    adapter._download_file = AsyncMock()
+    build_slack_server(adapter)
+
+    text = (await captured[3]({"file_id": "F1"}))["content"][0]["text"]
+
+    assert ("request_permission" in text) is requests_permission
+    assert ("kind='access'" in text) is requests_permission
+    assert ("target='slack:files'" in text) is requests_permission
+    adapter._download_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_user_info_refreshes_and_then_uses_cache(store, make_task):
     client = AsyncMock()
     client.users_info.return_value = {"user": {"team_id": "T1", "name": "ada", "real_name": "Ada", "profile": {"display_name": "ada", "email": "ada@example.test"}}}
@@ -206,6 +251,34 @@ async def test_send_dm_validates_required_fields(store, make_task, args, error):
     assert result["isError"] is True
     assert error in result["content"][0]["text"]
     client.conversations_open.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", (401, 403))
+async def test_download_file_maps_forbidden_to_files_access_denied(fake_aiohttp, store, make_task, status):
+    client = AsyncMock()
+    client.token = "xoxb-test"
+    adapter = SlackHistoryAdapter(store, make_task(), client)
+    fake_aiohttp(status)
+
+    with pytest.raises(AccessDenied) as raised:
+        await adapter._download_file("https://files.slack.test/F1")
+
+    assert raised.value.system == "slack"
+    assert raised.value.scope == "files"
+
+
+@pytest.mark.asyncio
+async def test_download_file_keeps_server_errors_generic(fake_aiohttp, store, make_task):
+    client = AsyncMock()
+    client.token = "xoxb-test"
+    adapter = SlackHistoryAdapter(store, make_task(), client)
+    fake_aiohttp(500)
+
+    with pytest.raises(RuntimeError) as raised:
+        await adapter._download_file("https://files.slack.test/F1")
+
+    assert not isinstance(raised.value, AccessDenied)
 
 
 @pytest.mark.asyncio

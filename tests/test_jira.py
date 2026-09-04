@@ -2,7 +2,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from taskboy.adapters.jira import JiraAdapter, _adf, _adf_to_text
+from taskboy.adapters._util import AccessDenied
+from taskboy.adapters.jira import JiraAdapter, _adf, _adf_to_text, _project_scope
 from taskboy.models import QUEUED, RECEIVED
 
 SITE = "https://example.atlassian.net"
@@ -123,8 +124,16 @@ async def test_create_issue_sets_parent_points_and_assignee(adapter):
 async def test_create_issue_without_points_field_adds_note(adapter):
     adapter.story_points_field = ""
     adapter._request.side_effect = [{"issues": []}, {"key": "RISK-103"}]
-    result = await adapter.create_issue({"project": "RISK", "issue_type": "Story", "summary": "Work", "story_points": 2})
-    assert "story points not set" in result["content"][0]["text"]
+    result = await adapter.create_issue({"project": "RISK", "issue_type": "Story", "summary": "Work", "story_points": 3})
+    text = result["content"][0]["text"]
+    assert "story points were not set" in text
+    assert "RISK-103" in text
+    assert "set_story_points" in text
+    assert "points 3" in text
+    assert "request_permission" in text
+    assert "kind='access'" in text
+    assert "target='jira:story_points_field'" in text
+    assert "retry" not in text
 
 
 @pytest.mark.asyncio
@@ -173,8 +182,68 @@ async def test_assign_move_epic_and_story_points_write_and_audit(adapter, store)
 
 @pytest.mark.asyncio
 async def test_set_story_points_requires_configured_field(adapter):
+    # the evidence case (2026-09-02): an empty jira.story_points_field blocked a sprint task with no way out. the
+    # adapter now raises AccessDenied so the wrapped tool tells the model which access target to request
+    import logging
+
+    from taskboy.adapters._util import AccessDenied, wrap
+
     adapter.story_points_field = ""
-    result = await adapter.set_story_points({"key": "RISK-1", "points": 3})
+    with pytest.raises(AccessDenied):
+        await adapter.set_story_points({"key": "RISK-1", "points": 3})
+    result = await wrap(adapter.set_story_points, logging.getLogger("test"))({"key": "RISK-1", "points": 3})
     assert result.get("isError") is True
-    assert "story points field is not configured" in result["content"][0]["text"]
+    text = result["content"][0]["text"]
+    assert "story points field is not configured" in text
+    assert "kind='access'" in text and "target='jira:story_points_field'" in text
     adapter._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path", "payload", "status", "scope"),
+    [
+        ("POST", "/rest/api/3/issue", {"fields": {"project": {"key": "RSQ"}}}, 403, "RSQ"),
+        ("PUT", "/rest/api/3/issue/RSQ-42", {"fields": {"summary": "updated"}}, 401, "RSQ"),
+        ("GET", "/rest/api/3/myself", None, 403, "api"),
+    ],
+)
+async def test_request_maps_unauthorized_and_forbidden_to_scoped_access_denied(adapter, fake_aiohttp, method, path, payload, status, scope):
+    del adapter._request
+    fake_aiohttp(status, body="denied")
+
+    with pytest.raises(AccessDenied) as raised:
+        await adapter._request(method, path, payload)
+
+    assert raised.value.system == "jira"
+    assert raised.value.scope == scope
+
+
+@pytest.mark.asyncio
+async def test_request_server_error_stays_generic(adapter, fake_aiohttp):
+    import logging
+
+    from taskboy.adapters._util import wrap
+
+    del adapter._request
+    fake_aiohttp(500, body="server unavailable")
+
+    with pytest.raises(RuntimeError, match="jira api GET .* failed: 500"):
+        await adapter._request("GET", "/rest/api/3/issue/RISK-42")
+
+    result = await wrap(adapter.get_issue, logging.getLogger("test"))({"key": "RISK-42"})
+    text = result["content"][0]["text"]
+    assert result.get("isError") is True
+    assert "request_permission" not in text
+
+
+@pytest.mark.parametrize(
+    ("path", "payload", "scope"),
+    [
+        ("/rest/api/3/issue", {"fields": {"project": {"key": "RSQ"}}}, "RSQ"),
+        ("/rest/api/3/issue/RSQ-42", {"fields": {"summary": "updated"}}, "RSQ"),
+        ("/rest/api/3/myself", None, "api"),
+    ],
+)
+def test_project_scope_uses_create_payload_issue_path_or_api(path, payload, scope):
+    assert _project_scope(path, payload) == scope

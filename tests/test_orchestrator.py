@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 
 import pytest
@@ -36,6 +37,63 @@ async def test_concurrency_cap_respected_and_all_tasks_complete(store, config, n
     await loop_task
     assert peak <= config.max_concurrency
     assert notifier.kinds().count("completed") == 6
+
+
+@pytest.mark.asyncio
+async def test_dispatch_skips_task_with_existing_supervisor(store, config, notifier, make_task, monkeypatch, wait_until):
+    async def run(task):
+        await asyncio.sleep(30)
+
+    task_a = make_task("task a")
+    task_b = make_task("task b")
+    store.transition(task_a.task_id, RECEIVED, QUEUED, "classified")
+    store.transition(task_b.task_id, RECEIVED, QUEUED, "classified")
+    checked_queue = asyncio.Event()
+    next_queued = store.next_queued
+
+    def observe_next_queued(exclude_task_ids=None):
+        queued = next_queued(exclude_task_ids=exclude_task_ids)
+        checked_queue.set()
+        return queued
+
+    monkeypatch.setattr(store, "next_queued", observe_next_queued)
+    orchestrator = Orchestrator(store, config, classify=stub_classify, run=run, notifier=notifier)
+    existing_handle = asyncio.create_task(asyncio.sleep(30))
+    orchestrator.running[task_a.task_id] = existing_handle
+    loop_task = asyncio.create_task(orchestrator.dispatcher_loop())
+    try:
+        await checked_queue.wait()
+        await wait_until(lambda: store.get_task(task_b.task_id).state == RUNNING)
+        assert store.get_task(task_a.task_id).state == QUEUED
+        assert orchestrator.running[task_a.task_id] is existing_handle
+        assert task_b.task_id in orchestrator.running
+    finally:
+        await orchestrator.shutdown()
+        existing_handle.cancel()
+        await asyncio.gather(existing_handle, return_exceptions=True)
+        await loop_task
+
+
+@pytest.mark.asyncio
+async def test_release_only_removes_current_supervisor(store, config, notifier):
+    orchestrator = Orchestrator(store, config, classify=stub_classify, run=None, notifier=notifier)
+    registered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def supervisor():
+        orchestrator.running["task"] = asyncio.current_task()
+        registered.set()
+        await release.wait()
+        orchestrator._release("task")
+
+    handle = asyncio.create_task(supervisor())
+    await registered.wait()
+    orchestrator._release("task")
+    assert orchestrator.running["task"] is handle
+
+    release.set()
+    await handle
+    assert "task" not in orchestrator.running
 
 
 @pytest.mark.asyncio
@@ -318,6 +376,12 @@ async def test_retryable_session_limit_outcome_requeues_gated_by_not_before(stor
     assert requeued.not_before == "9999-01-01T00:00:00+00:00"
     assert store.count_tasks(FAILED) == 0
     assert "recovered" in notifier.kinds()
+    events = [e for e in store.events_for(task.task_id) if e["kind"] == "recovery"]
+    assert len(events) == 1
+    assert json.loads(events[0]["detail_json"])["action"] == "requeued_transient"
+    state_changes = [e for e in store.events_for(task.task_id) if e["kind"] == "state_change"]
+    reasons = [json.loads(e["detail_json"])["reason"] for e in state_changes]
+    assert "requeued: transient session failure" in reasons
 
 
 @pytest.mark.asyncio

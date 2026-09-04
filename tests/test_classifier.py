@@ -12,8 +12,8 @@ RAW = {
     "classifier": {"tier": "haiku"},
     "models": {
         "haiku": {"id": "claude-haiku-4-5", "fallbacks": ["sonnet"]},
-        "sonnet": {"id": "claude-sonnet-4-6", "fallbacks": []},
-        "opus": {"id": "claude-opus-4-6", "fallbacks": []},
+        "sonnet": {"id": "claude-sonnet-5", "fallbacks": []},
+        "opus": {"id": "claude-opus-5", "fallbacks": []},
     },
     "routing": {
         "rules": [

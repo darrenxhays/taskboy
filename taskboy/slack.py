@@ -543,7 +543,14 @@ class SlackNotifier:
             await self.debug.blocked(task)
         if task.schedule_name:
             return  # debug feed already threads this into the debug channel; skip the duplicate top-level post
-        await self._post(task, f"*Blocked*\n{task.blocked_reason or ''}\nReply in this thread to continue.")
+        task_link = f"{self.dashboard_url}/tasks/{task.task_id}" if self.dashboard_url else "the dashboard"
+        if self.store is not None and self.store.has_pending_permission_request(task.task_id):
+            # the session asked for something it lacks; an admin grants it and the same session resumes (§8.4)
+            text = f"*Waiting for operator approval*\n{task.blocked_reason or ''}\nAn admin can grant this at {task_link} and I'll pick the task back up where I left off."
+        else:
+            # a thread reply here starts a new task, not a resume — say what actually continues this one
+            text = f"*Blocked*\n{task.blocked_reason or ''}\nOnce the blocker is fixed, an admin can resume this task at {task_link}; or mention me here to start a new task."
+        await self._post(task, text)
 
     async def issue_blocked(self, task: Task, issue: dict) -> None:
         """this task is cancelled and its issue is either reopened as `proposed` or, if it had already opened a PR,
@@ -575,7 +582,7 @@ class SlackNotifier:
             await self.debug.recovered(task)
         if task.schedule_name:
             return  # debug feed already threads this into the debug channel; skip the duplicate top-level post
-        await self._post(task, "The orchestrator restarted; this task was requeued and will resume.")
+        await self._post(task, "This task hit a transient issue and was requeued; it will resume shortly.")
 
     async def refused(self, task: Task, reason: str) -> None:
         if self.debug is not None:

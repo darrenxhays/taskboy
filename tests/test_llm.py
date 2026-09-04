@@ -187,6 +187,35 @@ async def test_structured_call_reraises_tolerated_text_when_no_frame_received(mo
 
 
 @pytest.mark.asyncio
+async def test_structured_call_falls_back_to_text_parsing_on_schema_rejection_400(monkeypatch):
+    """#124: a deterministic 400 rejecting the output_format tool schema must not be retried identically."""
+    import claude_agent_sdk
+
+    calls = []
+
+    async def sdk(*, prompt, options):
+        calls.append((prompt, options))
+        if len(calls) == 1:
+            raise Exception("API Error: 400 tools.9.custom.input_schema: input_schema does not support oneOf, allOf, or anyOf at the top level")
+            yield  # unreachable; makes this an async generator so `async for` works
+        yield SimpleNamespace(structured_output=None, result='{"answer": "ok"}', usage={}, total_cost_usd=None)
+
+    monkeypatch.setattr(claude_agent_sdk, "query", sdk)
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+
+    result, _ = await structured_call("claude-haiku", "prompt", schema)
+
+    assert result == {"answer": "ok"}
+    assert len(calls) == 2
+    first_prompt, first_options = calls[0]
+    second_prompt, second_options = calls[1]
+    assert first_options.output_format == {"type": "json_schema", "schema": schema}
+    assert second_options.output_format is None  # second attempt drops the rejected tool schema
+    assert first_prompt == "prompt"
+    assert json.dumps(schema) in second_prompt
+
+
+@pytest.mark.asyncio
 async def test_structured_call_two_failures_raises_with_diagnostics(monkeypatch):
     import claude_agent_sdk
 

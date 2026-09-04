@@ -327,6 +327,32 @@ MIGRATIONS = [
     );
     CREATE INDEX idx_issue_attachments_issue ON issue_attachments(issue_id, id);
     """,
+    # a session may now ask for any access it lacks, not only a tool or repo: kind 'access' carries a
+    # system:scope target (aws:production, jira:story_points_field, ...) that an operator satisfies out of
+    # band and then grants to resume the task. sqlite can't ALTER a CHECK constraint, so rebuild the table.
+    """
+    PRAGMA foreign_keys=OFF;
+    BEGIN;
+    CREATE TABLE permission_requests_new (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id      TEXT NOT NULL REFERENCES tasks(task_id),
+        kind         TEXT NOT NULL CHECK (kind IN ('tool','repo','access')),
+        target       TEXT NOT NULL,
+        reason       TEXT NOT NULL,
+        status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','granted','denied')),
+        decided_by   TEXT,
+        requested_at TEXT NOT NULL,
+        decided_at   TEXT,
+        UNIQUE(task_id, kind, target)
+    );
+    INSERT INTO permission_requests_new (id, task_id, kind, target, reason, status, decided_by, requested_at, decided_at)
+    SELECT id, task_id, kind, target, reason, status, decided_by, requested_at, decided_at FROM permission_requests;
+    DROP TABLE permission_requests;
+    ALTER TABLE permission_requests_new RENAME TO permission_requests;
+    CREATE INDEX idx_permission_requests_task ON permission_requests(task_id, id);
+    COMMIT;
+    PRAGMA foreign_keys=ON;
+    """,
 ]
 
 SCHEDULE_UPDATABLE = {"name", "request_text", "model_alias", "effort", "kind", "interval_minutes", "at_time", "run_at", "timezone", "max_runs", "enabled", "next_run_at", "run_count", "last_run_at", "last_task_id"}
@@ -493,8 +519,13 @@ class Store:
         rows = self.conn.execute("SELECT * FROM tasks WHERE state = ? ORDER BY rowid", (state,)).fetchall()
         return [Task(**dict(row)) for row in rows]
 
-    def next_queued(self) -> Task | None:
-        row = self.conn.execute("SELECT * FROM tasks WHERE state = ? AND (not_before IS NULL OR not_before <= ?) ORDER BY rowid LIMIT 1", (QUEUED, utcnow())).fetchone()
+    def next_queued(self, exclude_task_ids: set[str] | None = None) -> Task | None:
+        excluded = sorted(exclude_task_ids or set())
+        exclusion = f" AND task_id NOT IN ({','.join('?' for _ in excluded)})" if excluded else ""
+        row = self.conn.execute(
+            "SELECT * FROM tasks WHERE state = ? AND (not_before IS NULL OR not_before <= ?)" + exclusion + " ORDER BY rowid LIMIT 1",
+            (QUEUED, utcnow(), *excluded),
+        ).fetchone()
         return Task(**dict(row)) if row else None
 
     def count_tasks(self, state: str) -> int:
@@ -685,7 +716,7 @@ class Store:
         rows = self.conn.execute("SELECT * FROM usage WHERE task_id = ? ORDER BY id", (task_id,)).fetchall()
         return [dict(row) for row in rows]
 
-    def usage_totals(self, since_iso: str | None = None, model: str | None = None) -> dict:
+    def usage_totals(self, since_iso: str | None = None, model: str | None = None, model_like: str | None = None) -> dict:
         clauses: list[str] = []
         values: list[object] = []
         if since_iso:
@@ -694,6 +725,10 @@ class Store:
         if model:
             clauses.append("model = ?")
             values.append(model)
+        if model_like:
+            # a model family: rows recorded under an alias ("fable") and under pinned ids ("claude-fable-5-1") both count
+            clauses.append("model LIKE ?")
+            values.append(f"%{model_like}%")
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         row = self.conn.execute(
             f"""SELECT COUNT(*) AS rows, COUNT(DISTINCT task_id) AS task_count,
@@ -707,7 +742,7 @@ class Store:
         ).fetchone()
         return dict(row)
 
-    def usage_by_model(self, since_iso: str | None = None, model: str | None = None) -> list[dict]:
+    def usage_by_model(self, since_iso: str | None = None, model: str | None = None, model_like: str | None = None) -> list[dict]:
         clauses: list[str] = []
         values: list[object] = []
         if since_iso:
@@ -716,6 +751,10 @@ class Store:
         if model:
             clauses.append("model = ?")
             values.append(model)
+        if model_like:
+            # a model family: rows recorded under an alias ("fable") and under pinned ids ("claude-fable-5-1") both count
+            clauses.append("model LIKE ?")
+            values.append(f"%{model_like}%")
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.conn.execute(
             f"""SELECT model, COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -743,7 +782,7 @@ class Store:
     # -- permission requests -------------------------------------------------
 
     def request_permission(self, task_id: str, kind: str, target: str, reason: str) -> dict:
-        """record (or re-open) a sub-agent's request for one additional tool or repo. retry-safe: a repeat resets it to pending."""
+        """record (or re-open) a sub-agent's request for one additional tool, repo, or piece of access. retry-safe: a repeat resets it to pending."""
         now = utcnow()
         self.conn.execute(
             """INSERT INTO permission_requests (task_id, kind, target, reason, status, requested_at)
@@ -779,11 +818,12 @@ class Store:
         return dict(row)
 
     def granted_permissions_for(self, task_id: str) -> dict[str, list[str]]:
-        """tools and repos an operator has granted this task — the runner merges them into the session's scope on (re)start."""
+        """tools, repos, and access an operator has granted this task — the runner merges them into the session's scope on (re)start."""
         rows = self.conn.execute("SELECT kind, target FROM permission_requests WHERE task_id = ? AND status = 'granted' ORDER BY id", (task_id,)).fetchall()
-        result: dict[str, list[str]] = {"tools": [], "repos": []}
+        result: dict[str, list[str]] = {"tools": [], "repos": [], "access": []}
+        buckets = {"tool": "tools", "repo": "repos", "access": "access"}
         for row in rows:
-            bucket = "tools" if row["kind"] == "tool" else "repos"
+            bucket = buckets[row["kind"]]
             if row["target"] not in result[bucket]:
                 result[bucket].append(row["target"])
         return result

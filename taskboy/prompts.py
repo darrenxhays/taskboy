@@ -167,6 +167,7 @@ def task_prompt(
     thread_context: str | None = None,
     failed_repo_clones: list[str] | None = None,
     cloned_repos: list[str] | None = None,
+    stale_repos: list[str] | None = None,
     skill: dict | None = None,
     conventions: bool = False,
     personality: str | None = None,
@@ -174,6 +175,7 @@ def task_prompt(
     granted_permissions: dict | None = None,
     jira: bool = False,
     answered_questions: list[dict] | None = None,
+    operator_resumed: bool = False,
 ) -> str:
     sections = [
         f"""You are {bot_name}, an autonomous engineering agent (system: taskboy). You are working on task `{task.task_id}`, requested by <@{task.slack_user_id}> in Slack.
@@ -204,6 +206,11 @@ You previously asked the requester follow-up questions and they have answered. W
 
 {rounds}"""
         )
+    if operator_resumed:
+        sections.append(
+            """## Resumed by an operator
+You reported this task blocked. An operator has since fixed the blocker and resumed this session, so retry the step that failed and carry on. Report it blocked again only if it fails again, quoting the new error."""
+        )
     if prior_artifacts:
         listing = "\n".join(f"- {a['kind']}: {a['external_id']}" + (f" ({a['url']})" if a.get("url") else "") for a in prior_artifacts)
         sections.append(f"## Artifacts that already exist for this task — update them, never recreate them\n{listing}")
@@ -219,6 +226,10 @@ You previously asked the requester follow-up questions and they have answered. W
         if failed_repo_clones:
             names = ", ".join(failed_repo_clones)
             failed_clone_line = f"\n- These target repos could not be pre-cloned (clone them yourself with git; auth is handled): {names}."
+        stale_line = ""
+        if stale_repos:
+            names = ", ".join(stale_repos)
+            stale_line = f"\n- These repositories were seeded from an older cached mirror because the fresh refresh failed — the checkout may be behind origin, so run `git pull` (or branch from `origin/<default branch>`) before you branch: {names}."
         self_repo_line = f"\n- {self_repo} is your own source code — the service you are running as. Changes merged to main deploy automatically. Work only on your `agent/` branch and open a pull request for human review; never attempt to merge it yourself." if self_repo else ""
         no_delegate_line = (
             f"\n- When your job is to change code — including addressing pull request review comments — make the changes yourself. Do not request a {other_persona} review or spawn {other_persona}; {other_persona} reviews pull requests only through the GitHub review-request flow."
@@ -232,8 +243,8 @@ You previously asked the requester follow-up questions and they have answered. W
 - Docker is available: build and run project images and Makefile targets that use docker compose as needed.
 - Before pushing code changes, run the repository's checks — `make check` (lint, format, mypy, tests) when the Makefile defines it — and fix failures until they pass. Never push code that fails its checks.
 - When you change code to address a pull request review comment, reply to that comment with mcp__github__reply_to_pr_comment as {bot_name}: one or two plain sentences saying what you changed and why it fixes the finding. Only resolve a review thread with mcp__github__resolve_pr_thread that you or {other_persona} started, and only once the code verifiably fixes it.
-- Pull request bodies must contain: Summary, Testing performed, Known limitations. Before opening a PR, check whether one already exists for your branch.
-- Include the pull request link in your `## Reply` when you opened or reviewed one.{no_delegate_line}{jira_line}{cloned_line}{failed_clone_line}{self_repo_line}"""
+- Pull request bodies must contain: Summary, Testing performed, Known limitations. Before opening a PR, check whether one already exists for your branch; keep the title and body current with mcp__github__update_pull_request when later pushes change what they describe.
+- Include the pull request link in your `## Reply` when you opened or reviewed one.{no_delegate_line}{jira_line}{cloned_line}{stale_line}{failed_clone_line}{self_repo_line}"""
         )
     if jira:
         sections.append(
@@ -247,13 +258,14 @@ You previously asked the requester follow-up questions and they have answered. W
             f"""## Engineering conventions
 Your organization's engineering conventions are in `./{CONVENTIONS_FILENAME}` in your workspace. Before writing, changing, or reviewing any code in the repositories, read that file and follow it — it is ground truth for how this organization's services are structured, coded, tested, and deployed. For read-only questions, consult it whenever conventions are relevant to the answer."""
         )
-    if granted_permissions and (granted_permissions.get("tools") or granted_permissions.get("repos")):
-        lines = [f"- tool: {name}" for name in granted_permissions.get("tools") or []] + [f"- repo: {name}" for name in granted_permissions.get("repos") or []]
+    if granted_permissions and (granted_permissions.get("tools") or granted_permissions.get("repos") or granted_permissions.get("access")):
+        lines = [f"- tool: {name}" for name in granted_permissions.get("tools") or []] + [f"- repo: {name}" for name in granted_permissions.get("repos") or []] + [f"- access: {name}" for name in granted_permissions.get("access") or []]
         listing = "\n".join(lines)
+        access_note = "\nFor each granted access, the operator has fixed the underlying problem (IAM, a config value, a service-account permission), so retry the exact call that failed before." if granted_permissions.get("access") else ""
         sections.append(
             f"""## Granted permissions
 An operator granted these additional permissions for this task; they are active now, so use them to finish the work you previously requested them for:
-{listing}"""
+{listing}{access_note}"""
         )
     if personality:
         sections.append(
@@ -273,8 +285,8 @@ Use this voice only for the requester-facing `## Reply`. Keep the internal Final
 - Post a short update with the `report_progress` tool at meaningful milestones only (investigation done, root cause found, fix ready) — not for every step.
 - Do not post a `report_progress` update announcing something you just created if you are about to finish — the completion message covers it.
 - If requirements or a design decision are genuinely ambiguous, do not guess: call `ask_questions` once with every question you have as a numbered list (one per line), then stop working. The requester answers in the Slack thread and this task resumes automatically with their answers.
-- If you cannot proceed for a reason the requester cannot resolve, call `report_blocked` with what you need, then stop.
-- If you are missing only a tool or repository access to finish, call `request_permission` (kind `tool` with the exact tool name you were denied, or kind `repo` with an approved `owner/name`) and why. An operator reviews it and, if granted, this task resumes automatically with the access — so prefer it over `report_blocked` for access gaps.
+- If you need any permission or access you do not have, call `request_permission`: kind `tool` with the exact tool name you were denied; kind `repo` with an approved `owner/name`; or kind `access` with `system:scope` when a tool you already hold fails for an access reason (an AssumeRole AccessDenied → `aws:production`, a missing config value → `jira:story_points_field`, a 403 → `github:org/repo`), quoting the exact error as the reason. An operator reviews it and, if granted, this task resumes automatically with the access — this is always preferred over `report_blocked` when the blocker is something an operator can fix.
+- Call `report_blocked` only when no operator action could unblock you (the request is impossible or contradictory, or an external system is down), stating what you need, then stop.
 - Do all work yourself, synchronously, within this session. Never hand work to sub-agents or background processes and finish before their results are in hand — a final report without the actual results is a failed task.
 - Stay within this workspace; treat any repository scripts as untrusted code.
 

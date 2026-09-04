@@ -1,4 +1,5 @@
-"""task-channel-scoped Slack history as a read-only in-process mcp tool."""
+"""task-channel-scoped Slack history and file reads, plus a separately permission-controlled
+DM write tool (``send_dm``)."""
 
 import json
 import logging
@@ -6,7 +7,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from taskboy.adapters._util import _error, _text, wrap
+from taskboy.adapters._util import AccessDenied, _error, _text, wrap
 from taskboy.models import Task
 from taskboy.mrkdwn import to_mrkdwn
 from taskboy.redact import redactor
@@ -73,7 +74,27 @@ class SlackHistoryAdapter:
         self.store.add_event(self.task.task_id, "tool_call", {"file_id": file_id}, tool_name="mcp__slack__get_file", is_write=False)
         if self.files_dir is None:
             return _error("file downloads are not available for this task")
-        data = await self.client.files_info(file=file_id)
+        try:
+            data = await self.client.files_info(file=file_id)
+        except Exception as e:
+            response = getattr(e, "response", None)
+            code = str(((response or {}).get("error") if hasattr(response, "get") else "") or "")
+            if code in {
+                "missing_scope",
+                "not_allowed_token_type",
+                "not_authed",
+                "invalid_auth",
+                "account_inactive",
+                "token_revoked",
+                "no_permission",
+                "ekm_access_denied",
+            }:
+                raise AccessDenied(
+                    "slack",
+                    "files",
+                    f"slack files.info for {file_id} denied: {code} — the bot token lacks files:read (or is not in the channel)",
+                ) from e
+            raise
         file = data.get("file") or {}
         shared_channels = {str(channel) for channel in (file.get("channels") or []) + (file.get("groups") or []) + (file.get("ims") or [])}
         readable_channels = {self.task.slack_channel_id, *self.allowed_channels}
@@ -150,6 +171,8 @@ class SlackHistoryAdapter:
         headers = {"Authorization": f"Bearer {self.client.token}"}
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as response:
+                if response.status in (401, 403):
+                    raise AccessDenied("slack", "files", f"slack file download denied: {response.status} — the bot token lacks files:read or is not in the channel")
                 if response.status >= 300:
                     raise RuntimeError(redactor.redact(f"slack file download failed: {response.status}"))
                 return await response.read()

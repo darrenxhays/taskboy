@@ -61,20 +61,20 @@ def test_event_pagination_and_kinds(store, make_task):
 
 def test_usage_windows_and_timeseries(store, make_task):
     task = make_task()
-    store.add_usage(task.task_id, "subagent", "claude-fable-5", input_tokens=100, output_tokens=50, cost_usd=1.5)
+    store.add_usage(task.task_id, "subagent", "claude-fable-5-1", input_tokens=100, output_tokens=50, cost_usd=1.5)
     store.add_usage(task.task_id, "classifier", "haiku", input_tokens=10, output_tokens=5, cost_usd=0.1)
     # age the first row out of the five-hour window
     old = _iso(datetime.now(timezone.utc) - timedelta(hours=8))
-    store.conn.execute("UPDATE usage SET ts = ? WHERE model = 'claude-fable-5'", (old,))
+    store.conn.execute("UPDATE usage SET ts = ? WHERE model = 'claude-fable-5-1'", (old,))
     store.conn.commit()
     five_hour = store.usage_totals(since_iso=_iso(datetime.now(timezone.utc) - timedelta(hours=5)))
     all_time = store.usage_totals()
-    fable_only = store.usage_totals(model="claude-fable-5")
+    fable_only = store.usage_totals(model="claude-fable-5-1")
     assert five_hour["input_tokens"] == 10
     assert all_time["input_tokens"] == 110
     assert fable_only["output_tokens"] == 50
     by_model = {row["model"]: row for row in store.usage_by_model()}
-    assert by_model["claude-fable-5"]["cost_usd"] == 1.5
+    assert by_model["claude-fable-5-1"]["cost_usd"] == 1.5
     series = store.usage_timeseries(_iso(datetime.now(timezone.utc) - timedelta(days=1)))
     assert any(row["model"] == "haiku" and row["total_tokens"] == 15 for row in series)
 

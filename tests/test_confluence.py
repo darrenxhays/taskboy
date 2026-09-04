@@ -1,7 +1,9 @@
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
 
+from taskboy.adapters._util import AccessDenied, wrap
 from taskboy.adapters.confluence import ConfluenceAdapter
 
 
@@ -45,3 +47,33 @@ async def test_get_page_strips_html_redacts_and_bounds(adapter):
     assert "Deploy" in text
     assert "ghp_" not in text
     assert len(text) <= 4000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", (401, 403))
+async def test_request_maps_forbidden_to_site_access_denied_and_permission_hint(adapter, fake_aiohttp, status):
+    del adapter._request
+    fake_aiohttp(status, body="forbidden")
+
+    with pytest.raises(AccessDenied) as raised:
+        await adapter._request("GET", "/wiki/rest/api/content/12")
+
+    assert raised.value.system == "confluence"
+    assert raised.value.scope == "example.atlassian.net"
+
+    result = await wrap(adapter.get_page, logging.getLogger("test"))({"page_id": "12"})
+    text = result["content"][0]["text"]
+    assert "request_permission" in text
+    assert "kind='access'" in text
+    assert "target='confluence:example.atlassian.net'" in text
+
+
+@pytest.mark.asyncio
+async def test_request_keeps_server_errors_generic(adapter, fake_aiohttp):
+    del adapter._request
+    fake_aiohttp(500, body="upstream failed")
+
+    with pytest.raises(RuntimeError) as raised:
+        await adapter._request("GET", "/wiki/rest/api/content/12")
+
+    assert not isinstance(raised.value, AccessDenied)

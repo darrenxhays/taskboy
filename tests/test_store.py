@@ -267,6 +267,87 @@ def test_appended_migrations_apply_to_existing_databases(tmp_path, monkeypatch):
         upgraded.close()
 
 
+def test_permission_requests_migration_preserves_rows_and_allows_access(tmp_path):
+    import sqlite3
+
+    from taskboy.store import MIGRATIONS
+
+    path = str(tmp_path / "old_permissions.db")
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    for migration in MIGRATIONS[:-1]:
+        conn.executescript(migration)
+    conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", (str(len(MIGRATIONS) - 1),))
+    conn.execute(
+        "INSERT INTO tasks (task_id, idempotency_key, state, slack_team_id, slack_channel_id, slack_thread_ts, slack_message_ts, slack_user_id, request_text, created_at, updated_at) "
+        "VALUES ('t-old', 'idem-old', 'running', 'T1', 'C1', '1.1', '1.1', 'U1', 'pre-existing row', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+    )
+    conn.executemany(
+        "INSERT INTO permission_requests (id, task_id, kind, target, reason, status, decided_by, requested_at, decided_at) VALUES (?, 't-old', ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (11, "tool", "mcp__jira__add_comment", "need to post findings", "pending", None, "2026-01-01T00:01:00+00:00", None),
+            (12, "repo", "example-org/core", "need the source", "granted", "boss@example.com", "2026-01-01T00:02:00+00:00", "2026-01-01T00:03:00+00:00"),
+            (13, "tool", "mcp__slack__send_message", "need to notify", "denied", "boss@example.com", "2026-01-01T00:04:00+00:00", "2026-01-01T00:05:00+00:00"),
+        ],
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO permission_requests (task_id, kind, target, reason, requested_at) VALUES ('t-old', 'access', 'aws:production', 'need diagnostics', '2026-01-01T00:06:00+00:00')")
+    conn.commit()
+    conn.close()
+
+    upgraded = Store(path)
+    try:
+        assert upgraded.meta_get("schema_version") == str(len(MIGRATIONS))
+        assert upgraded.permission_requests_for("t-old") == [
+            {
+                "id": 11,
+                "task_id": "t-old",
+                "kind": "tool",
+                "target": "mcp__jira__add_comment",
+                "reason": "need to post findings",
+                "status": "pending",
+                "decided_by": None,
+                "requested_at": "2026-01-01T00:01:00+00:00",
+                "decided_at": None,
+            },
+            {
+                "id": 12,
+                "task_id": "t-old",
+                "kind": "repo",
+                "target": "example-org/core",
+                "reason": "need the source",
+                "status": "granted",
+                "decided_by": "boss@example.com",
+                "requested_at": "2026-01-01T00:02:00+00:00",
+                "decided_at": "2026-01-01T00:03:00+00:00",
+            },
+            {
+                "id": 13,
+                "task_id": "t-old",
+                "kind": "tool",
+                "target": "mcp__slack__send_message",
+                "reason": "need to notify",
+                "status": "denied",
+                "decided_by": "boss@example.com",
+                "requested_at": "2026-01-01T00:04:00+00:00",
+                "decided_at": "2026-01-01T00:05:00+00:00",
+            },
+        ]
+        assert upgraded.conn.execute("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_permission_requests_task'").fetchone()
+
+        reopened = upgraded.request_permission("t-old", "tool", "mcp__jira__add_comment", "still need to post findings")
+        assert reopened["id"] == 11
+        assert reopened["reason"] == "still need to post findings"
+        assert len(upgraded.permission_requests_for("t-old")) == 3
+
+        access = upgraded.request_permission("t-old", "access", "aws:production", "need diagnostics")
+        assert (access["kind"], access["status"]) == ("access", "pending")
+        upgraded.decide_permission_request("t-old", "access", "aws:production", "granted", "boss@example.com")
+        assert upgraded.granted_permissions_for("t-old") == {"tools": [], "repos": ["example-org/core"], "access": ["aws:production"]}
+    finally:
+        upgraded.close()
+
+
 def test_issues_table_accepts_implementation_queued_and_rejects_garbage_status(store):
     import sqlite3
 
@@ -609,11 +690,23 @@ def test_permission_request_lifecycle(store, make_task):
     task = make_task()
     row = store.request_permission(task.task_id, "tool", "mcp__jira__add_comment", "need to post findings")
     assert row["status"] == "pending"
-    assert store.granted_permissions_for(task.task_id) == {"tools": [], "repos": []}
+    assert store.granted_permissions_for(task.task_id) == {"tools": [], "repos": [], "access": []}
     decided = store.decide_permission_request(task.task_id, "tool", "mcp__jira__add_comment", "granted", "boss@example.com")
     assert decided["status"] == "granted"
     assert decided["decided_by"] == "boss@example.com"
-    assert store.granted_permissions_for(task.task_id) == {"tools": ["mcp__jira__add_comment"], "repos": []}
+    assert store.granted_permissions_for(task.task_id) == {"tools": ["mcp__jira__add_comment"], "repos": [], "access": []}
+
+
+def test_access_permission_requests_are_recorded_and_granted(store, make_task):
+    # kind 'access' is any system:scope a session lacks (aws:production, jira:story_points_field, ...) — the
+    # schema rebuild in the last migration admits it alongside tool/repo
+    task = make_task()
+    row = store.request_permission(task.task_id, "access", "aws:production", "AssumeRole AccessDenied on the production diagnostics role")
+    assert (row["kind"], row["status"]) == ("access", "pending")
+    assert store.has_pending_permission_request(task.task_id) is True
+    store.decide_permission_request(task.task_id, "access", "aws:production", "granted", "boss@example.com")
+    assert store.granted_permissions_for(task.task_id) == {"tools": [], "repos": [], "access": ["aws:production"]}
+    assert store.has_pending_permission_request(task.task_id) is False
 
 
 def test_permission_request_is_retry_safe_and_reopens(store, make_task):

@@ -26,6 +26,11 @@ class _NoFrameObserved(Exception):
     """the tolerated SDK error (#80) arrived before any usable frame was seen (#93)."""
 
 
+def _is_schema_rejection(exc: Exception) -> bool:
+    text = str(exc)
+    return "API Error: 400" in text and "input_schema" in text
+
+
 async def structured_call(model_id: str, prompt: str, schema: dict[str, Any]) -> tuple[dict, dict | None]:
     """one tool-free schema-shaped call; retries once on failure, then raises."""
     use_output_format = True
@@ -35,7 +40,7 @@ async def structured_call(model_id: str, prompt: str, schema: dict[str, Any]) ->
             return await _structured_call_once(model_id, prompt, schema, use_output_format=use_output_format)
         except Exception as exc:
             last_exc = exc
-            if isinstance(exc, _NoFrameObserved):
+            if isinstance(exc, _NoFrameObserved) or _is_schema_rejection(exc):
                 # retrying the identical call fails identically, so the retry drops output_format and parses text
                 use_output_format = False
             logger.warning("structured_call attempt %s/2 failed (%s): %s", attempt, type(exc).__name__, redactor.redact(str(exc))[:_DIAGNOSTIC_SNIPPET_LEN])

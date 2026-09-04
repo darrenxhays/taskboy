@@ -207,7 +207,8 @@ class Orchestrator:
                     self.classify_handles.add(handle)
                     handle.add_done_callback(self.classify_handles.discard)
             while not self.stopping and len(self.running) < self.config.max_concurrency:
-                queued = self.store.next_queued()
+                # a resumed task can be queued while its old supervisor is still notifying
+                queued = self.store.next_queued(exclude_task_ids=set(self.running))
                 if queued is None:
                     break
                 try:
@@ -345,9 +346,9 @@ class Orchestrator:
                     # not issue-backed, or the issue already left a reopenable status (raced with a delete/refine)
                     await self._notify_blocked(blocked)
             elif outcome.retryable and task.attempt < self.config.max_retries:
-                # transient claude usage/session limit: come back after the recorded reset instead of failing outright
-                requeued = self.store.transition(task.task_id, RUNNING, QUEUED, "requeued: session hit a usage limit", resume_session_id=outcome.session_id, attempt=task.attempt + 1, not_before=outcome.retry_not_before)
-                self.store.add_event(task.task_id, "recovery", {"action": "requeued_rate_limit", "attempt": task.attempt + 1, "not_before": outcome.retry_not_before})
+                # come back after the recorded delay instead of failing outright
+                requeued = self.store.transition(task.task_id, RUNNING, QUEUED, "requeued: transient session failure", resume_session_id=outcome.session_id, attempt=task.attempt + 1, not_before=outcome.retry_not_before)
+                self.store.add_event(task.task_id, "recovery", {"action": "requeued_transient", "attempt": task.attempt + 1, "not_before": outcome.retry_not_before})
                 await _notify_safe(self.notifier.recovered, requeued)
             else:
                 failed = self.store.transition(task.task_id, RUNNING, FAILED, "runner reported failure", error=outcome.error, session_id=outcome.session_id, cost_usd=outcome.cost_usd, num_turns=outcome.num_turns, finished_at=utcnow())
@@ -369,7 +370,8 @@ class Orchestrator:
             await _notify_safe(self.notifier.blocked, blocked)
 
     def _release(self, task_id: str) -> None:
-        self.running.pop(task_id, None)
+        if self.running.get(task_id) is asyncio.current_task():
+            self.running.pop(task_id)
         self.wake.set()
 
     def _record_terminal_timing(self, task: Task) -> None:

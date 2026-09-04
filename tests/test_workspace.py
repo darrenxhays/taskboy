@@ -36,6 +36,24 @@ def test_sweep_respects_per_state_retention(store, make_task, tmp_path):
     assert old_failed.exists()  # failed keeps 7 days for diagnosis (REL-007)
 
 
+def test_sweep_retries_leaked_workspace_instead_of_forgetting_it(store, make_task, tmp_path, monkeypatch, caplog):
+    workspaces = tmp_path / "ws"
+    task = make_task("root-owned leftovers")
+    old_completed = _finish(store, task, COMPLETED, workspaces)
+    task_id = task.task_id
+    _age(store, task_id, 4)
+
+    # simulate rmtree silently failing on a root-owned file (ignore_errors=True swallows it)
+    monkeypatch.setattr(workspace.shutil, "rmtree", lambda *a, **k: None)
+
+    with caplog.at_level("WARNING", logger="taskboy.workspace"):
+        counts = workspace.sweep_once(store, str(workspaces), str(tmp_path / "memory"), RETENTION)
+    assert counts["workspaces"] == 0  # the leak wasn't actually removed, so it isn't counted
+    assert old_completed.exists()
+    assert store.get_task(task_id).workspace_path is not None  # left set so the next sweep retries it
+    assert any("could not be fully removed" in record.message for record in caplog.records)
+
+
 def test_sweep_purges_old_memory_and_slack_events(store, tmp_path):
     memory_dir = tmp_path / "memory" / "tasks"
     memory_dir.mkdir(parents=True)

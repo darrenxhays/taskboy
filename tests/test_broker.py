@@ -49,6 +49,43 @@ def routed(store, make_task, profile="standard", targets=None):
     return store.transition(task.task_id, RECEIVED, QUEUED, "classified", profile=profile, classification_json=json.dumps({"target_repos": targets or []}))
 
 
+def test_register_widens_token_only_when_a_github_write_tool_was_granted(store, make_task, broker):
+    original_read_only_permissions = dict(PROFILE_PERMISSIONS["read_only"])
+    task = routed(store, make_task, profile="read_only", targets=["org/service-a"])
+    expected_permissions = {
+        "mcp__github__create_pull_request": {"contents": "write", "metadata": "read", "pull_requests": "write"},
+        "mcp__github__comment_on_pull_request": {"contents": "read", "metadata": "read", "pull_requests": "write"},
+        "mcp__github__create_pr_review": {"contents": "read", "metadata": "read", "pull_requests": "write"},
+        "mcp__github__reply_to_pr_comment": {"contents": "read", "metadata": "read", "pull_requests": "write"},
+        "mcp__github__resolve_pr_thread": {"contents": "read", "metadata": "read", "pull_requests": "write"},
+        "mcp__github__close_pull_request": {"contents": "read", "metadata": "read", "pull_requests": "write"},
+        "mcp__github__delete_branch": {"contents": "write", "metadata": "read", "pull_requests": "read"},
+        "mcp__github__create_release": {"contents": "write", "metadata": "read", "pull_requests": "read"},
+    }
+    for tool, permissions in expected_permissions.items():
+        broker.register_task(task, APPROVED, granted_tools=[tool], hooks_path="/ws/t1/githooks")
+        assert broker.grants[task.task_id].permissions == permissions
+    broker.register_task(task, APPROVED, granted_tools=["mcp__jira__add_comment", "Write"], hooks_path="/ws/t1/githooks")
+    assert broker.grants[task.task_id].permissions == PROFILE_PERMISSIONS["read_only"]
+    standard_task = routed(store, make_task, profile="standard", targets=["org/service-a"])
+    broker.register_task(standard_task, APPROVED, granted_tools=["mcp__github__delete_branch"], hooks_path="/ws/t1/githooks")
+    assert broker.grants[standard_task.task_id].permissions == PROFILE_PERMISSIONS["standard"]
+    assert PROFILE_PERMISSIONS["read_only"] == original_read_only_permissions
+
+
+def test_register_combines_permissions_from_every_granted_github_tool(store, make_task, broker):
+    task = routed(store, make_task, profile="read_only", targets=["org/service-a"])
+
+    broker.register_task(
+        task,
+        APPROVED,
+        granted_tools=["mcp__github__delete_branch", "mcp__github__comment_on_pull_request"],
+        hooks_path="/ws/t1/githooks",
+    )
+
+    assert broker.grants[task.task_id].permissions == {"contents": "write", "metadata": "read", "pull_requests": "write"}
+
+
 def test_register_scopes_token_to_profile_and_targets(store, make_task, broker):
     task = routed(store, make_task, profile="read_only", targets=["org/service-a"])
     env = broker.register_task(task, APPROVED, hooks_path="/ws/t1/githooks")
