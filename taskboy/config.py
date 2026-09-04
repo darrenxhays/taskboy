@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
+from taskboy import assets
 from taskboy.models import EFFORT_LEVELS
 
 
@@ -16,6 +17,10 @@ class ConfigError(Exception):
 
 # connected services an operator can turn on/off, each configurable in its own services/<name>.yaml file
 KNOWN_SERVICES = ("slack", "github", "jira", "confluence", "sentry", "aws")
+
+# dashboard profile pictures: accepted file types (suffix -> content type) and the size cap, shared by the loader and the api
+AVATAR_SUFFIXES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
+AVATAR_MAX_BYTES = 1_048_576
 
 
 @dataclass
@@ -34,6 +39,7 @@ class ReviewerConfig:
     enabled: bool = False
     name: str = "Reviewer"
     personality_path: str | None = None
+    avatar_path: str = str(assets.DEFAULT_REVIEWER_AVATAR)  # configured picture or the packaged default; always a file
     review_agent_prs: bool = True
     commit_name: str = "Reviewer"
     commit_email: str = ""
@@ -93,6 +99,7 @@ class Config:
     agent_name: str = "Agent"  # the main agent's display name, used in all user-facing text
     conventions_path: str | None = None
     personality_path: str | None = None
+    avatar_path: str = str(assets.DEFAULT_AGENT_AVATAR)  # configured picture or the packaged default; always a file
     help_path: str | None = None
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     reviewer: ReviewerConfig = field(default_factory=ReviewerConfig)
@@ -137,7 +144,7 @@ def load_config(path: str) -> Config:
     _validate_profiles(raw)
     roles = _roles_config(raw, slack)
     _validate_skills(raw)
-    agent_name, personality_path = _agent_config(raw, path)
+    agent_name, personality_path, avatar_path = _agent_config(raw, path)
     conventions_path = _file_path(raw, path, "conventions")
     help_path = _file_path(raw, path, "help")
     dashboard = _dashboard_config(raw.get("dashboard"), agent_name)
@@ -155,6 +162,7 @@ def load_config(path: str) -> Config:
         agent_name=agent_name,
         conventions_path=conventions_path,
         personality_path=personality_path,
+        avatar_path=avatar_path,
         help_path=help_path,
         dashboard=dashboard,
         reviewer=reviewer,
@@ -273,6 +281,7 @@ def _reviewer_config(section: object, config_path: str) -> ReviewerConfig:
         if not resolved.is_file():
             raise ConfigError(f"reviewer.personality_file not found: {resolved}")
         personality_path = str(resolved)
+    avatar_path = _avatar_path(section, config_path, "reviewer", assets.DEFAULT_REVIEWER_AVATAR)
     review_agent_prs = section.get("review_agent_prs", True)
     if not isinstance(review_agent_prs, bool):
         raise ConfigError(f"reviewer.review_agent_prs must be a boolean, got {review_agent_prs!r}")
@@ -288,6 +297,7 @@ def _reviewer_config(section: object, config_path: str) -> ReviewerConfig:
         enabled=enabled,
         name=name,
         personality_path=personality_path,
+        avatar_path=avatar_path,
         review_agent_prs=review_agent_prs,
         commit_name=commit_name,
         commit_email=commit_email,
@@ -510,7 +520,24 @@ def _file_path(raw: dict, config_path: str, section_name: str) -> str | None:
     return str(resolved)
 
 
-def _agent_config(raw: dict, config_path: str) -> tuple[str, str | None]:
+def _avatar_path(section: dict, config_path: str, key_prefix: str, default: Path) -> str:
+    """the persona's dashboard picture: the configured file, else the packaged default. same relative-path rules as personality_file."""
+    file_value = section.get("avatar_file", "")
+    if not isinstance(file_value, str):
+        raise ConfigError(f"{key_prefix}.avatar_file must be a string, got {file_value!r}")
+    if not file_value:
+        return str(default)
+    resolved = (Path(config_path).resolve().parent / file_value).resolve()
+    if not resolved.is_file():
+        raise ConfigError(f"{key_prefix}.avatar_file not found: {resolved}")
+    if resolved.suffix.lower() not in AVATAR_SUFFIXES:
+        raise ConfigError(f"{key_prefix}.avatar_file must be a png, jpg, jpeg, webp, or gif image, got {resolved.suffix!r}")
+    if resolved.stat().st_size > AVATAR_MAX_BYTES:
+        raise ConfigError(f"{key_prefix}.avatar_file is larger than 1 MiB")
+    return str(resolved)
+
+
+def _agent_config(raw: dict, config_path: str) -> tuple[str, str | None, str]:
     if "personality" in raw:
         raise ConfigError("the top-level personality section moved to agent.personality_file")
     section = raw.get("agent")
@@ -524,12 +551,14 @@ def _agent_config(raw: dict, config_path: str) -> tuple[str, str | None]:
     file_value = section.get("personality_file", "")
     if not isinstance(file_value, str):
         raise ConfigError(f"agent.personality_file must be a string, got {file_value!r}")
-    if not file_value:
-        return name, None
-    resolved = (Path(config_path).resolve().parent / file_value).resolve()
-    if not resolved.is_file():
-        raise ConfigError(f"agent.personality_file not found: {resolved}")
-    return name, str(resolved)
+    personality_path = None
+    if file_value:
+        resolved = (Path(config_path).resolve().parent / file_value).resolve()
+        if not resolved.is_file():
+            raise ConfigError(f"agent.personality_file not found: {resolved}")
+        personality_path = str(resolved)
+    avatar_path = _avatar_path(section, config_path, "agent", assets.DEFAULT_AGENT_AVATAR)
+    return name, personality_path, avatar_path
 
 
 def _int_at_least(section: dict, key: str, minimum: int) -> int:

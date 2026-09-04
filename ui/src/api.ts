@@ -209,7 +209,7 @@ export type ScheduleInput = {
   max_runs?: number | null;
 };
 
-export type Me = { email: string; admin: boolean; bot_name: string; reviewer_name: string };
+export type Me = { email: string; admin: boolean; bot_name: string; reviewer_name: string; agent_avatar_url: string; reviewer_avatar_url: string };
 
 export type ManageTarget = {
   kind: string;

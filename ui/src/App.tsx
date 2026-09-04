@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Navigate, NavLink, Route, Routes } from "react-router-dom";
 import { api, ApiError, type Me } from "./api";
+import { BrandingContext } from "./branding";
 import { StreamContext, useStream, useStreamSource } from "./stream";
 import { MissionControl } from "./pages/MissionControl";
 import { Tasks } from "./pages/Tasks";
@@ -22,6 +23,21 @@ const NAV = [
   { to: "/config", label: "Config", icon: "⚙" },
 ];
 
+function LogoMark({ me, className }: { me: Me | null; className: string }) {
+  // the agent's picture once /api/me has resolved; its initial while loading or if the image fails to load
+  const [broken, setBroken] = useState(false);
+  const botName = me?.bot_name || "Agent";
+  const url = me?.agent_avatar_url;
+  if (url && !broken) {
+    return <img src={url} alt={botName} className={`${className} shrink-0 rounded-lg object-cover`} onError={() => setBroken(true)} />;
+  }
+  return (
+    <span className={`${className} flex shrink-0 items-center justify-center rounded-lg font-black`} style={{ background: "var(--accent)", color: "#0a0f16" }}>
+      {botName.charAt(0).toUpperCase()}
+    </span>
+  );
+}
+
 function Sidebar({ me, open, onClose }: { me: Me | null; open: boolean; onClose: () => void }) {
   const { connected, counts } = useStream();
   const active = counts ? (counts.running ?? 0) : 0;
@@ -36,9 +52,7 @@ function Sidebar({ me, open, onClose }: { me: Me | null; open: boolean; onClose:
         style={{ borderColor: "var(--hairline)", background: "var(--surface-1)" }}
       >
         <div className="mb-8 flex items-center gap-2.5">
-          <span className="flex h-8 w-8 items-center justify-center rounded-lg text-[15px] font-black" style={{ background: "var(--accent)", color: "#0a0f16" }}>
-            {botName.charAt(0).toUpperCase()}
-          </span>
+          <LogoMark me={me} className="h-8 w-8 text-[15px]" />
           <div>
             <div className="text-[14px] font-bold tracking-wide">{botName.toUpperCase()}</div>
             <div className="text-[9px] font-semibold tracking-[0.22em]" style={{ color: "var(--text-muted)" }}>
@@ -111,9 +125,7 @@ function MobileTopBar({ me, onOpen }: { me: Me | null; onOpen: () => void }) {
       <button onClick={onOpen} aria-label="open menu" className="flex h-9 w-9 items-center justify-center rounded-md border text-[16px]" style={{ borderColor: "var(--hairline-strong)", color: "var(--text-secondary)" }}>
         ☰
       </button>
-      <span className="flex h-7 w-7 items-center justify-center rounded-lg text-[13px] font-black" style={{ background: "var(--accent)", color: "#0a0f16" }}>
-        {botName.charAt(0).toUpperCase()}
-      </span>
+      <LogoMark me={me} className="h-7 w-7 text-[13px]" />
       <span className="text-[13px] font-bold tracking-wide">
         {botName.toUpperCase()}
         <span className="ml-2 text-[9px] font-semibold tracking-[0.22em]" style={{ color: "var(--text-muted)" }}>
@@ -158,29 +170,33 @@ export default function App() {
 
   if (authError) return <AccessDenied detail={authError} />;
 
+  const branding = { agentAvatarUrl: me?.agent_avatar_url ?? null, reviewerAvatarUrl: me?.reviewer_avatar_url ?? null };
+
   return (
     <StreamContext.Provider value={stream}>
-      <div className="md:flex">
-        <Sidebar me={me} open={navOpen} onClose={() => setNavOpen(false)} />
-        <div className="flex h-dvh flex-col md:min-w-0 md:flex-1">
-          <MobileTopBar me={me} onOpen={() => setNavOpen(true)} />
-          <main className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-6 sm:py-6">
-            <Routes>
-              <Route path="/" element={<MissionControl />} />
-              <Route path="/tasks" element={<Tasks />} />
-              <Route path="/tasks/:taskId" element={<TaskDetailPage admin={me?.admin ?? false} />} />
-              <Route path="/tasks/:taskId/feedback" element={<FeedbackPage email={me?.email ?? null} />} />
-              <Route path="/issues" element={<Issues admin={me?.admin ?? false} email={me?.email ?? null} />} />
-              <Route path="/improvements" element={<Navigate to="/issues" replace />} />
-              <Route path="/scheduler" element={<Scheduler admin={me?.admin ?? false} />} />
-              <Route path="/memory" element={<Memory />} />
-              <Route path="/memory/:taskId" element={<Memory />} />
-              <Route path="/usage" element={<UsagePage />} />
-              <Route path="/config" element={<ConfigPage admin={me?.admin ?? false} />} />
-            </Routes>
-          </main>
+      <BrandingContext.Provider value={branding}>
+        <div className="md:flex">
+          <Sidebar me={me} open={navOpen} onClose={() => setNavOpen(false)} />
+          <div className="flex h-dvh flex-col md:min-w-0 md:flex-1">
+            <MobileTopBar me={me} onOpen={() => setNavOpen(true)} />
+            <main className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-6 sm:py-6">
+              <Routes>
+                <Route path="/" element={<MissionControl />} />
+                <Route path="/tasks" element={<Tasks />} />
+                <Route path="/tasks/:taskId" element={<TaskDetailPage admin={me?.admin ?? false} />} />
+                <Route path="/tasks/:taskId/feedback" element={<FeedbackPage email={me?.email ?? null} />} />
+                <Route path="/issues" element={<Issues admin={me?.admin ?? false} email={me?.email ?? null} />} />
+                <Route path="/improvements" element={<Navigate to="/issues" replace />} />
+                <Route path="/scheduler" element={<Scheduler admin={me?.admin ?? false} />} />
+                <Route path="/memory" element={<Memory />} />
+                <Route path="/memory/:taskId" element={<Memory />} />
+                <Route path="/usage" element={<UsagePage />} />
+                <Route path="/config" element={<ConfigPage admin={me?.admin ?? false} />} />
+              </Routes>
+            </main>
+          </div>
         </div>
-      </div>
+      </BrandingContext.Provider>
     </StreamContext.Provider>
   );
 }
