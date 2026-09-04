@@ -9,13 +9,14 @@ import pytest
 
 from taskboy.config import Role
 from taskboy.models import BLOCKED, COMPLETED, FAILED, QUEUED, RECEIVED, RUNNING, Outcome
-from taskboy.runner import ClaudeRunner, ModelUnavailable, extract_final_report, extract_reply, looks_model_unavailable, looks_session_limit, record_rate_limit_event, retry_not_before, session_option_kwargs
+from taskboy.repocache import RefreshResult
+from taskboy.runner import ClaudeRunner, ModelUnavailable, extract_final_report, extract_reply, looks_model_unavailable, looks_session_limit, looks_transient_api_error, record_rate_limit_event, retry_not_before, session_option_kwargs
 
 RAW = {
     "models": {
         "haiku": {"id": "claude-haiku-4-5", "fallbacks": ["sonnet"]},
-        "sonnet": {"id": "claude-sonnet-4-6", "fallbacks": ["opus"]},
-        "opus": {"id": "claude-opus-4-6", "fallbacks": []},
+        "sonnet": {"id": "claude-sonnet-5", "fallbacks": ["opus"]},
+        "opus": {"id": "claude-opus-5", "fallbacks": []},
     },
     "profiles": {
         "read_only": {"allowed_tools": ["Read", "Bash"], "max_budget_usd": 2.0, "max_turns": 60, "max_runtime_minutes": 30},
@@ -32,7 +33,7 @@ def make_runner(store, config, tmp_path):
 
 def routed_task(store, make_task):
     task = make_task("investigate")
-    store.transition(task.task_id, RECEIVED, QUEUED, "classified", model_alias="sonnet", model_id="claude-sonnet-4-6", profile="read_only", max_turns=60, max_runtime_minutes=30)
+    store.transition(task.task_id, RECEIVED, QUEUED, "classified", model_alias="sonnet", model_id="claude-sonnet-5", profile="read_only", max_turns=60, max_runtime_minutes=30)
     return store.transition(task.task_id, QUEUED, RUNNING, "dispatched", max_budget_usd=2.0)
 
 
@@ -48,7 +49,7 @@ async def test_run_creates_workspace_and_returns_outcome(store, config, make_tas
     for sub in ("repo", "notes", "home"):
         assert (Path(workspace_path) / sub).is_dir()
     # ran on the routed model, no fallback events
-    assert runner._run_session.call_args.args[1] == "claude-sonnet-4-6"
+    assert runner._run_session.call_args.args[1] == "claude-sonnet-5"
     assert not [e for e in store.events_for(task.task_id) if e["kind"] == "model_fallback"]
 
 
@@ -78,7 +79,7 @@ async def test_model_unavailable_walks_fallback_chain(store, config, make_task, 
     outcome = await runner.run(task)
     assert outcome.state == COMPLETED
     attempted = [call.args[1] for call in runner._run_session.call_args_list]
-    assert attempted == ["claude-sonnet-4-6", "claude-opus-4-6"]
+    assert attempted == ["claude-sonnet-5", "claude-opus-5"]
     fallbacks = [e for e in store.events_for(task.task_id) if e["kind"] == "model_fallback"]
     assert len(fallbacks) == 1  # MOD-009: every hop audited
 
@@ -135,6 +136,29 @@ def test_looks_session_limit():
     assert not looks_session_limit("model claude-x not found")
 
 
+def test_looks_transient_api_error():
+    assert looks_transient_api_error("API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment.")
+    assert looks_transient_api_error("API Error: The response stopped arriving. The response above may be incomplete.")
+    assert looks_transient_api_error("connect ECONNRESET")
+    assert looks_transient_api_error("write EPIPE: socket hang up")
+    # structured signal from the CLI, not a text substring match
+    assert looks_transient_api_error("some agent-narrated text with no marker words", api_error_status=503)
+    # a per-request burst 429 isn't a usage-window RateLimitEvent, so it needs its own path here (issue #128)
+    assert looks_transient_api_error("some agent-narrated text with no marker words", api_error_status=429)
+    assert not looks_transient_api_error("some agent-narrated text with no marker words", api_error_status=404)
+    # status-code-shaped text alone is not trusted (it's agent-influenced, and "529" isn't word-bounded)
+    assert not looks_transient_api_error("Request failed with status 503 Service Unavailable")
+    assert not looks_transient_api_error("something went wrong")
+    assert not looks_transient_api_error("model claude-x not found")
+    assert not looks_transient_api_error("You've hit your session limit · resets 6:50pm (UTC)")
+
+
+def test_retry_not_before_accepts_explicit_default_minutes():
+    now = datetime.now(timezone.utc)
+    computed = datetime.fromisoformat(retry_not_before(None, 3))
+    assert abs((computed - now).total_seconds() - 180) < 5
+
+
 def test_retry_not_before_uses_resets_at_plus_buffer():
     now = datetime.now(timezone.utc)
     resets_at = int(now.timestamp()) + 120
@@ -159,10 +183,10 @@ def test_session_option_kwargs_reasoning_matrix(store, make_task, tmp_path):
     task = routed_task(store, make_task)
     ws = tmp_path / "workspace"
     profile = {"allowed_tools": ["Read"], "effort": "high", "thinking": {"type": "adaptive"}}
-    kwargs = session_option_kwargs(task, "claude-fable-5", ws, profile)
+    kwargs = session_option_kwargs(task, "claude-fable-5-1", ws, profile)
     assert kwargs == {
         "cwd": str(ws / "repo"),
-        "model": "claude-fable-5",
+        "model": "claude-fable-5-1",
         "allowed_tools": ["Read"],
         "permission_mode": "acceptEdits",
         "max_turns": 60,
@@ -188,38 +212,38 @@ def test_session_option_kwargs_disables_claude_code_attribution(store, make_task
 
 def test_session_option_kwargs_effort_override_wins_over_profile(store, make_task, tmp_path):
     task = make_task("investigate", effort_override="xhigh")
-    store.transition(task.task_id, RECEIVED, QUEUED, "classified", model_alias="sonnet", model_id="claude-sonnet-4-6", profile="read_only", max_turns=60, max_runtime_minutes=30)
+    store.transition(task.task_id, RECEIVED, QUEUED, "classified", model_alias="sonnet", model_id="claude-sonnet-5", profile="read_only", max_turns=60, max_runtime_minutes=30)
     task = store.transition(task.task_id, QUEUED, RUNNING, "dispatched", max_budget_usd=2.0)
     ws = tmp_path / "workspace"
     profile = {"allowed_tools": ["Read"], "effort": "high"}
-    kwargs = session_option_kwargs(task, "claude-sonnet-4-6", ws, profile)
+    kwargs = session_option_kwargs(task, "claude-sonnet-5", ws, profile)
     assert kwargs["effort"] == "xhigh"
 
 
 def test_session_option_kwargs_effort_override_applies_without_profile_effort(store, make_task, tmp_path):
     task = make_task("investigate", effort_override="low")
-    store.transition(task.task_id, RECEIVED, QUEUED, "classified", model_alias="sonnet", model_id="claude-sonnet-4-6", profile="read_only", max_turns=60, max_runtime_minutes=30)
+    store.transition(task.task_id, RECEIVED, QUEUED, "classified", model_alias="sonnet", model_id="claude-sonnet-5", profile="read_only", max_turns=60, max_runtime_minutes=30)
     task = store.transition(task.task_id, QUEUED, RUNNING, "dispatched", max_budget_usd=2.0)
     ws = tmp_path / "workspace"
-    kwargs = session_option_kwargs(task, "claude-sonnet-4-6", ws, {"allowed_tools": []})
+    kwargs = session_option_kwargs(task, "claude-sonnet-5", ws, {"allowed_tools": []})
     assert kwargs["effort"] == "low"
 
 
 def test_session_option_kwargs_classifier_effort_wins_over_profile(store, make_task, tmp_path):
     task = make_task("investigate")
-    store.transition(task.task_id, RECEIVED, QUEUED, "classified", model_alias="sonnet", model_id="claude-sonnet-4-6", profile="read_only", max_turns=60, max_runtime_minutes=30, effort="xhigh")
+    store.transition(task.task_id, RECEIVED, QUEUED, "classified", model_alias="sonnet", model_id="claude-sonnet-5", profile="read_only", max_turns=60, max_runtime_minutes=30, effort="xhigh")
     task = store.transition(task.task_id, QUEUED, RUNNING, "dispatched", max_budget_usd=2.0)
     ws = tmp_path / "workspace"
-    kwargs = session_option_kwargs(task, "claude-sonnet-4-6", ws, {"allowed_tools": [], "effort": "high"})
+    kwargs = session_option_kwargs(task, "claude-sonnet-5", ws, {"allowed_tools": [], "effort": "high"})
     assert kwargs["effort"] == "xhigh"
 
 
 def test_session_option_kwargs_effort_override_wins_over_classifier_effort(store, make_task, tmp_path):
     task = make_task("investigate", effort_override="max")
-    store.transition(task.task_id, RECEIVED, QUEUED, "classified", model_alias="sonnet", model_id="claude-sonnet-4-6", profile="read_only", max_turns=60, max_runtime_minutes=30, effort="low")
+    store.transition(task.task_id, RECEIVED, QUEUED, "classified", model_alias="sonnet", model_id="claude-sonnet-5", profile="read_only", max_turns=60, max_runtime_minutes=30, effort="low")
     task = store.transition(task.task_id, QUEUED, RUNNING, "dispatched", max_budget_usd=2.0)
     ws = tmp_path / "workspace"
-    kwargs = session_option_kwargs(task, "claude-sonnet-4-6", ws, {"allowed_tools": []})
+    kwargs = session_option_kwargs(task, "claude-sonnet-5", ws, {"allowed_tools": []})
     assert kwargs["effort"] == "max"
 
 
@@ -293,7 +317,7 @@ async def test_blue_runner_uses_reviewer_broker_personality_and_name(store, conf
 
     await runner.run(task)
 
-    reviewer_broker.register_task.assert_called_once_with(task, [], granted_repos=[], hooks_path=ANY)
+    reviewer_broker.register_task.assert_called_once_with(task, [], granted_repos=[], granted_tools=[], hooks_path=ANY)
     red_broker.register_task.assert_not_called()
     assert runner._run_session.call_args.args[6] is reviewer_broker
     prompt = runner._run_session.call_args.args[3]
@@ -310,7 +334,7 @@ async def test_blue_only_broker_clones_target_repositories(store, config, make_t
     config.reviewer.enabled = True
     reviewer_broker = MagicMock()
     reviewer_broker.register_task.return_value = {}
-    refresh = AsyncMock(return_value=True)
+    refresh = AsyncMock(return_value=RefreshResult(ok=True, existed=True))
     clone = AsyncMock(return_value=True)
     monkeypatch.setattr("taskboy.runner.repocache.refresh_one", refresh)
     monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", clone)
@@ -380,7 +404,7 @@ async def test_blue_session_uses_reviewer_github_adapter_and_git_identity(store,
     monkeypatch.setattr("taskboy.adapters.slack_history.build_slack_server", lambda adapter: adapter)
     runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=red_broker, reviewer_broker=reviewer_broker, slack_client=object())
 
-    outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {"TASKBOY_BROKER_SOCKET": "blue.sock"}, [], reviewer_broker)
+    outcome = await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {"TASKBOY_BROKER_SOCKET": "blue.sock"}, [], reviewer_broker)
 
     assert outcome.state == COMPLETED
     assert captured["github_broker"] is reviewer_broker
@@ -525,8 +549,31 @@ async def test_permission_requester_rejects_unknown_and_already_held(store, conf
     assert "already have" in await request("tool", "mcp__jira__add_comment", "why")
     assert "not an approved repository" in await request("repo", "othercorp/secret", "why")  # a different org entirely
     assert "owner/name" in await request("repo", "notaslug", "why")
-    assert "'tool' or 'repo'" in await request("bogus", "x", "why")
+    assert "'tool', 'repo', or 'access'" in await request("bogus", "x", "why")
+    assert "system:scope" in await request("access", "production", "why")  # no system prefix
+    assert "system:scope" in await request("access", "aws: production", "why")  # whitespace
+    assert "needs a reason" in await request("access", "aws:production", "")
     assert store.permission_requests_for(task.task_id) == []  # nothing invalid was recorded
+
+
+@pytest.mark.asyncio
+async def test_permission_requester_records_access_requests(store, config, make_task, tmp_path):
+    # the evidence case: aws_read was held, but assuming the production role was denied — the only way out was
+    # report_blocked. an 'access' request is recorded for the operator and the task pauses on its session (§8.4)
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+    blocked: dict = {}
+    progress = AsyncMock()
+    request = runner._permission_requester(task, blocked, ["Read", "mcp__aws__aws_read"], ["Read", "mcp__aws__aws_read"], [], [], None, progress)
+    message = await request("access", "aws:production", "AssumeRole AccessDenied on arn:aws:iam::838717548546:role/rz-taskboy-production-diagnostics")
+    assert "recorded" in message
+    assert blocked["reason"].startswith("needs permission for access 'aws:production'")
+    requests = store.permission_requests_for(task.task_id)
+    assert [(r["kind"], r["target"], r["status"]) for r in requests] == [("access", "aws:production", "pending")]
+    assert "AccessDenied" in requests[0]["reason"]
+    progress.assert_awaited_once()
+    # a tool the session already holds is not the thing to request — the message redirects to kind access
+    assert "kind='access'" in await request("tool", "mcp__aws__aws_read", "production denied")
 
 
 @pytest.mark.asyncio
@@ -572,19 +619,70 @@ async def test_run_merges_granted_tool_into_session_and_prompt(store, config, ma
 
 
 @pytest.mark.asyncio
-async def test_read_only_tier_cannot_gain_write_tool(store, config, make_task, tmp_path):
+async def test_read_only_tier_write_tool_request_is_recorded_as_an_escalation(store, config, make_task, tmp_path):
+    # operator decision 2026-09-02: a write-tool request from a read-only tier is recorded (labelled as a profile
+    # escalation) rather than refused, and once an admin grants it the tool widens the session allowlist
     runner = make_runner(store, config, tmp_path)
     runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
     task = routed_task(store, make_task)  # read_only tier
-    # the requester refuses to even record a write-tool request from a read-only tier
     request = runner._permission_requester(task, {}, ["Read", "Bash"], ["Read", "Bash"], [], [], None, AsyncMock())
-    assert "cannot be granted" in await request("tool", "Write", "want to edit")
-    assert store.permission_requests_for(task.task_id) == []
-    # and a write grant that somehow lands is filtered out before it widens the session allowlist
-    store.request_permission(task.task_id, "tool", "mcp__jira__add_comment", "post")
-    store.decide_permission_request(task.task_id, "tool", "mcp__jira__add_comment", "granted", "boss")
+    assert "recorded" in await request("tool", "Write", "want to edit")
+    recorded = store.permission_requests_for(task.task_id)
+    assert [(r["kind"], r["target"]) for r in recorded] == [("tool", "Write")]
+    assert recorded[0]["reason"].startswith("[profile escalation: write tool on a read_only task]")
+    assert any(e["kind"] == "permission_request" and json.loads(e["detail_json"])["escalation"] is True for e in store.events_for(task.task_id))
+    store.decide_permission_request(task.task_id, "tool", "Write", "granted", "boss")
     await runner.run(store.get_task(task.task_id))
-    assert runner._run_session.call_args.args[7] == []
+    assert runner._run_session.call_args.args[7] == ["Write"]
+
+
+@pytest.mark.asyncio
+async def test_run_after_operator_resume_tells_the_session_to_retry(store, config, make_task, tmp_path, notifier):
+    from taskboy.task_actions import decide_permission, resume_task
+
+    runner = make_runner(store, config, tmp_path)
+    runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
+    task = routed_task(store, make_task)  # already RUNNING
+    store.transition(task.task_id, RUNNING, BLOCKED, "production logs unreadable", session_id="sess-3")
+    resumed, status = resume_task(store, task.task_id, "boss@example.com")
+    assert status == "resumed" and resumed.resume_session_id == "sess-3"
+    _, status = resume_task(store, task.task_id, "boss@example.com")
+    assert status.startswith("not blocked")
+    store.transition(task.task_id, QUEUED, RUNNING, "dispatched")
+    store.transition(task.task_id, RUNNING, QUEUED, "recovery: orchestrator restarted", resume_session_id="sess-3")
+    await runner.run(store.get_task(task.task_id))
+    prompt = runner._run_session.call_args.args[3]
+    assert "## Resumed by an operator" in prompt
+    assert "retry the step that failed" in prompt
+    # permission grants have their own prompt section and must not look like a plain operator resume
+    granted = routed_task(store, make_task)
+    store.request_permission(granted.task_id, "access", "aws:production", "AssumeRole denied")
+    store.transition(granted.task_id, RUNNING, BLOCKED, "needs permission", session_id="sess-4")
+    resumed, status = await decide_permission(store, notifier, granted.task_id, "access", "aws:production", "granted", "boss@example.com")
+    assert status == "granted" and resumed.state == QUEUED
+    await runner.run(store.get_task(granted.task_id))
+    assert "## Resumed by an operator" not in runner._run_session.call_args.args[3]
+    # a first run (nothing to resume) never carries the section
+    fresh = routed_task(store, make_task)
+    await runner.run(store.get_task(fresh.task_id))
+    assert "## Resumed by an operator" not in runner._run_session.call_args.args[3]
+
+
+@pytest.mark.asyncio
+async def test_run_relays_granted_access_to_the_prompt(store, config, make_task, tmp_path):
+    runner = make_runner(store, config, tmp_path)
+    runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
+    task = routed_task(store, make_task)
+    store.request_permission(task.task_id, "access", "aws:production", "AssumeRole denied")
+    store.decide_permission_request(task.task_id, "access", "aws:production", "granted", "boss")
+    await runner.run(store.get_task(task.task_id))
+    prompt = runner._run_session.call_args.args[3]
+    assert "## Granted permissions" in prompt
+    assert "- access: aws:production" in prompt
+    assert "retry the exact call that failed" in prompt
+    assert runner._run_session.call_args.args[7] == []  # nothing to allowlist: the fix happened outside the session
+    applied = [e for e in store.events_for(task.task_id) if e["kind"] == "permissions_applied"]
+    assert applied and json.loads(applied[0]["detail_json"])["access"] == ["aws:production"]
 
 
 @pytest.mark.asyncio
@@ -598,7 +696,7 @@ async def test_run_clones_granted_repo(store, config, make_task, tmp_path):
 
     async def fake_refresh(_broker, _root, repo, timeout=60):
         seen.append(repo)
-        return True
+        return RefreshResult(ok=True, existed=True)
 
     async def fake_clone(_root, _repo, _dest):
         return True
@@ -632,7 +730,7 @@ async def test_run_clones_granted_repo_outside_approved_list_same_org(store, con
 
     async def fake_refresh(_broker, _root, repo, timeout=60):
         seen.append(repo)
-        return True
+        return RefreshResult(ok=True, existed=True)
 
     async def fake_clone(_root, _repo, _dest):
         return True
@@ -652,13 +750,13 @@ async def test_run_clones_granted_repo_outside_approved_list_same_org(store, con
 
 
 @pytest.mark.asyncio
-async def test_run_records_repo_seed_failure_when_refresh_fails(store, config, make_task, tmp_path, monkeypatch):
+async def test_run_records_repo_seed_failure_when_refresh_fails_with_no_mirror(store, config, make_task, tmp_path, monkeypatch):
     config.raw = {**RAW, "github": {"approved_repos": ["org/a"], "protected_branch_patterns": ["main"]}}
     broker = MagicMock()
     broker.register_task.return_value = {}
     runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
     runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
-    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", AsyncMock(return_value=False))
+    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", AsyncMock(return_value=RefreshResult(ok=False, existed=False, error="fatal: could not read Username for 'https://github.com'")))
     clone = AsyncMock(return_value=True)
     monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", clone)
     task = routed_task(store, make_task)
@@ -666,17 +764,72 @@ async def test_run_records_repo_seed_failure_when_refresh_fails(store, config, m
 
     await runner.run(store.get_task(task.task_id))
 
-    clone.assert_not_awaited()  # short-circuits on refresh failure, same as before
+    clone.assert_not_awaited()  # no mirror at all — nothing usable to fall back to
     errors = store.errors_for(task.task_id)
-    assert any(e["kind"] == "repo_seed_failed" and e["context_json"] and "org/a" in e["context_json"] for e in errors)
+    matching = [e for e in errors if e["kind"] == "repo_seed_failed"]
+    assert len(matching) == 1
+    assert "org/a" in matching[0]["context_json"]
+    assert "fatal: could not read Username" in matching[0]["message"]
     events = [e for e in store.events_for(task.task_id) if e["kind"] == "repo_seed_failed"]
     assert len(events) == 1
     detail = json.loads(events[0]["detail_json"])
     assert detail["repository"] == "org/a"
     assert detail["stage"] == "refresh"
+    assert "fatal: could not read Username" in detail["error"]
     prompt = runner._run_session.call_args.args[3]
     assert "org/a" in prompt
     assert "could not be pre-cloned" in prompt
+
+
+@pytest.mark.asyncio
+async def test_run_falls_back_to_stale_mirror_when_refresh_fails_but_mirror_exists(store, config, make_task, tmp_path, monkeypatch):
+    config.raw = {**RAW, "github": {"approved_repos": ["org/a"], "protected_branch_patterns": ["main"]}}
+    broker = MagicMock()
+    broker.register_task.return_value = {}
+    runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
+    runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
+    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", AsyncMock(return_value=RefreshResult(ok=False, existed=True, error="git command timed out")))
+    clone = AsyncMock(return_value=True)
+    monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", clone)
+    monkeypatch.setattr("taskboy.runner.repocache.mirror_last_fetch", lambda *_: 12345.0)
+    task = routed_task(store, make_task)
+    store.set_fields(task.task_id, classification_json='{"target_repos": ["org/a"]}')
+
+    await runner.run(store.get_task(task.task_id))
+
+    clone.assert_awaited_once()  # a stale mirror is still cloned into the workspace
+    assert store.errors_for(task.task_id) == []  # a stale fallback is a warning, not a failure
+    events = [e for e in store.events_for(task.task_id) if e["kind"] == "repo_seed_stale"]
+    assert len(events) == 1
+    detail = json.loads(events[0]["detail_json"])
+    assert detail["repository"] == "org/a"
+    assert detail["error"] == "git command timed out"
+    assert detail["last_fetch"] == "1970-01-01T03:25:45+00:00"
+    assert not [e for e in store.events_for(task.task_id) if e["kind"] == "repo_seed_failed"]
+    prompt = runner._run_session.call_args.args[3]
+    assert "org/a" in prompt
+    assert "behind origin" in prompt
+    assert "could not be pre-cloned" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_run_records_repo_seed_failure_when_stale_mirror_clone_also_fails(store, config, make_task, tmp_path, monkeypatch):
+    config.raw = {**RAW, "github": {"approved_repos": ["org/a"], "protected_branch_patterns": ["main"]}}
+    broker = MagicMock()
+    broker.register_task.return_value = {}
+    runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
+    runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
+    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", AsyncMock(return_value=RefreshResult(ok=False, existed=True, error="git command timed out")))
+    monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", AsyncMock(return_value=False))
+    task = routed_task(store, make_task)
+    store.set_fields(task.task_id, classification_json='{"target_repos": ["org/a"]}')
+
+    await runner.run(store.get_task(task.task_id))
+
+    events = [e for e in store.events_for(task.task_id) if e["kind"] == "repo_seed_failed"]
+    assert len(events) == 1
+    assert json.loads(events[0]["detail_json"])["stage"] == "clone"
+    assert not [e for e in store.events_for(task.task_id) if e["kind"] == "repo_seed_stale"]
 
 
 @pytest.mark.asyncio
@@ -686,7 +839,7 @@ async def test_run_records_repo_seed_failure_when_clone_from_mirror_fails(store,
     broker.register_task.return_value = {}
     runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
     runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
-    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", AsyncMock(return_value=True))
+    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", AsyncMock(return_value=RefreshResult(ok=True, existed=False)))
     monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", AsyncMock(return_value=False))
     task = routed_task(store, make_task)
     store.set_fields(task.task_id, classification_json='{"target_repos": ["org/a"]}')
@@ -705,7 +858,7 @@ async def test_run_skips_reclone_when_workspace_already_has_repo(store, config, 
     broker.register_task.return_value = {}
     runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
     runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
-    refresh = AsyncMock(return_value=True)
+    refresh = AsyncMock(return_value=RefreshResult(ok=True, existed=True))
     clone = AsyncMock(return_value=True)
     monkeypatch.setattr("taskboy.runner.repocache.refresh_one", refresh)
     monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", clone)
@@ -727,13 +880,42 @@ async def test_run_skips_reclone_when_workspace_already_has_repo(store, config, 
 
 
 @pytest.mark.asyncio
+async def test_run_reflags_stale_repo_on_resumed_workspace(store, config, make_task, tmp_path, monkeypatch):
+    # a re-run of the same task (recovery requeue, usage-limit requeue, blocked/answered-questions resume)
+    # reuses the persisted workspace and takes the already-cloned shortcut above — it must still warn the
+    # session the checkout may be stale if an earlier attempt recorded repo_seed_stale for this repo
+    config.raw = {**RAW, "github": {"approved_repos": ["org/a"], "protected_branch_patterns": ["main"]}}
+    broker = MagicMock()
+    broker.register_task.return_value = {}
+    runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
+    runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
+    refresh = AsyncMock(return_value=RefreshResult(ok=True, existed=True))
+    clone = AsyncMock(return_value=True)
+    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", refresh)
+    monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", clone)
+    task = routed_task(store, make_task)
+    store.set_fields(task.task_id, classification_json='{"target_repos": ["org/a"]}')
+    store.add_event(task.task_id, "repo_seed_stale", {"repository": "org/a", "error": "git command timed out", "last_fetch": None})
+    dest = tmp_path / "workspaces" / task.task_id / "repo" / "a"
+    (dest / ".git").mkdir(parents=True)
+
+    await runner.run(store.get_task(task.task_id))
+
+    refresh.assert_not_awaited()
+    clone.assert_not_awaited()
+    prompt = runner._run_session.call_args.args[3]
+    assert "org/a" in prompt
+    assert "behind origin" in prompt
+
+
+@pytest.mark.asyncio
 async def test_run_reclones_when_workspace_has_leftover_non_git_dir(store, config, make_task, tmp_path, monkeypatch):
     config.raw = {**RAW, "github": {"approved_repos": ["org/a"], "protected_branch_patterns": ["main"]}}
     broker = MagicMock()
     broker.register_task.return_value = {}
     runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
     runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
-    refresh = AsyncMock(return_value=True)
+    refresh = AsyncMock(return_value=RefreshResult(ok=True, existed=True))
     clone = AsyncMock(return_value=True)
     monkeypatch.setattr("taskboy.runner.repocache.refresh_one", refresh)
     monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", clone)
@@ -755,7 +937,7 @@ async def test_run_repo_seed_success_path_records_no_new_events(store, config, m
     broker.register_task.return_value = {}
     runner = ClaudeRunner(store, config, str(tmp_path / "workspaces"), str(tmp_path / "memory"), progress=AsyncMock(), broker=broker)
     runner._run_session = AsyncMock(return_value=Outcome(state=COMPLETED, result_summary="done"))
-    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", AsyncMock(return_value=True))
+    monkeypatch.setattr("taskboy.runner.repocache.refresh_one", AsyncMock(return_value=RefreshResult(ok=True, existed=False)))
     monkeypatch.setattr("taskboy.runner.repocache.clone_from_mirror", AsyncMock(return_value=True))
     task = routed_task(store, make_task)
     store.set_fields(task.task_id, classification_json='{"target_repos": ["org/a"]}')
@@ -768,11 +950,27 @@ async def test_run_repo_seed_success_path_records_no_new_events(store, config, m
     assert "could not be pre-cloned" not in prompt
 
 
-def test_build_progress_server_exposes_request_permission():
+@pytest.mark.asyncio
+async def test_build_progress_server_exposes_request_permission(monkeypatch):
     from taskboy.runner import build_progress_server
 
-    server = build_progress_server(AsyncMock(), {}, AsyncMock(return_value="ok"))
-    assert server is not None
+    def fake_tool(name, description, schema):
+        def decorate(callback):
+            return SimpleNamespace(name=name, callback=callback)
+
+        return decorate
+
+    monkeypatch.setattr("claude_agent_sdk.tool", fake_tool)
+    monkeypatch.setattr("claude_agent_sdk.create_sdk_mcp_server", lambda **kwargs: kwargs)
+    on_permission_request = AsyncMock(return_value="permission recorded")
+
+    server = build_progress_server(AsyncMock(), {}, on_permission_request)
+
+    tools = {registered.name: registered.callback for registered in server["tools"]}
+    assert "request_permission" in tools
+    result = await tools["request_permission"]({"kind": "access", "target": "aws:production", "reason": "AssumeRole denied"})
+    on_permission_request.assert_awaited_once_with("access", "aws:production", "AssumeRole denied")
+    assert result["content"][0]["text"] == "permission recorded"
 
 
 def test_record_rate_limit_event_writes_window_and_structured_audit(store, make_task):
@@ -874,7 +1072,7 @@ async def test_run_session_marks_session_limit_error_retryable(store, config, ma
     monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
     monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
 
-    outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
+    outcome = await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
 
     assert outcome.state == FAILED
     assert outcome.retryable is True
@@ -882,6 +1080,101 @@ async def test_run_session_marks_session_limit_error_retryable(store, config, ma
     assert store.rate_limit_windows()[0]["resets_at"] == 1780000000
     # a clean session with a result message must record usage exactly once, not once per recording site
     assert len(store.usage_for(task.task_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_session_transient_error_honors_known_reset_from_rejected_rate_limit_event(store, config, make_task, tmp_path, monkeypatch):
+    """a rejecting RateLimitEvent can record a reset even when the error text/status doesn't match
+    looks_session_limit (e.g. a per-request 429 with no "rate limit" wording) — that known reset must
+    still gate the retry, not the short transient default (issue #128)."""
+    config.raw = RAW
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+
+    class RateLimitEvent:
+        def __init__(self, rate_limit_info):
+            self.rate_limit_info = rate_limit_info
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            return None
+
+        async def receive_response(self):
+            yield RateLimitEvent(SimpleNamespace(rate_limit_type="five_hour", status="rejected", utilization=1.0, resets_at=1780000000))
+            yield SimpleNamespace(total_cost_usd=0.1, num_turns=1, usage={}, result="the task hit an internal error", is_error=True, subtype="error", session_id="s1", api_error_status=429)
+
+    monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
+
+    outcome = await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
+
+    assert outcome.state == FAILED
+    assert outcome.retryable is True
+    # gated on the recorded reset (resets_at + 60s), not the ~3-9 minute transient default
+    assert outcome.retry_not_before == datetime.fromtimestamp(1780000000 + 60, tz=timezone.utc).isoformat(timespec="seconds")
+
+
+@pytest.mark.asyncio
+async def test_run_session_transient_error_ignores_reset_from_non_rejected_rate_limit_event(store, config, make_task, tmp_path, monkeypatch):
+    """limit_resets_at is recorded for any well-formed RateLimitEvent, including a routine 'allowed_warning'
+    that throttled nothing — a transient result-frame error in such a session must fall back to the short
+    transient delay, not sit until the usage-window reset up to the 6-hour cap."""
+    config.raw = RAW
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+
+    class RateLimitEvent:
+        def __init__(self, rate_limit_info):
+            self.rate_limit_info = rate_limit_info
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            return None
+
+        async def receive_response(self):
+            yield RateLimitEvent(SimpleNamespace(rate_limit_type="five_hour", status="allowed_warning", utilization=0.83, resets_at=1780000000))
+            yield SimpleNamespace(total_cost_usd=0.1, num_turns=1, usage={}, result="529 Overloaded", is_error=True, subtype="error", session_id="s1", api_error_status=529)
+
+    monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
+
+    outcome = await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
+
+    assert outcome.state == FAILED
+    assert outcome.retryable is True
+    now = datetime.now(timezone.utc)
+    computed = datetime.fromisoformat(outcome.retry_not_before)
+    assert abs((computed - now).total_seconds() - 3 * 60) < 5  # TRANSIENT_RETRY_MINUTES(3) * (attempt(0) + 1), not the resets_at-gated reset
 
 
 @pytest.mark.asyncio
@@ -917,7 +1210,7 @@ async def test_run_session_limit_shaped_text_without_rejected_event_is_not_retry
     monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
     monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
 
-    outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
+    outcome = await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
 
     assert outcome.state == FAILED
     assert outcome.retryable is False
@@ -962,12 +1255,225 @@ async def test_run_session_non_rejected_rate_limit_event_is_not_retryable(store,
     monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
     monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
 
-    outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
+    outcome = await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
 
     assert outcome.state == FAILED
     assert outcome.retryable is False
     assert outcome.retry_not_before is None
     assert store.rate_limit_windows()[0]["status"] == "allowed_warning"  # observed, but not a rejection
+
+
+@pytest.mark.asyncio
+async def test_run_session_cli_process_error_is_retryable_not_a_crash(store, config, make_task, tmp_path, monkeypatch):
+    """the CLI subprocess dying mid-stream (ProcessError/CLIConnectionError) must resume, not surface as an
+    unretried 'runner crashed' (issue #128)."""
+    from claude_agent_sdk import ProcessError
+
+    config.raw = RAW
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            return None
+
+        async def receive_response(self):
+            yield SimpleNamespace(usage={"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}, session_id="s1")
+            raise ProcessError("CLI exited unexpectedly", exit_code=1)
+
+    monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
+
+    outcome = await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
+
+    assert outcome.state == FAILED
+    assert outcome.retryable is True
+    assert outcome.session_id == "s1"  # observed before the crash, preserved for resume
+    assert outcome.retry_not_before is not None
+    assert store.errors_for(task.task_id)[-1]["kind"] == "session_error"
+
+
+@pytest.mark.asyncio
+async def test_run_session_cli_not_found_error_is_not_retried(store, config, make_task, tmp_path, monkeypatch):
+    """CLINotFoundError subclasses CLIConnectionError but is a permanent misconfiguration (missing/unresolvable
+    CLI binary), not a transient drop — it must surface, not burn every retry as if it were one (issue #128)."""
+    from claude_agent_sdk import CLINotFoundError
+
+    config.raw = RAW
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            return None
+
+        async def receive_response(self):
+            yield SimpleNamespace(usage={"input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}, session_id="s1")
+            raise CLINotFoundError("Claude Code not found")
+
+    monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
+
+    with pytest.raises(CLINotFoundError):
+        await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
+
+
+@pytest.mark.asyncio
+async def test_run_session_result_error_max_turns_is_not_retried(store, config, make_task, tmp_path, monkeypatch):
+    """ResultError subclasses ProcessError, so a terminal CLI-reported result (error_max_turns here) would
+    otherwise match the same isinstance check as a transient connection drop (issue #128)."""
+    from claude_agent_sdk import ResultError
+
+    config.raw = RAW
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            return None
+
+        async def receive_response(self):
+            yield SimpleNamespace(usage={"input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}, session_id="s1")
+            raise ResultError("max turns reached", data={"subtype": "error_max_turns", "terminal_reason": "max_turns", "session_id": "s1"})
+
+    monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
+
+    with pytest.raises(ResultError):
+        await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
+
+
+@pytest.mark.asyncio
+async def test_run_session_result_error_without_terminal_reason_is_retryable(store, config, make_task, tmp_path, monkeypatch):
+    """the CLI doesn't always populate terminal_reason for a transient api_error — gate on the same
+    looks_transient_api_error classifier as the result-frame path, not on terminal_reason alone (issue #128)."""
+    from claude_agent_sdk import ResultError
+
+    config.raw = RAW
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            return None
+
+        async def receive_response(self):
+            yield SimpleNamespace(usage={"input_tokens": 1, "output_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}, session_id="s1")
+            raise ResultError("overloaded", data={"subtype": "success", "api_error_status": 529, "session_id": "s1"})
+
+    monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
+
+    outcome = await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
+
+    assert outcome.state == FAILED
+    assert outcome.retryable is True
+    assert outcome.session_id == "s1"
+    assert outcome.retry_not_before is not None
+
+
+@pytest.mark.asyncio
+async def test_run_session_structured_api_error_status_is_retryable(store, config, make_task, tmp_path, monkeypatch):
+    """the CLI's structured api_error_status (>=500) gates the retry, not a substring match on
+    agent-influenced result text (issue #128)."""
+    config.raw = RAW
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+    task.attempt = 2  # third try
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            return None
+
+        async def receive_response(self):
+            yield SimpleNamespace(total_cost_usd=0.1, num_turns=1, usage={}, result="the task hit an internal error", is_error=True, subtype="error", session_id="s1", api_error_status=503)
+
+    monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
+
+    outcome = await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
+
+    assert outcome.state == FAILED
+    assert outcome.retryable is True
+    assert outcome.retry_not_before is not None
+    now = datetime.now(timezone.utc)
+    computed = datetime.fromisoformat(outcome.retry_not_before)
+    assert abs((computed - now).total_seconds() - 9 * 60) < 5  # TRANSIENT_RETRY_MINUTES(3) * (attempt(2) + 1)
 
 
 @pytest.mark.asyncio
@@ -1001,7 +1507,7 @@ async def test_run_session_non_limit_error_is_not_retryable(store, config, make_
     monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
     monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
 
-    outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
+    outcome = await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
 
     assert outcome.state == FAILED
     assert outcome.retryable is False
@@ -1042,7 +1548,7 @@ async def test_run_session_without_result_message_fails_instead_of_completing(st
     monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
     monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
 
-    outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
+    outcome = await runner._run_session(task, "fable", tmp_path, "prompt", {}, [])
 
     assert outcome.state == FAILED
     rows = store.usage_for(task.task_id)
@@ -1050,10 +1556,54 @@ async def test_run_session_without_result_message_fails_instead_of_completing(st
     assert rows[0]["input_tokens"] == 100
     assert rows[0]["output_tokens"] == 50
     assert rows[0]["cost_usd"] is None
+    assert rows[0]["model"] == "fable"
     assert outcome.error == "session ended without a result message"
     assert outcome.retryable is False
     assert outcome.result_summary == ""
     assert store.errors_for(task.task_id)[0]["kind"] == "missing_result"
+
+
+@pytest.mark.asyncio
+async def test_run_session_records_resolved_model_from_assistant_frames(store, config, make_task, tmp_path, monkeypatch, caplog):
+    config.raw = RAW
+    runner = make_runner(store, config, tmp_path)
+    task = routed_task(store, make_task)
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            pass
+
+    class FakeClient:
+        def __init__(self, options):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def query(self, prompt):
+            return None
+
+        async def receive_response(self):
+            yield SimpleNamespace(model="claude-fable-5-1", usage={"input_tokens": 40, "output_tokens": 20}, session_id="s1")
+            yield SimpleNamespace(model="claude-fable-5-1", usage={"input_tokens": 10, "output_tokens": 5}, session_id="s1")
+            yield SimpleNamespace(total_cost_usd=0.5, usage={"input_tokens": 50, "output_tokens": 25}, num_turns=2, result="## Final Report\ndone", is_error=False, session_id="s1")
+
+    monkeypatch.setattr("claude_agent_sdk.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
+    monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
+    caplog.set_level("INFO", logger="taskboy.runner")
+
+    outcome = await runner._run_session(task, "fable", tmp_path, "prompt", {}, [])
+
+    assert outcome.state == COMPLETED
+    rows = store.usage_for(task.task_id)
+    assert len(rows) == 1
+    assert rows[0]["model"] == "claude-fable-5-1"
+    assert caplog.messages.count(f"task {task.task_id}: model fable resolved to claude-fable-5-1") == 1
 
 
 @pytest.mark.asyncio
@@ -1091,7 +1641,7 @@ async def test_run_session_records_partial_usage_on_timeout(store, config, make_
     monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
     monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
 
-    outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
+    outcome = await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
 
     assert outcome.state == FAILED
     assert outcome.session_id == "s1"
@@ -1140,7 +1690,7 @@ async def test_run_session_records_partial_usage_on_cancellation(store, config, 
     monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
 
     with pytest.raises(asyncio.CancelledError):
-        await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
+        await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
 
     rows = store.usage_for(task.task_id)
     assert len(rows) == 1
@@ -1185,7 +1735,7 @@ async def test_run_session_timeout_without_usage_records_nothing(store, config, 
     monkeypatch.setattr("claude_agent_sdk.HookMatcher", lambda **kwargs: object())
     monkeypatch.setattr("taskboy.runner.build_progress_server", lambda *args: object())
 
-    outcome = await runner._run_session(task, "claude-sonnet-4-6", tmp_path, "prompt", {}, [])
+    outcome = await runner._run_session(task, "claude-sonnet-5", tmp_path, "prompt", {}, [])
 
     assert outcome.state == FAILED
     assert outcome.error == "exceeded the 60 minute runtime limit"

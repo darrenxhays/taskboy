@@ -55,6 +55,29 @@ def should_start_review_poller(config, broker) -> bool:
     return True
 
 
+async def startup_aws_check(role_arns: dict[str, str], notifier, timeout_seconds: float = 20) -> dict[str, str]:
+    if not role_arns:
+        return {}
+
+    from taskboy.adapters.aws_read import check_environments
+
+    try:
+        aws_statuses = await asyncio.wait_for(asyncio.to_thread(check_environments, role_arns), timeout_seconds)
+    except TimeoutError:
+        logger.warning("aws diagnostics self-check did not finish within %ss — continuing startup; the dashboard config page re-probes on demand", timeout_seconds)
+        return {}
+    for environment, status in aws_statuses.items():
+        if status == "ok":
+            logger.info("aws diagnostics role for %s: ok", environment)
+        else:
+            logger.warning("aws diagnostics role for %s cannot be assumed — reads in that environment will fail until fixed: %s", environment, status)
+    denied = {environment: status for environment, status in aws_statuses.items() if status != "ok"}
+    debug = getattr(notifier, "debug", None)
+    if denied and debug is not None:
+        await debug.system_error("aws", "diagnostics roles that cannot be assumed: " + "; ".join(f"{environment}: {status}" for environment, status in denied.items()))
+    return aws_statuses
+
+
 async def amain() -> None:
     config = load_config(settings.CONFIG_PATH)
     store = Store(settings.DB_PATH)
@@ -106,6 +129,12 @@ async def amain() -> None:
         if config.reviewer.enabled:
             if not config.service_enabled("github"):
                 logger.warning("reviewer is enabled but the github service is disabled — reviewer GitHub review tasks are disabled")
+            elif broker is not None and settings.REVIEWER_BROKER_SOCKET == settings.BROKER_SOCKET:
+                # the same path would unlink the main broker's live socket when the reviewer's broker binds
+                logger.warning(
+                    "TASKBOY_BROKER_SOCKET and TASKBOY_REVIEWER_BROKER_SOCKET both resolve to %s — refusing to start the reviewer's credential broker so the main broker is not unlinked",
+                    settings.BROKER_SOCKET,
+                )
             elif secrets is not None and secrets.reviewer_github_enabled:
                 candidate = CredentialBroker(secrets.reviewer_github_app_id, secrets.reviewer_github_installation_id, secrets.reviewer_github_app_private_key, settings.REVIEWER_BROKER_SOCKET, settings.GIT_CRED_HELPER)
                 try:
@@ -131,6 +160,10 @@ async def amain() -> None:
             config.service_enabled("aws"),
             slack_client is not None,
         )
+        # probe every configured aws environment now: a role that cannot be assumed is a startup warning, not a blocked task later
+        role_arns = (config.raw.get("aws") or {}).get("diagnostics_role_arns") or {}
+        if config.service_enabled("aws") and role_arns:
+            await startup_aws_check(role_arns, notifier)
     else:
         classify = stub_classify
         run = EchoRunner().run

@@ -2,8 +2,10 @@
 
 sub-agents never hold a long-lived credential. git asks this broker at use-time through a
 credential helper over a unix socket, authenticated by a per-task nonce; the broker mints an
-installation token scoped to the task's profile (read-only vs write) and target repositories,
-caches it, and re-mints when close to expiry — so github's ~1h ttl never breaks a long task.
+installation token scoped to the task's effective permissions (the profile set widened per
+granted GitHub write tool via GITHUB_TOOL_PERMISSIONS) and effective repositories (classified
+targets plus operator-granted repositories), caches it, and re-mints when close to expiry — so
+github's ~1h ttl never breaks a long task.
 task A's nonce is useless for task B, and every minted token is registered with the redactor.
 """
 
@@ -28,11 +30,22 @@ logger = logging.getLogger("taskboy.broker")
 GITHUB_API = "https://api.github.com"
 REFRESH_MARGIN_SECONDS = 600  # re-mint when less than 10 minutes remain
 
-# github app permissions requested per routing profile: allowlist, hook, and credential all agree (§8.4)
+# github app base permissions per routing profile; effective task permissions may be widened per granted github write tool (§8.4)
 PROFILE_PERMISSIONS = {
     "read_only": {"contents": "read", "metadata": "read", "pull_requests": "read"},
     "standard": {"contents": "write", "metadata": "read", "pull_requests": "write"},
     "deep": {"contents": "write", "metadata": "read", "pull_requests": "write"},
+}
+GITHUB_TOOL_PERMISSIONS: dict[str, dict[str, str]] = {
+    "mcp__github__create_pull_request": {"contents": "write", "pull_requests": "write"},
+    "mcp__github__update_pull_request": {"pull_requests": "write"},
+    "mcp__github__comment_on_pull_request": {"pull_requests": "write"},
+    "mcp__github__create_pr_review": {"pull_requests": "write"},
+    "mcp__github__reply_to_pr_comment": {"pull_requests": "write"},
+    "mcp__github__resolve_pr_thread": {"pull_requests": "write"},
+    "mcp__github__close_pull_request": {"pull_requests": "write"},
+    "mcp__github__delete_branch": {"contents": "write"},
+    "mcp__github__create_release": {"contents": "write"},
 }
 
 
@@ -61,12 +74,21 @@ class CredentialBroker:
 
     # -- task lifecycle --------------------------------------------------------
 
-    def register_task(self, task: Task, approved_repos: list[str], granted_repos: list[str] | None = None, *, hooks_path: str) -> dict[str, str]:
-        """returns the env vars for the task session; the future token is scoped to profile + target repos.
+    def register_task(self, task: Task, approved_repos: list[str], granted_repos: list[str] | None = None, granted_tools: list[str] | None = None, *, hooks_path: str) -> dict[str, str]:
+        """returns the env vars for the task session; the future token is scoped to the task's effective permissions (the profile's set, widened per granted GitHub write tool) and its effective repos (classified targets plus operator-granted repos).
 
         granted_repos are repos an operator approved mid-task; they widen the token scope beyond the task's
-        original classification so live git ops against a granted repo authenticate instead of 403ing (§8.4)."""
-        permissions = PROFILE_PERMISSIONS.get(task.profile or "", PROFILE_PERMISSIONS["read_only"])
+        original classification so live git ops against a granted repo authenticate instead of 403ing (§8.4).
+        granted_tools likewise: each granted GitHub write tool adds only the token permissions that tool needs."""
+        permissions = dict(PROFILE_PERMISSIONS.get(task.profile or "", PROFILE_PERMISSIONS["read_only"]))
+        for tool_name in granted_tools or []:
+            # unmapped github write tools do not widen token permissions
+            tool_permissions = GITHUB_TOOL_PERMISSIONS.get(tool_name)
+            if tool_permissions is None:
+                continue
+            for permission_name, permission_level in tool_permissions.items():
+                if permissions.get(permission_name) != "write":
+                    permissions[permission_name] = permission_level
         targets = (json.loads(task.classification_json) if task.classification_json else {}).get("target_repos") or []
         repos = [repo for repo in targets if repo in approved_repos]
         for repo in granted_repos or []:

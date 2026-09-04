@@ -28,7 +28,9 @@ echo "== service user + directories =="
 id -u "$SVC_USER" &>/dev/null || useradd --system --home-dir "$VAR_DIR" --shell /sbin/nologin "$SVC_USER"
 install -d -o "$SVC_USER" -g "$SVC_USER" -m 700 "$VAR_DIR" "$VAR_DIR/workspaces" "$VAR_DIR/memory" "$VAR_DIR/repos"
 install -d -o "$SVC_USER" -g "$SVC_USER" -m 755 "$RUN_DIR"
-install -d -m 755 "$ETC_DIR" "$OPT_DIR"
+# group-writable so the dashboard, running as the service user, can write temp files next to the live config
+install -d -g "$SVC_USER" -m 775 "$ETC_DIR"
+install -d -m 755 "$OPT_DIR"
 echo "d $RUN_DIR 0755 $SVC_USER $SVC_USER" > "/etc/tmpfiles.d/$SLUG.conf"
 
 echo "== code + venv =="

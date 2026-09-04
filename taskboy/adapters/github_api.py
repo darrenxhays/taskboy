@@ -9,8 +9,9 @@ push) stays in Bash via the credential helper; these tools cover the api surface
 import json
 import logging
 import re
+from typing import Annotated
 
-from taskboy.adapters._util import OUTPUT_LIMIT, _error, _text, wrap
+from taskboy.adapters._util import OUTPUT_LIMIT, _error, _text, permission_hint, wrap
 from taskboy.models import Task
 from taskboy.redact import redactor
 from taskboy.store import Store
@@ -75,6 +76,41 @@ class GitHubAdapter:
         if self.on_milestone:
             await self.on_milestone(f"Opened pull request {pr['html_url']}")
         return _text(f"created pull request #{pr['number']}: {pr['html_url']}")
+
+    async def update_pull_request(self, args: dict) -> dict:
+        repo, error = self._check_repo(args)
+        if error:
+            return error
+        number = int(args["number"])
+        title = str(args.get("title") or "").strip()
+        body = str(args.get("body") or "").strip()
+        if not title and not body:
+            return _error("provide title and/or body to update")
+
+        # only the agent's or reviewer's own prs may be edited, same guard as resolve_pr_thread
+        known_logins, unresolved = await self._resolve_bot_logins()
+        detail = f" ({'; '.join(unresolved)})" if unresolved else ""
+        if not known_logins:
+            return _error(f"cannot verify pull request authorship — resolution unavailable for this task{detail}")
+
+        pr = await self._request("GET", f"/repos/{repo}/pulls/{number}")
+        author_login = str((pr.get("user") or {}).get("login") or "").lower().removesuffix("[bot]")
+        if author_login not in known_logins:
+            return _error(f"only pull requests authored by {self.bot_name} or {self.other_bot_name} can be edited{detail}")
+
+        payload: dict = {}
+        if title:
+            payload["title"] = title
+        if body:
+            # don't drop attribution if the caller's new body doesn't already carry a trailer (#122)
+            if "Requested via Slack" not in body:
+                body = body + f"\n\n---\nRequested via Slack — taskboy task `{self.task.task_id}`."
+            payload["body"] = body
+
+        pr = await self._request("PATCH", f"/repos/{repo}/pulls/{number}", payload)
+        if self.on_milestone:
+            await self.on_milestone(f"Updated pull request {pr['html_url']}")
+        return _text(f"updated pull request #{number}: {pr['html_url']}")
 
     async def get_pull_request(self, args: dict) -> dict:
         repo, error = self._check_repo(args)
@@ -145,14 +181,23 @@ class GitHubAdapter:
             return self._one_comment(int(comment_id_raw), issue_comments, review_comments, offset)
 
         resolution_by_comment: dict[int, bool] = {}
+        review_thread_note = ""
         try:
             for thread in await self._review_threads(repo, number):
                 for comment in (thread.get("comments") or {}).get("nodes") or []:
                     comment_id = comment.get("databaseId")
                     if comment_id is not None:
                         resolution_by_comment[int(comment_id)] = bool(thread.get("isResolved"))
-        except Exception:
+        except Exception as e:
+            if (isinstance(e, GitHubStatusError) and e.status in (401, 403)) or "request_permission" in str(e):
+                review_thread_note = f"note: review-thread resolution state unavailable — {redactor.redact(str(e))}"
             logger.debug("could not annotate review thread status for %s#%s", repo, number, exc_info=True)
+
+        def append_review_thread_note(text: str) -> str:
+            if not review_thread_note:
+                return text
+            return f"{text[: max(OUTPUT_LIMIT - len(review_thread_note) - 1, 0)]}\n{review_thread_note}"
+
         # combine before sorting so "newest-appearing-last" holds across both kinds, not just within each
         combined = [("issue", comment) for comment in issue_comments] + [("review", comment) for comment in review_comments]
         combined.sort(key=lambda item: str(item[1].get("created_at") or ""))
@@ -173,13 +218,14 @@ class GitHubAdapter:
             lines.append(f"[{comment.get('id')}] [{comment.get('created_at')}] {comment_author} ({label}): {preview}{status}")
         if not lines:
             total = len(issue_comments) + len(review_comments)
-            return _text("no comments" if not total else f"no comments matched the filters (there are {total} in total)")
+            message = "no comments" if not total else f"no comments matched the filters (there are {total} in total)"
+            return _text(append_review_thread_note(message))
         # tail_fit always favors the newest lines, so offset skips from the newest end too — otherwise
         # a caller paging with offset would keep landing back on the same tail-fitted chunk
         selected = lines[: max(len(lines) - offset, 0)]
         if not selected:
-            return _text(f"no comments past offset {offset} (there are {len(lines)} in total)")
-        return _text(self._tail_fit(selected, offset))
+            return _text(append_review_thread_note(f"no comments past offset {offset} (there are {len(lines)} in total)"))
+        return _text(append_review_thread_note(self._tail_fit(selected, offset)))
 
     @staticmethod
     def _tail_fit(selected: list[str], offset: int) -> str:
@@ -375,6 +421,7 @@ class GitHubAdapter:
   resolveReviewThread(input: {threadId: $id}) { thread { isResolved } }
 }""",
             {"id": thread["id"]},
+            repo=repo,
         )
         if not (((data.get("resolveReviewThread") or {}).get("thread") or {}).get("isResolved")):
             raise RuntimeError("github did not confirm that the review thread was resolved")
@@ -422,9 +469,12 @@ class GitHubAdapter:
 
     def _check_repo(self, args: dict) -> tuple[str, dict | None]:
         repo = str(args.get("repo", "")).strip()
-        if repo not in self.approved_repos:
-            return repo, _error(f"repository {repo!r} is not on the approved list {self.approved_repos}")
-        return repo, None
+        if repo in self.approved_repos:
+            return repo, None
+        if "/" not in repo:
+            # bare name reads as a permissions problem via the approved-list error (issue #125)
+            return repo, _error(f"repo must be the full 'owner/name' form, got {repo!r} — approved: {self.approved_repos}")
+        return repo, _error(f"repository {repo!r} is not on the approved list {self.approved_repos}")
 
     def _record_pr(self, repo: str, pr: dict) -> None:
         self.store.add_artifact(self.task.task_id, "pull_request", f"{repo}#{pr['number']}", pr.get("html_url"))
@@ -451,12 +501,17 @@ class GitHubAdapter:
                 if response.status >= 300:
                     body = redactor.redact(await response.text())[:300]
                     retry_after = response.headers.get("Retry-After")
-                    raise GitHubStatusError(response.status, f"github api {method} {path} failed: {response.status} — {body}", retry_after=retry_after)
+                    message = f"github api {method} {path} failed: {response.status} — {body}"
+                    is_throttle = response.status == 403 and (retry_after is not None or "rate limit" in body.lower())
+                    if response.status in (401, 403) and not is_throttle:
+                        # the app installation or token scope lacks something: an operator fix, so point the model at request_permission
+                        message += f" — {permission_hint('github', _repo_scope(path))}"
+                    raise GitHubStatusError(response.status, message, retry_after=retry_after)
                 if response.status == 204:
                     return None
                 return await response.json()
 
-    async def _graphql(self, query: str, variables: dict) -> dict:
+    async def _graphql(self, query: str, variables: dict, *, repo: str | None = None) -> dict:
         """the graphql http seam — patched separately in unit tests."""
         import aiohttp
 
@@ -465,10 +520,22 @@ class GitHubAdapter:
         async with aiohttp.ClientSession() as session:
             async with session.post(GITHUB_API + "/graphql", json={"query": query, "variables": variables}, headers=headers) as response:
                 if response.status >= 300:
-                    raise RuntimeError(redactor.redact(f"github graphql failed: {response.status}"))
+                    body = redactor.redact(await response.text())[:300]
+                    retry_after = response.headers.get("Retry-After")
+                    message = f"github graphql failed: {response.status} — {body}"
+                    is_throttle = response.status == 403 and (retry_after is not None or "rate limit" in body.lower())
+                    if response.status in (401, 403) and not is_throttle:
+                        message += f" — {permission_hint('github', repo or 'api')}"
+                    if response.status in (401, 403):
+                        raise GitHubStatusError(response.status, message, retry_after=retry_after)
+                    raise RuntimeError(message)
                 payload = await response.json()
                 if payload.get("errors"):
-                    raise RuntimeError(redactor.redact(f"github graphql failed: {json.dumps(payload['errors'])}"))
+                    errors = payload["errors"]
+                    message = redactor.redact(f"github graphql failed: {json.dumps(errors)}")
+                    if any(isinstance(error, dict) and (error.get("type") in ("FORBIDDEN", "INSUFFICIENT_SCOPES") or "Resource not accessible by integration" in str(error.get("message", ""))) for error in errors):
+                        message += f" — {permission_hint('github', repo or 'api')}"
+                    raise RuntimeError(message)
                 return payload.get("data") or {}
 
     async def _review_threads(self, repo: str, number: int) -> list[dict]:
@@ -492,6 +559,7 @@ class GitHubAdapter:
   }
 }""",
                 {"owner": owner, "name": name, "number": number, "after": cursor},
+                repo=repo,
             )
             review_threads = (((data.get("repository") or {}).get("pullRequest") or {}).get("reviewThreads")) or {}
             nodes.extend(review_threads.get("nodes") or [])
@@ -501,22 +569,30 @@ class GitHubAdapter:
                 return nodes
 
 
+_REPO = Annotated[str, "owner/name"]
+
+
 def build_github_server(adapter: GitHubAdapter):
     """expose the adapter as mcp tools; names become mcp__github__<name> in allowed_tools."""
     from claude_agent_sdk import create_sdk_mcp_server, tool
 
     tools = [
-        tool("create_pull_request", "Create a pull request. Include a Summary, Testing performed, and Known limitations in the body.", {"repo": str, "title": str, "head": str, "base": str, "body": str})(wrap(adapter.create_pull_request, logger)),
-        tool("get_pull_request", "Get one pull request's metadata.", {"repo": str, "number": int})(wrap(adapter.get_pull_request, logger)),
+        tool("create_pull_request", "Create a pull request. Include a Summary, Testing performed, and Known limitations in the body.", {"repo": _REPO, "title": str, "head": str, "base": str, "body": str})(wrap(adapter.create_pull_request, logger)),
+        tool("get_pull_request", "Get one pull request's metadata.", {"repo": _REPO, "number": int})(wrap(adapter.get_pull_request, logger)),
+        tool(
+            "update_pull_request",
+            f"Update an existing pull request's title and/or body (at least one required). `body` fully replaces the existing body — do not rebuild it from get_pull_request's body, which is truncated to 2000 chars. Only pull requests authored by {adapter.bot_name} or {adapter.other_bot_name} can be edited; use close_pull_request for state changes.",
+            {"type": "object", "properties": {"repo": {"type": "string"}, "number": {"type": "integer"}, "title": {"type": "string"}, "body": {"type": "string"}}, "required": ["repo", "number"]},
+        )(wrap(adapter.update_pull_request, logger)),
         tool(
             "list_pull_requests",
             "List pull requests in a repository. State defaults to open and may be open, closed, or all.",
-            {"type": "object", "properties": {"repo": {"type": "string"}, "state": {"type": "string"}}, "required": ["repo"]},
+            {"type": "object", "properties": {"repo": {"type": "string", "description": "owner/name"}, "state": {"type": "string"}}, "required": ["repo"]},
         )(wrap(adapter.list_pull_requests, logger)),
         tool(
             "list_pr_files",
             "List changed files and bounded patches for a pull request, 10 per page. Fetch full diffs with git.",
-            {"type": "object", "properties": {"repo": {"type": "string"}, "number": {"type": "integer"}, "page": {"type": "integer"}}, "required": ["repo", "number"]},
+            {"type": "object", "properties": {"repo": {"type": "string", "description": "owner/name"}, "number": {"type": "integer"}, "page": {"type": "integer"}}, "required": ["repo", "number"]},
         )(wrap(adapter.list_pr_files, logger)),
         tool(
             "list_pr_comments",
@@ -524,7 +600,7 @@ def build_github_server(adapter: GitHubAdapter):
             {
                 "type": "object",
                 "properties": {
-                    "repo": {"type": "string"},
+                    "repo": {"type": "string", "description": "owner/name"},
                     "number": {"type": "integer"},
                     "offset": {"type": "integer", "description": "if truncated, skip this many of the most-recently-shown comments (the truncation marker gives the right value); with comment_id, this is characters into that body to resume from instead"},
                     "author": {"type": "string", "description": 'login, exact match; pass "me" for the acting persona\'s own login'},
@@ -533,32 +609,38 @@ def build_github_server(adapter: GitHubAdapter):
                 "required": ["repo", "number"],
             },
         )(wrap(adapter.list_pr_comments, logger)),
-        tool("comment_on_pull_request", "Post a comment on a pull request.", {"repo": str, "number": int, "body": str})(wrap(adapter.comment_on_pull_request, logger)),
+        tool("comment_on_pull_request", "Post a comment on a pull request.", {"repo": _REPO, "number": int, "body": str})(wrap(adapter.comment_on_pull_request, logger)),
         tool(
             "create_pr_review",
             "Post a review (COMMENT or REQUEST_CHANGES, and APPROVE for the reviewing persona) on a pull request, optionally with inline comments_json.",
             {
                 "type": "object",
-                "properties": {"repo": {"type": "string"}, "number": {"type": "integer"}, "body": {"type": "string"}, "event": {"type": "string"}, "comments_json": {"type": "string"}},
+                "properties": {"repo": {"type": "string", "description": "owner/name"}, "number": {"type": "integer"}, "body": {"type": "string"}, "event": {"type": "string"}, "comments_json": {"type": "string"}},
                 "required": ["repo", "number", "body", "event"],
             },
         )(wrap(adapter.create_pr_review, logger)),
-        tool("reply_to_pr_comment", "Reply to a specific pull request review comment.", {"repo": str, "number": int, "comment_id": int, "body": str})(wrap(adapter.reply_to_pr_comment, logger)),
+        tool("reply_to_pr_comment", "Reply to a specific pull request review comment.", {"repo": _REPO, "number": int, "comment_id": int, "body": str})(wrap(adapter.reply_to_pr_comment, logger)),
         tool(
             "resolve_pr_thread",
             f"Resolve a pull request review thread, identified by any review comment id in it. Only threads started by {adapter.bot_name} or {adapter.other_bot_name} can be resolved; use it once the thread's finding is verifiably fixed.",
-            {"repo": str, "number": int, "comment_id": int},
+            {"repo": _REPO, "number": int, "comment_id": int},
         )(wrap(adapter.resolve_pr_thread, logger)),
-        tool("close_pull_request", "Close a pull request without merging it. Idempotent — already-closed pull requests are reported, not re-closed.", {"repo": str, "number": int})(wrap(adapter.close_pull_request, logger)),
-        tool("delete_branch", "Delete a branch. Only agent/-prefixed branches can be deleted; protected and default branches are refused.", {"repo": str, "branch": str})(wrap(adapter.delete_branch, logger)),
+        tool("close_pull_request", "Close a pull request without merging it. Idempotent — already-closed pull requests are reported, not re-closed.", {"repo": _REPO, "number": int})(wrap(adapter.close_pull_request, logger)),
+        tool("delete_branch", "Delete a branch. Only agent/-prefixed branches can be deleted; protected and default branches are refused.", {"repo": _REPO, "branch": str})(wrap(adapter.delete_branch, logger)),
         tool(
             "create_release",
             "Create a GitHub release with a new tag (vX.Y.Z) and release notes. The tag is created from target_commitish (default branch when omitted); name defaults to the tag.",
             {
                 "type": "object",
-                "properties": {"repo": {"type": "string"}, "tag_name": {"type": "string"}, "body": {"type": "string"}, "name": {"type": "string"}, "target_commitish": {"type": "string"}},
+                "properties": {"repo": {"type": "string", "description": "owner/name"}, "tag_name": {"type": "string"}, "body": {"type": "string"}, "name": {"type": "string"}, "target_commitish": {"type": "string"}},
                 "required": ["repo", "tag_name", "body"],
             },
         )(wrap(adapter.create_release, logger)),
     ]
     return create_sdk_mcp_server(name="github", version="1.0.0", tools=tools)
+
+
+def _repo_scope(path: str) -> str:
+    """owner/name from a /repos/{owner}/{name}/... path, else 'api'."""
+    match = re.match(r"^/repos/([^/]+)/([^/]+)", path)
+    return f"{match.group(1)}/{match.group(2)}" if match else "api"

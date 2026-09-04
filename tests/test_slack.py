@@ -886,8 +886,29 @@ async def test_requester_lifecycle_messages_omit_task_id(make_task):
     assert all(task.task_id not in post["text"] for post in client.posts)
     assert client.posts[0]["text"] == "Working on it."
     assert client.posts[1]["text"] == "*Failed*\nit broke"
-    assert client.posts[3]["text"] == "The orchestrator restarted; this task was requeued and will resume."
+    assert client.posts[3]["text"] == "This task hit a transient issue and was requeued; it will resume shortly."
     assert client.posts[4]["text"] == "Can't take this task: unsupported"
+
+
+@pytest.mark.asyncio
+async def test_blocked_message_names_the_resume_path(store, make_task):
+    # a thread reply to a blocked task starts a new task, so the message must not claim it continues this one
+    client = AsyncMock()
+    client.chat_postMessage.return_value = {"ts": "1.1"}
+    notifier = SlackNotifier(client, store=store, dashboard_url="https://red.test/")
+    task = make_task()
+    store.set_fields(task.task_id, blocked_reason="production logs unreadable")
+    await notifier.blocked(store.get_task(task.task_id))
+    text = client.chat_postMessage.await_args.kwargs["text"]
+    assert "*Blocked*" in text and "production logs unreadable" in text
+    assert f"https://red.test/tasks/{task.task_id}" in text
+    assert "Reply in this thread to continue" not in text
+    # with a pending permission request the same post says an admin's grant resumes the task
+    store.request_permission(task.task_id, "access", "aws:production", "AssumeRole denied")
+    await notifier.blocked(store.get_task(task.task_id))
+    text = client.chat_postMessage.await_args.kwargs["text"]
+    assert "*Waiting for operator approval*" in text
+    assert f"https://red.test/tasks/{task.task_id}" in text
 
 
 @pytest.mark.asyncio

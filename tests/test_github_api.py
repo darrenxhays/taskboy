@@ -1,10 +1,12 @@
 import json
+import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from taskboy.adapters._util import permission_hint, wrap
 from taskboy.adapters.github_api import GitHubAdapter, GitHubStatusError, _text
 from taskboy.models import QUEUED, RECEIVED
 
@@ -37,6 +39,55 @@ def adapter(store, make_task):
     a._request = AsyncMock()
     a._graphql = AsyncMock(return_value={"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}})
     return a
+
+
+@pytest.fixture
+def http_adapter(store, make_task):
+    broker = AsyncMock()
+    broker.token_for_task.return_value = "ghs_tok"
+    task = routed(store, make_task)
+    return GitHubAdapter(broker, store, task, APPROVED, on_milestone=AsyncMock(), main_broker=slug_broker("agent"), reviewer_broker=slug_broker("reviewer"))
+
+
+class FakeResponse:
+    def __init__(self, status, *, headers=None, body="", payload=None):
+        self.status = status
+        self.headers = headers or {}
+        self.body = body
+        self.payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def text(self):
+        return self.body
+
+    async def json(self):
+        return self.payload
+
+
+class FakeSession:
+    def __init__(self, response):
+        self.response = response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    def request(self, method, url, json, headers):
+        return self.response
+
+    def post(self, url, json, headers):
+        return self.response
+
+
+def fake_aiohttp(monkeypatch, response):
+    monkeypatch.setitem(sys.modules, "aiohttp", SimpleNamespace(ClientSession=lambda: FakeSession(response)))
 
 
 @pytest.mark.asyncio
@@ -78,6 +129,17 @@ async def test_unapproved_repo_is_refused_without_any_request(adapter):
     result = await adapter.create_pull_request({"repo": "org/other", "title": "x", "head": "b", "body": ""})
     assert result.get("isError") is True
     assert "not on the approved list" in result["content"][0]["text"]
+    adapter._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bare_repo_name_errors_with_corrective_message(adapter):
+    """issue #125: a bare name gets the owner/name correction, not the approved-list message."""
+    result = await adapter.create_pull_request({"repo": "other-repo", "title": "x", "head": "b", "body": ""})
+    assert result.get("isError") is True
+    text = result["content"][0]["text"]
+    assert "owner/name" in text
+    assert "not on the approved list" not in text
     adapter._request.assert_not_awaited()
 
 
@@ -182,6 +244,73 @@ async def test_comment_and_reply_record_artifacts(adapter, store):
     await adapter.reply_to_pr_comment({"repo": "org/service-a", "number": 4, "comment_id": 9, "body": "done"})
     kinds = {a["external_id"] for a in store.artifacts_for(adapter.task.task_id) if a["kind"] == "pr_comment"}
     assert kinds == {"org/service-a#4/comment/1", "org/service-a#4/comment/2"}
+
+
+@pytest.mark.asyncio
+async def test_update_pull_request_updates_title_and_appends_trailer(adapter, store):
+    adapter._request.side_effect = [
+        {"user": {"login": "red[bot]"}},  # GET for authorship check
+        {"number": 12, "html_url": "https://github.com/org/service-a/pull/12"},  # PATCH
+    ]
+    result = await adapter.update_pull_request({"repo": "org/service-a", "number": 12, "title": "new title", "body": "Summary\nTesting\nLimitations"})
+    assert "updated pull request #12" in result["content"][0]["text"]
+    patch_call = adapter._request.call_args
+    assert patch_call.args[:2] == ("PATCH", "/repos/org/service-a/pulls/12")
+    payload = patch_call.args[2]
+    assert payload["title"] == "new title"
+    assert adapter.task.task_id in payload["body"]
+    # this task didn't open #12, so it must not claim it as its own pull_request artifact (#122)
+    assert ("pull_request", "org/service-a#12") not in {(a["kind"], a["external_id"]) for a in store.artifacts_for(adapter.task.task_id)}
+    adapter.on_milestone.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_pull_request_title_only_does_not_touch_body(adapter):
+    adapter._request.side_effect = [
+        {"user": {"login": "red[bot]"}},  # GET for authorship check
+        {"number": 12, "html_url": "u"},  # PATCH
+    ]
+    await adapter.update_pull_request({"repo": "org/service-a", "number": 12, "title": "new title"})
+    payload = adapter._request.call_args.args[2]
+    assert payload == {"title": "new title"}
+
+
+@pytest.mark.asyncio
+async def test_update_pull_request_does_not_duplicate_an_existing_trailer(adapter):
+    trailer = f"\n\n---\nRequested via Slack — taskboy task `{adapter.task.task_id}`."
+    adapter._request.side_effect = [
+        {"user": {"login": "red[bot]"}},
+        {"number": 12, "html_url": "u"},
+    ]
+    await adapter.update_pull_request({"repo": "org/service-a", "number": 12, "body": "new body" + trailer})
+    payload = adapter._request.call_args.args[2]
+    assert payload == {"body": "new body" + trailer}
+
+
+@pytest.mark.asyncio
+async def test_update_pull_request_requires_title_or_body(adapter):
+    result = await adapter.update_pull_request({"repo": "org/service-a", "number": 12})
+    assert result.get("isError") is True
+    assert "title and/or body" in result["content"][0]["text"]
+    adapter._request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_pull_request_refuses_human_authored_pr(adapter):
+    adapter._request.side_effect = [{"user": {"login": "a-human"}}]
+    result = await adapter.update_pull_request({"repo": "org/service-a", "number": 12, "title": "x"})
+    assert result.get("isError") is True
+    assert "only pull requests authored by Agent or Reviewer can be edited" in result["content"][0]["text"]
+    assert adapter._request.await_count == 1  # only the authorship GET, never a PATCH
+
+
+@pytest.mark.asyncio
+async def test_update_pull_request_refuses_without_any_persona_broker(adapter):
+    adapter.bot_brokers = []
+    result = await adapter.update_pull_request({"repo": "org/service-a", "number": 12, "title": "x"})
+    assert result.get("isError") is True
+    assert "cannot verify pull request authorship" in result["content"][0]["text"]
+    adapter._request.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -381,15 +510,64 @@ async def test_list_pr_comments_review_threads_stops_on_null_end_cursor(adapter)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "thread_error",
+    [
+        GitHubStatusError(
+            403,
+            "github graphql failed: 403 — forbidden — this is an access problem an operator can fix: call request_permission with kind='access' and target='github:org/repo', quoting this error as the reason, then stop working.",
+        ),
+        RuntimeError(f"github graphql failed: [{{'type': 'FORBIDDEN'}}] — {permission_hint('github', 'org/repo')}"),
+    ],
+    ids=["http-403", "graphql-payload"],
+)
+async def test_list_pr_comments_surfaces_review_thread_access_hint(adapter, thread_error):
+    adapter._request.side_effect = [[], [{"id": 2, "created_at": "now", "user": {"login": "agent"}, "body": "finding", "path": "src/foo.py", "line": 1}]]
+    adapter._review_threads = AsyncMock(side_effect=thread_error)
+
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
+
+    assert "agent (review, src/foo.py:1): finding" in text
+    assert "request_permission" in text
+    assert "target='github:org/repo'" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("comments", "args"),
+    [
+        (([], []), {}),
+        (([{"id": 1, "created_at": "now", "user": {"login": "dev"}, "body": "finding"}], []), {"author": "reviewer"}),
+        (([{"id": 1, "created_at": "now", "user": {"login": "dev"}, "body": "finding"}], []), {"offset": 2}),
+    ],
+    ids=["no-comments", "author-matches-none", "offset-past-end"],
+)
+async def test_list_pr_comments_early_returns_preserve_review_thread_access_hint(adapter, comments, args):
+    adapter._request.side_effect = comments
+    adapter._review_threads = AsyncMock(
+        side_effect=GitHubStatusError(
+            403,
+            "github graphql failed: 403 — forbidden — this is an access problem an operator can fix: call request_permission with kind='access' and target='github:org/repo'",
+        )
+    )
+
+    text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4, **args}))["content"][0]["text"]
+
+    assert "request_permission" in text
+    assert "target='github:org/repo'" in text
+
+
+@pytest.mark.asyncio
 async def test_list_pr_comments_degrades_when_thread_query_fails(adapter):
     adapter._request.side_effect = [[], [{"id": 2, "created_at": "now", "user": {"login": "agent"}, "body": "finding", "path": "src/foo.py", "line": 1}]]
-    adapter._graphql.side_effect = RuntimeError("graphql unavailable")
+    adapter._review_threads = AsyncMock(side_effect=RuntimeError("github graphql failed: 502"))
 
     text = (await adapter.list_pr_comments({"repo": "org/service-a", "number": 4}))["content"][0]["text"]
 
     assert "agent (review, src/foo.py:1): finding" in text
     assert "(resolved)" not in text
     assert "(unresolved)" not in text
+    assert "request_permission" not in text
 
 
 @pytest.mark.asyncio
@@ -529,9 +707,11 @@ async def test_resolve_pr_thread_resolves_red_authored_thread(adapter):
     result = await adapter.resolve_pr_thread({"repo": "org/service-a", "number": 4, "comment_id": 11})
 
     assert result["content"][0]["text"] == "resolved review thread for comment 11 on org/service-a#4"
+    assert adapter._graphql.await_args_list[0].kwargs == {"repo": "org/service-a"}
     mutation = adapter._graphql.await_args_list[1]
     assert "resolveReviewThread" in mutation.args[0]
     assert mutation.args[1] == {"id": "PRRT_1"}
+    assert mutation.kwargs == {"repo": "org/service-a"}
 
 
 @pytest.mark.asyncio
@@ -808,6 +988,7 @@ async def test_request_raises_status_error_with_body_and_retry_after_on_failure(
     assert exc_info.value.retry_after == "7"
     assert "missing.py" in str(exc_info.value)
     assert "422" in str(exc_info.value)
+    assert "request_permission" not in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -847,4 +1028,118 @@ async def test_request_bounds_and_redacts_the_body_on_failure(monkeypatch, store
     message = str(exc_info.value)
     assert "[redacted]" in message
     assert "ghs_" + "a" * 40 not in message
-    assert len(message) < 400  # bounded to ~300 chars of body plus the status prefix
+    body, _, hint = message.partition(" — this is an access problem")
+    assert len(body) < 400  # bounded to ~300 chars of body plus the status prefix
+    assert "request_permission with kind='access' and target='github:org/service-a'" in hint  # a 403 tells the model what to request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403])
+async def test_graphql_http_access_error_for_resolve_thread_includes_repo_access_hint(monkeypatch, http_adapter, status):
+    fake_aiohttp(monkeypatch, FakeResponse(status))
+
+    result = await wrap(http_adapter.resolve_pr_thread, logging.getLogger("test.github"))({"repo": "org/service-a", "number": 4, "comment_id": 11})
+
+    message = result["content"][0]["text"]
+    assert result["isError"] is True
+    assert "request_permission" in message
+    assert "kind='access'" in message
+    assert "target='github:org/service-a'" in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "body", "expected_retry_after"),
+    [
+        ({"Retry-After": "60"}, "Please retry this request later", "60"),
+        ({}, "You have exceeded a secondary rate limit", None),
+    ],
+)
+async def test_graphql_secondary_rate_limit_keeps_retry_after_without_access_hint(monkeypatch, http_adapter, headers, body, expected_retry_after):
+    fake_aiohttp(monkeypatch, FakeResponse(403, headers=headers, body=body))
+
+    with pytest.raises(GitHubStatusError) as exc_info:
+        await http_adapter._graphql("query { viewer { login } }", {}, repo="org/service-a")
+
+    assert exc_info.value.retry_after == expected_retry_after
+    assert "request_permission" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"type": "FORBIDDEN", "message": "Unrelated GraphQL error"},
+        {"type": "INSUFFICIENT_SCOPES", "message": "Unrelated GraphQL error"},
+        {"type": "OTHER", "message": "Resource not accessible by integration"},
+    ],
+)
+async def test_graphql_access_payload_for_resolve_thread_includes_repo_access_hint(monkeypatch, http_adapter, error):
+    fake_aiohttp(monkeypatch, FakeResponse(200, payload={"errors": [error]}))
+
+    result = await wrap(http_adapter.resolve_pr_thread, logging.getLogger("test.github"))({"repo": "org/service-a", "number": 4, "comment_id": 11})
+
+    message = result["content"][0]["text"]
+    assert result["isError"] is True
+    assert "request_permission" in message
+    assert "kind='access'" in message
+    assert "target='github:org/service-a'" in message
+
+
+@pytest.mark.asyncio
+async def test_graphql_non_access_payload_stays_generic(monkeypatch, http_adapter):
+    error = {"type": "BAD_USER_INPUT", "message": "Variable \\ of type Int! was provided invalid value"}
+    fake_aiohttp(monkeypatch, FakeResponse(200, payload={"errors": [error]}))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await http_adapter._graphql("query { viewer { login } }", {}, repo="org/service-a")
+
+    assert "BAD_USER_INPUT" in str(exc_info.value)
+    assert "request_permission" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("headers", "body", "retry_after"),
+    [
+        ({"Retry-After": "60"}, "Please retry this request later", "60"),
+        ({}, "You have exceeded a secondary rate limit", None),
+    ],
+)
+async def test_request_secondary_rate_limit_stays_generic(monkeypatch, http_adapter, headers, body, retry_after):
+    fake_aiohttp(monkeypatch, FakeResponse(403, headers=headers, body=body))
+
+    with pytest.raises(GitHubStatusError) as exc_info:
+        await http_adapter._request("POST", "/repos/org/service-a/pulls", {"title": "x"})
+
+    assert exc_info.value.retry_after == retry_after
+    assert "request_permission" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected_hint"),
+    [
+        (401, "request_permission with kind='access' and target='github:org/service-a'"),
+        (403, "request_permission with kind='access' and target='github:org/service-a'"),
+    ],
+)
+async def test_request_plain_access_error_includes_repo_access_hint(monkeypatch, http_adapter, status, expected_hint):
+    fake_aiohttp(monkeypatch, FakeResponse(status, body="Resource not accessible by integration"))
+
+    with pytest.raises(GitHubStatusError) as exc_info:
+        await http_adapter._request("POST", "/repos/org/service-a/pulls", {"title": "x"})
+
+    assert expected_hint in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_request_server_error_stays_generic(monkeypatch, http_adapter):
+    fake_aiohttp(monkeypatch, FakeResponse(500, body="server unavailable"))
+
+    with pytest.raises(GitHubStatusError) as exc_info:
+        await http_adapter._request("GET", "/repos/org/service-a/pulls")
+
+    assert exc_info.value.status == 500
+    assert str(exc_info.value) == "github api GET /repos/org/service-a/pulls failed: 500 — server unavailable"
+    assert "request_permission" not in str(exc_info.value)

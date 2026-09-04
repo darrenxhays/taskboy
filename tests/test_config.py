@@ -52,7 +52,7 @@ def test_example_config_is_valid():
     assert "mcp__github__resolve_pr_thread" not in config.raw["profiles"]["read_only"]["allowed_tools"]
     assert "mcp__github__resolve_pr_thread" in config.raw["profiles"]["standard"]["allowed_tools"]
     assert "mcp__github__resolve_pr_thread" in config.raw["profiles"]["deep"]["allowed_tools"]
-    for tool in ("mcp__github__close_pull_request", "mcp__github__delete_branch", "mcp__github__create_release"):
+    for tool in ("mcp__github__close_pull_request", "mcp__github__delete_branch", "mcp__github__create_release", "mcp__github__update_pull_request"):
         assert tool not in config.raw["profiles"]["read_only"]["allowed_tools"]
         assert tool in config.raw["profiles"]["standard"]["allowed_tools"]
         assert tool in config.raw["profiles"]["deep"]["allowed_tools"]
@@ -413,6 +413,15 @@ def test_dashboard_expected_alb_arn_configurable_and_validated(tmp_path):
     path.write_text(VALID + "dashboard:\n  expected_alb_arn: 12\n")
     with pytest.raises(ConfigError, match="dashboard.expected_alb_arn must be a string"):
         load_config(str(path))
+
+
+def test_shipped_config_template_uses_model_aliases():
+    # the sdk resolves bare aliases to the newest release of each class; a pinned id silently freezes a tier
+    example = Path(__file__).parents[1] / "taskboy" / "templates" / "config.example.yaml"
+    config = load_config(str(example))
+
+    for alias, model in config.raw["models"].items():
+        assert model["id"] == alias
 
 
 def test_dashboard_auto_commit_committer_identity_is_configurable(tmp_path):

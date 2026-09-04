@@ -34,8 +34,11 @@ def main() -> None:
     for verb in ("grant", "deny"):
         decide = sub.add_parser(verb, help=f"{verb} a sub-agent's permission request (granting a blocked task resumes it)")
         decide.add_argument("task_id")
-        decide.add_argument("kind", choices=["tool", "repo"])
-        decide.add_argument("target", help="the tool name or owner/name repository")
+        decide.add_argument("kind", choices=["tool", "repo", "access"])
+        decide.add_argument("target", help="the tool name, owner/name repository, or system:scope access target")
+
+    resume = sub.add_parser("resume", help="requeue a blocked task on its existing session after fixing the blocker out of band")
+    resume.add_argument("task_id")
 
     sub.add_parser("pause-intake", help="refuse new tasks; running tasks continue (REL-009)")
     sub.add_parser("resume-intake", help="accept new tasks again")
@@ -73,6 +76,8 @@ def main() -> None:
             _cancel(store, args.task_id)
         elif args.command == "permissions":
             _permissions(store, args.task_id)
+        elif args.command == "resume":
+            _resume(store, args.task_id)
         elif args.command in ("grant", "deny"):
             asyncio.run(_decide_permission(store, args.command, args.task_id, args.kind, args.target))
         elif args.command == "pause-intake":
@@ -131,7 +136,7 @@ def _permissions(store: Store, task_id: str) -> None:
         return
     for row in rows:
         decided = f" by {row['decided_by']}" if row["decided_by"] else ""
-        print(f"{row['status']:8} {row['kind']:4} {row['target']}{decided}  ({row['reason'][:80]})")
+        print(f"{row['status']:8} {row['kind']:6} {row['target']}{decided}  ({row['reason'][:80]})")
 
 
 async def _decide_permission(store: Store, decision_verb: str, task_id: str, kind: str, target: str) -> None:
@@ -139,6 +144,13 @@ async def _decide_permission(store: Store, decision_verb: str, task_id: str, kin
 
     decision = "granted" if decision_verb == "grant" else "denied"
     task, status = await decide_permission(store, StdoutNotifier(), task_id, kind, target, decision, "cli")
+    print(f"{task_id}: {status}" + (f" (now {task.state})" if task else ""))
+
+
+def _resume(store: Store, task_id: str) -> None:
+    from taskboy.task_actions import resume_task
+
+    task, status = resume_task(store, task_id, "cli")
     print(f"{task_id}: {status}" + (f" (now {task.state})" if task else ""))
 
 

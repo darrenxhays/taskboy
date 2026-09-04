@@ -14,14 +14,17 @@ from datetime import datetime, timedelta, timezone
 
 from taskboy import memory, repocache, settings, skills, workspace
 from taskboy.config import KNOWN_SERVICES, Config, role_for
-from taskboy.hooks import TOOL_CLASSIFICATION, TaskHooks, repo_grantable, tool_grantable
-from taskboy.models import BLOCKED, COMPLETED, FAILED, Outcome, Task
+from taskboy.hooks import TOOL_CLASSIFICATION, TaskHooks, is_profile_escalation, repo_grantable, tool_grantable
+from taskboy.models import BLOCKED, COMPLETED, FAILED, QUEUED, Outcome, Task
 from taskboy.personality import load as load_personality
 from taskboy.prompts import CONVENTIONS_FILENAME, task_prompt
 from taskboy.router import fallback_chain
 from taskboy.store import Store
 
 logger = logging.getLogger("taskboy.runner")
+
+# an 'access' permission target: system:scope, no whitespace (aws:production, jira:story_points_field, github:org/repo)
+ACCESS_TARGET = re.compile(r"^[a-z][a-z0-9_-]*:\S+$")
 
 
 class EchoRunner:
@@ -153,12 +156,14 @@ class ClaudeRunner:
         task_broker = self.reviewer_broker if is_reviewer and self.reviewer_broker is not None else self.broker
         if is_reviewer and self.reviewer_broker is None:
             logger.warning("reviewer task %s has no reviewer credential broker — falling back to the main broker", task.task_id)
-        # operator-granted permissions widen this run's scope: extra tools go to the allowlist, extra repos get cloned.
-        # grants are gated exactly like the original request — recognized tools within the profile tier; a granted repo
-        # either was already role-scoped, or is an org/installation-grantable escalation (repo_grantable, issue #39)
-        profile_tools = strip_disabled_service_tools(list(((self.config.raw.get("profiles") or {}).get(task.profile or "", {})).get("allowed_tools") or []), self.config)
+        # operator-granted permissions widen this run's scope: extra tools go to the allowlist, extra repos get cloned,
+        # granted access (aws:production, jira:story_points_field, ...) is relayed to the prompt so the session retries.
+        # grants are gated exactly like the original request — recognized tools (an operator may knowingly grant a write
+        # tool to a read-only task); a granted repo either was already role-scoped, or is an org/installation-grantable
+        # escalation (repo_grantable, issue #39)
         granted = self.store.granted_permissions_for(task.task_id)
-        granted_tools = [tool_name for tool_name in granted["tools"] if tool_grantable(tool_name, profile_tools)]
+        granted_tools = [tool_name for tool_name in granted["tools"] if tool_grantable(tool_name)]
+        granted_access = list(granted.get("access") or [])
         accessible_repos = task_broker.accessible_repos if task_broker is not None else None
         granted_repos = [repo for repo in granted["repos"] if repo in scoped_repos or repo_grantable(repo, approved_repos, accessible_repos)]
         # widen scoped_repos itself so a granted escalation actually takes effect downstream: register_task's token
@@ -167,34 +172,51 @@ class ClaudeRunner:
         for repo in granted_repos:
             if repo not in scoped_targets:
                 scoped_targets.append(repo)
-        applied_permissions = {"tools": granted_tools, "repos": granted_repos} if (granted_tools or granted_repos) else None
+        applied_permissions = {"tools": granted_tools, "repos": granted_repos, "access": granted_access} if (granted_tools or granted_repos or granted_access) else None
         if applied_permissions:
             self.store.add_event(task.task_id, "permissions_applied", applied_permissions)
         broker_env: dict[str, str] = {}
         cloned_repos: list[str] = []
         failed_repo_clones: list[str] = []
+        stale_repos: list[str] = []
         if task_broker is not None:
             for repo in scoped_targets:
                 dest = ws / "repo" / repo.split("/", 1)[-1]
                 if (dest / ".git").is_dir():
                     # clone_from_mirror rmtrees dest on failure — don't re-clone over a prior attempt's tree
                     cloned_repos.append(repo)
+                    if self.store.last_event_ts(task.task_id, "repo_seed_stale", "repository", repo):
+                        # a resumed session (recovery requeue, usage-limit requeue, blocked/answered-questions
+                        # resume) reuses this workspace — re-flag it stale so the prompt still warns to pull
+                        stale_repos.append(repo)
                     continue
-                refreshed = await repocache.refresh_one(task_broker, settings.REPOS_ROOT, repo, timeout=60)
-                cloned = refreshed and await repocache.clone_from_mirror(settings.REPOS_ROOT, repo, dest)
-                if cloned:
-                    cloned_repos.append(repo)
-                else:
-                    failed_repo_clones.append(repo)
-                    stage = "refresh" if not refreshed else "clone"
-                    detail = {"repository": repo, "stage": stage}
-                    self.store.add_error("runner", "repo_seed_failed", f"failed to pre-clone {repo} into workspace ({stage} step failed)", task_id=task.task_id, context=detail)
+                refresh = await repocache.refresh_one(task_broker, settings.REPOS_ROOT, repo, timeout=60)
+                if not refresh.ok and not refresh.existed:
+                    detail = {"repository": repo, "stage": "refresh", "error": refresh.error}
+                    self.store.add_error("runner", "repo_seed_failed", f"failed to pre-clone {repo} into workspace (refresh step failed): {refresh.error}", task_id=task.task_id, context=detail)
                     self.store.add_event(task.task_id, "repo_seed_failed", detail)
+                    failed_repo_clones.append(repo)
+                    continue
+                if not await repocache.clone_from_mirror(settings.REPOS_ROOT, repo, dest):
+                    detail = {"repository": repo, "stage": "clone"}
+                    self.store.add_error("runner", "repo_seed_failed", f"failed to pre-clone {repo} into workspace (clone step failed)", task_id=task.task_id, context=detail)
+                    self.store.add_event(task.task_id, "repo_seed_failed", detail)
+                    failed_repo_clones.append(repo)
+                    continue
+                cloned_repos.append(repo)
+                if not refresh.ok:
+                    # a failed fetch leaves the prior mirror intact — seed from it rather than failing the task
+                    stale_repos.append(repo)
+                    last_fetch = repocache.mirror_last_fetch(settings.REPOS_ROOT, repo)
+                    last_fetch_iso = datetime.fromtimestamp(last_fetch, timezone.utc).isoformat(timespec="seconds") if last_fetch is not None else None
+                    detail = {"repository": repo, "error": refresh.error, "last_fetch": last_fetch_iso}
+                    self.store.add_event(task.task_id, "repo_seed_stale", detail)
+                    logger.warning("seeded %s from a stale mirror after refresh failure for %s: %s", repo, task.task_id, refresh.error)
         if task_broker is not None:
             # granted_repos are passed through so the live credential token is scoped to them too,
             # not just the task's original classification — otherwise mid-session git ops 403 (§8.4)
             # git resolves core.hooksPath against its own cwd, so the path must be absolute (#75)
-            broker_env = task_broker.register_task(task, scoped_repos, granted_repos=granted_repos, hooks_path=str(workspace.hooks_dir(ws).resolve()))
+            broker_env = task_broker.register_task(task, scoped_repos, granted_repos=granted_repos, granted_tools=granted_tools, hooks_path=str(workspace.hooks_dir(ws).resolve()))
         conventions_path = self.config.conventions_path
         inject_conventions = bool(scoped_targets) and conventions_path is not None
         if inject_conventions:
@@ -221,12 +243,14 @@ class ClaudeRunner:
             thread_context=task.thread_context,
             cloned_repos=cloned_repos,
             failed_repo_clones=failed_repo_clones,
+            stale_repos=stale_repos,
             skill=skill_prompt,
             conventions=inject_conventions,
             personality=personality[0] if personality else None,
             self_repo=self_repo if self_repo in scoped_targets else None,
             granted_permissions=applied_permissions,
             answered_questions=self.store.answered_questions_for(task.task_id),
+            operator_resumed=bool(task.resume_session_id) and self._operator_resumed(task),
         )
         if self.debug is not None:
             await self.debug.prompt_file(task, prompt)
@@ -248,7 +272,7 @@ class ClaudeRunner:
                 task_broker.release_task(task.task_id)
 
     async def _run_session(self, task: Task, model_id: str, ws, prompt: str, broker_env: dict[str, str], scoped_repos: list[str], task_broker=None, granted_tools: list[str] | None = None, skill_internal_tools: list[str] | None = None) -> Outcome:
-        from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher
+        from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, CLIConnectionError, CLINotFoundError, HookMatcher, ProcessError, ResultError
 
         from taskboy.adapters.issues import ENQUEUE_TOOLS, ISSUES_TOOLS, EnqueueAdapter, IssuesAdapter, build_enqueue_server, build_issues_server
 
@@ -340,6 +364,7 @@ class ClaudeRunner:
         saw_rejected_rate_limit = False
         limit_minutes = task.max_runtime_minutes or 60
         running_usage = {"input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
+        resolved_model: str | None = None
         try:
             async with asyncio.timeout(limit_minutes * 60):
                 async with ClaudeSDKClient(options=options) as client:
@@ -360,6 +385,9 @@ class ClaudeRunner:
                         if is_result(message):
                             final = message
                             continue
+                        observed = getattr(message, "model", None)
+                        if isinstance(observed, str) and observed:
+                            resolved_model = observed
                         # assistant frames carry per-turn usage; the result frame's is cumulative
                         message_usage = getattr(message, "usage", None) or {}
                         for key in running_usage:
@@ -371,8 +399,25 @@ class ClaudeRunner:
         except Exception as e:
             if looks_model_unavailable(e):
                 raise ModelUnavailable(str(e)) from e
+            if isinstance(e, CLINotFoundError):
+                # a missing/unresolvable CLI binary is a permanent misconfiguration, not a transient
+                # connection drop — let it surface as an unretried crash rather than burn retries on it
+                raise
+            if isinstance(e, ResultError) and not looks_transient_api_error(e.result or str(e), e.api_error_status):
+                # a terminal CLI-reported result (error_max_turns, error_during_execution, a resume the CLI refused) will fail identically on retry (issue #128)
+                raise
+            if isinstance(e, (CLIConnectionError, ProcessError)):
+                # session_id may already be known from an earlier message, so resume it rather than
+                # surfacing this as an unretried "runner crashed" (issue #128)
+                error = str(e)
+                self.store.add_error("runner", "session_error", error, task_id=task.task_id)
+                # limit_resets_at is recorded for any well-formed RateLimitEvent, including a routine
+                # "allowed_warning" that throttled nothing — only honor it once something was actually rejected
+                return Outcome(state=FAILED, error=error, session_id=session_id, retryable=True, retry_not_before=retry_not_before(limit_resets_at if saw_rejected_rate_limit else None, TRANSIENT_RETRY_MINUTES * (task.attempt + 1)))
             raise
         finally:
+            if resolved_model and resolved_model != model_id:
+                logger.info("task %s: model %s resolved to %s", task.task_id, model_id, resolved_model)
             # the result frame's cumulative usage/cost are exact, unlike the running per-turn sum; record
             # whichever we have, so this is the single site that persists usage either way (issue #101, #91)
             record_usage = getattr(final, "usage", None) or running_usage
@@ -381,7 +426,7 @@ class ClaudeRunner:
                 self.store.add_usage(
                     task.task_id,
                     "subagent",
-                    model_id,
+                    resolved_model or model_id,
                     input_tokens=record_usage.get("input_tokens"),
                     output_tokens=record_usage.get("output_tokens"),
                     cache_read_tokens=record_usage.get("cache_read_input_tokens"),
@@ -405,6 +450,10 @@ class ClaudeRunner:
             # requeue when the SDK actually told us this run got throttled (§10)
             if saw_rejected_rate_limit and looks_session_limit(error):
                 return Outcome(state=FAILED, error=error, session_id=session_id, cost_usd=cost, num_turns=turns, retryable=True, retry_not_before=retry_not_before(limit_resets_at))
+            # a provider-side 5xx / overloaded / dropped-stream result is worth a short-delay retry even
+            # without a RateLimitEvent (issue #128)
+            if looks_transient_api_error(error, getattr(final, "api_error_status", None)):
+                return Outcome(state=FAILED, error=error, session_id=session_id, cost_usd=cost, num_turns=turns, retryable=True, retry_not_before=retry_not_before(limit_resets_at if saw_rejected_rate_limit else None, TRANSIENT_RETRY_MINUTES * (task.attempt + 1)))
             return Outcome(state=FAILED, error=error, session_id=session_id, cost_usd=cost, num_turns=turns)
         return Outcome(state=COMPLETED, result_summary=extract_final_report(text), reply=extract_reply(text), session_id=session_id, cost_usd=cost, num_turns=turns)
 
@@ -423,37 +472,57 @@ class ClaudeRunner:
 
         return audit
 
-    def _permission_requester(self, task: Task, blocked: dict, allowed_tools: list[str], profile_tools: list[str], scoped_repos: list[str], approved_repos: list[str], accessible_repos: set[str] | None, progress):
-        """validate a session's request for one extra tool/repo, record it for operator review, and stop the task (§8.4).
+    def _operator_resumed(self, task: Task) -> bool:
+        """true when the latest blocked-to-queued transition was an operator resume."""
+        changes = self.store.events_for_kinds(task.task_id, {"state_change"})
+        for event in reversed(changes):
+            detail = json.loads(event["detail_json"])
+            if detail.get("from") == BLOCKED and detail.get("to") == QUEUED:
+                return str(detail.get("reason", "")).startswith("operator resume")
+        return False
 
-        allowed_tools is the effective allowlist (base + any prior grant); profile_tools is the base tier used to
-        gate escalation; scoped_repos is the role-scoped repo set (not the org-wide approved list) — a repo request
-        outside it is still recorded for operator review as long as it's a well-formed 'owner/name' whose org
-        already appears in approved_repos and, when accessible_repos is known, the github app is installed on it;
-        auto-rejection is reserved for malformed targets or repos outside the org/installation (issue #39)."""
+    def _permission_requester(self, task: Task, blocked: dict, allowed_tools: list[str], profile_tools: list[str], scoped_repos: list[str], approved_repos: list[str], accessible_repos: set[str] | None, progress):
+        """validate a session's request for one extra tool, repo, or piece of access, record it for operator review,
+        and stop the task (§8.4). anything a task was not granted at start but needs to finish goes through here.
+
+        allowed_tools is the effective allowlist (base + any prior grant); profile_tools is the base tier, used only
+        to label a write-tool request from a read-only task as a profile escalation (still recorded — the operator
+        decides); scoped_repos is the role-scoped repo set (not the org-wide approved list) — a repo request outside
+        it is still recorded for operator review as long as it's a well-formed 'owner/name' whose org already appears
+        in approved_repos and, when accessible_repos is known, the github app is installed on it; auto-rejection is
+        reserved for malformed targets or repos outside the org/installation (issue #39). an 'access' request names
+        a system:scope (aws:production, jira:story_points_field, github:org/repo) that an operator satisfies out of
+        band — IAM, a config value, a service-account permission — and then grants so the same session resumes."""
 
         async def request(kind: str, target: str, reason: str) -> str:
             kind = (kind or "").strip().lower()
             target = (target or "").strip()
             reason = (reason or "").strip()
-            if kind not in ("tool", "repo"):
-                return "kind must be 'tool' or 'repo'. no request recorded."
+            if kind not in ("tool", "repo", "access"):
+                return "kind must be 'tool', 'repo', or 'access'. no request recorded."
             if not target:
                 return f"a target {kind} is required. no request recorded."
+            escalation = False
             if kind == "tool":
                 if target not in TOOL_CLASSIFICATION:
                     return f"'{target}' is not a recognized tool, so it cannot be granted. no request recorded."
                 if target in allowed_tools:
-                    return f"you already have {target} for this task — no permission needed."
-                if not tool_grantable(target, profile_tools):
-                    return f"'{target}' is a write tool and this task runs on a read-only profile, so it cannot be granted. no request recorded."
-            else:
+                    return f"you already have {target} for this task — if a call to it failed for an access reason, request kind='access' with the system:scope it named instead. no permission needed for the tool itself."
+                escalation = is_profile_escalation(target, profile_tools)
+            elif kind == "repo":
                 if "/" not in target:
                     return "a repo target must be 'owner/name'. no request recorded."
                 if target not in scoped_repos and not repo_grantable(target, approved_repos, accessible_repos):
                     return f"{target} is not an approved repository for this task, so it cannot be granted. no request recorded."
+            else:
+                if not ACCESS_TARGET.fullmatch(target):
+                    return "an access target must be 'system:scope' with no spaces, e.g. aws:production or jira:story_points_field. no request recorded."
+                if not reason:
+                    return "an access request needs a reason quoting the error you hit, so the operator knows what to fix. no request recorded."
+            if escalation:
+                reason = f"[profile escalation: write tool on a {task.profile or 'read_only'} task] {reason}".strip()
             self.store.request_permission(task.task_id, kind, target, reason)
-            self.store.add_event(task.task_id, "permission_request", {"kind": kind, "target": target, "reason": reason[:500]})
+            self.store.add_event(task.task_id, "permission_request", {"kind": kind, "target": target, "reason": reason[:500], "escalation": escalation})
             blocked["reason"] = f"needs permission for {kind} '{target}': {reason[:300]}" if reason else f"needs permission for {kind} '{target}'"
             await progress(f"Requested permission for {kind} `{target}` to continue — awaiting operator approval.")
             return f"recorded a permission request for {kind} '{target}'. an operator will review it; if granted, this task resumes automatically with the access. stop working now."
@@ -493,7 +562,7 @@ def build_progress_server(on_progress, blocked: dict, on_permission_request=None
 
     @tool(
         "request_permission",
-        "Request one additional permission this task did not start with: kind='tool' with target a tool name you were denied (e.g. mcp__jira__add_comment), or kind='repo' with target an approved 'owner/name' repository you need to access. reason explains why it is needed. An operator reviews it; if granted the task resumes automatically with the access. After calling this, stop working.",
+        "Request one permission this task did not start with but needs to finish: kind='tool' with target a tool name you were denied (e.g. mcp__jira__add_comment); kind='repo' with target an approved 'owner/name' repository; or kind='access' with target 'system:scope' when a tool you already hold failed for an access reason (e.g. aws:production after an AssumeRole AccessDenied, jira:story_points_field when a config value is missing, github:org/repo after a 403). reason explains why, quoting the exact error. An operator reviews it; if granted the task resumes automatically with the access. After calling this, stop working.",
         {"kind": str, "target": str, "reason": str},
     )
     async def request_permission(args: dict) -> dict:
@@ -552,14 +621,28 @@ def looks_session_limit(text: str) -> bool:
     return any(marker in lowered for marker in ("session limit", "rate limit", "usage limit"))
 
 
-def retry_not_before(limit_resets_at: int | None) -> str:
-    """when to requeue a task that died on a session/rate limit: shortly after the recorded reset, a default
-    wait when no reset time was observed, and never later than a bounded cap either way."""
+# minutes to wait before retrying a transient provider/connection failure — short, unlike the 15-minute
+# rate-limit default, since these aren't gated by a known reset time
+TRANSIENT_RETRY_MINUTES = 3
+
+
+def looks_transient_api_error(text: str, api_error_status: int | None = None) -> bool:
+    """error-shape heuristic for a provider-side/connection failure worth a short-delay retry."""
+    if api_error_status is not None and (api_error_status >= 500 or api_error_status == 429):
+        return True
+    # the result text alone is agent-influenced and not a safe place to match status-code substrings (a "529"
+    # could appear inside unrelated content); these markers are for shapes with no structured status to check
+    lowered = text.lower()
+    return any(marker in lowered for marker in ("overloaded", "response stopped arriving", "econnreset", "socket hang up"))
+
+
+def retry_not_before(limit_resets_at: int | None, default_minutes: float = 15) -> str:
+    """when to requeue a task that died transiently: shortly after a recorded reset if one is known, otherwise the default wait."""
     now = datetime.now(timezone.utc)
     if limit_resets_at is not None:
         candidate = datetime.fromtimestamp(limit_resets_at + 60, tz=timezone.utc)
     else:
-        candidate = now + timedelta(minutes=15)
+        candidate = now + timedelta(minutes=default_minutes)
     cap = now + timedelta(hours=6)
     if candidate > cap:
         candidate = cap

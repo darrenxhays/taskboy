@@ -9,9 +9,9 @@ from taskboy.router import RoleRefusal, route, route_skill
 RAW = {
     "models": {
         "haiku": {"id": "claude-haiku-4-5", "fallbacks": ["sonnet"]},
-        "sonnet": {"id": "claude-sonnet-4-6", "fallbacks": ["opus"]},
-        "opus": {"id": "claude-opus-4-6", "fallbacks": []},
-        "fable": {"id": "claude-fable-5", "fallbacks": ["opus"]},
+        "sonnet": {"id": "claude-sonnet-5", "fallbacks": ["opus"]},
+        "opus": {"id": "claude-opus-5", "fallbacks": []},
+        "fable": {"id": "claude-fable-5-1", "fallbacks": ["opus"]},
     },
     "routing": {
         "rules": [
@@ -51,7 +51,7 @@ def test_complexity_alone_can_route_to_opus():
 def test_critical_routes_to_fable_and_deep():
     decision = route("bug_fix", "critical", None, RAW)
     assert decision.model_alias == "fable"
-    assert decision.model_id == "claude-fable-5"
+    assert decision.model_id == "claude-fable-5-1"
     assert decision.fallback_chain == ["fable", "opus"]
     assert decision.profile == "deep"
     assert decision.max_budget_usd == 20.0

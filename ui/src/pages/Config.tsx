@@ -256,6 +256,25 @@ export function ConfigPage({ admin }: { admin: boolean }) {
         </Panel>
       </div>
 
+      <Panel title="AWS diagnostics roles — can the host assume each environment?">
+        {Object.keys(data.aws_environments ?? {}).length === 0 ? (
+          <EmptyState label="no diagnostics_role_arns configured in services/aws.yaml (or the aws service is disabled)" />
+        ) : (
+          <div className="space-y-1.5">
+            {Object.entries(data.aws_environments).map(([environment, status]) => (
+              <div key={environment} className="flex items-start justify-between gap-3 text-[12px]">
+                <span className="mono shrink-0" style={{ color: "var(--text-secondary)" }}>
+                  {environment}
+                </span>
+                <span className="mono min-w-0 break-all text-right font-semibold" style={{ color: status === "ok" ? "var(--status-good)" : "var(--status-critical)" }} title={status}>
+                  {status === "ok" ? "● ok" : `○ ${status}`}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </Panel>
+
       <Panel title="Operator policy — config.yaml + services/*.yaml merged (redacted)">
         <pre className="mono max-h-[480px] overflow-auto rounded-md border p-3 text-[11px] leading-relaxed" style={{ borderColor: "var(--hairline)", background: "var(--surface-2)", color: "var(--text-secondary)" }}>
           {JSON.stringify(data.policy, null, 2)}

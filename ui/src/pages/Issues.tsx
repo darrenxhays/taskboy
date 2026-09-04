@@ -8,18 +8,17 @@ import { CardActions, CardHeader, CardMeta, ResponsiveTable, RowCard } from "../
 import { CheckIcon, ConfirmIconButton, EmptyState, ErrorNote, IconButton, Panel, RefreshIcon, RocketIcon, TablePager, TaskLink, TrashIcon, XIcon } from "../components/ui";
 import { useLiveData } from "../stream";
 
-const ACTIVE_STATUSES = ["proposed", "approved", "implementation_queued", "failed"];
-const ARCHIVE_STATUSES = ["done", "denied"];
-const NO_REFINE_STATUSES = ["in_progress", "done", "denied"];
+const ACTIVE_STATUSES = ["proposed", "approved", "implementation_queued"];
+const ARCHIVE_STATUSES = ["done", "denied", "failed"];
+const EDITABLE_STATUSES = ["proposed", "approved"];
 const NO_DELETE_STATUSES = ["in_progress", "in_review"]; // backend blocks these with 409 to avoid orphaning an active implementation
-const IMPLEMENTABLE_STATUSES = ["proposed", "approved"];
 const SUGGESTED_TYPES = ["feature_request", "bug", "security", "user_experience", "reliability", "performance", "token_efficiency", "organization"];
 const STATUS_COLOR: Record<string, string> = { proposed: "var(--status-warning)", approved: "var(--status-good)", implementation_queued: "var(--accent)", in_progress: "var(--accent)", in_review: "var(--accent)", done: "var(--status-good)", failed: "var(--status-critical)", denied: "var(--status-neutral)" };
 const fieldClass = "rounded-md border px-2.5 py-1.5 text-[13px] outline-none focus:border-cyan-500";
 const fieldStyle = { borderColor: "var(--hairline-strong)", background: "var(--surface-2)", color: "var(--text-primary)" };
 
 function canRefine(status: string): boolean {
-  return !NO_REFINE_STATUSES.includes(status);
+  return EDITABLE_STATUSES.includes(status);
 }
 
 function canDelete(status: string): boolean {
@@ -27,7 +26,7 @@ function canDelete(status: string): boolean {
 }
 
 function canImplement(status: string): boolean {
-  return IMPLEMENTABLE_STATUSES.includes(status);
+  return EDITABLE_STATUSES.includes(status);
 }
 
 // tolerate missing/malformed persisted state
@@ -214,15 +213,16 @@ export function Issues({ admin, email }: { admin: boolean; email: string | null 
   const bulk = async (action: "approve" | "deny" | "refine" | "delete" | "implement") => { const ids = eligible(action); if (!ids.length) return; try { await mutate(async () => { const result = await api.bulkIssues(ids, action); const successes = result.results.filter((row) => !["skipped", "not_found", "already_running"].includes(row.status)).length; setNote(`${action}: ${successes} succeeded, ${result.results.length - successes} skipped`); setSelected(new Set()); }); } catch { /* note is set by mutate */ } };
   const deletable = eligible("delete");
   const implementable = eligible("implement");
+  const refinable = eligible("refine");
   const run = async (skill: "discoverissues" | "implementapprovedissues") => { try { await mutate(async () => { const result = await api.runIssues(skill, skill === "discoverissues" ? discoveryRepo : undefined); if (result.status === "created") setNote(`${skill === "discoverissues" ? "discovery" : "implementation"} started (${result.task_id})`); else if (result.status === "no_approved_issues") setNote("no approved issues to implement"); else setNote(`${result.status}${result.task_id ? ` (${result.task_id})` : ""}`); }); } catch { /* note is set by mutate */ } };
 
   return <div className="mx-auto max-w-7xl space-y-4 overflow-x-hidden"><header className="flex flex-wrap items-center justify-between gap-3"><h1 className="text-[18px] font-bold tracking-wide">ISSUES</h1><div className="flex flex-wrap items-center gap-2"><RepoFilter repos={repos} selected={effectiveRepos} onChange={setSelectedRepos} />{admin && <><button onClick={() => setCreating(true)} disabled={busy || creating} className="rounded-md px-3 py-1.5 text-[12px] font-bold text-white disabled:opacity-40" style={{ background: "var(--accent)" }}>CREATE</button><div className="flex flex-wrap items-center gap-1"><select value={discoveryRepo} onChange={(event) => setDiscoveryRepo(event.target.value)} className="max-w-56 rounded-md border px-2 py-1.5 text-[12px]" style={fieldStyle}>{repos.map((repo) => <option key={repo}>{repo}</option>)}</select><button onClick={() => run("discoverissues")} disabled={busy || !discoveryRepo} className="rounded-md border px-3 py-1.5 text-[12px] font-bold disabled:opacity-40" style={{ borderColor: "var(--accent)", color: "var(--accent)" }}>RUN DISCOVERY</button></div><button onClick={() => run("implementapprovedissues")} disabled={busy || data?.implementation_active != null} className="rounded-md border px-3 py-1.5 text-[12px] font-bold disabled:opacity-40" style={{ borderColor: "var(--status-good)", color: "var(--status-good)" }}>{data?.implementation_active ? "IMPLEMENTING" : "IMPLEMENT APPROVED"}</button></>}</div></header>
     {data?.implementation_active && <div className="text-[11px]" style={{ color: "var(--text-muted)" }}>implementation run: <TaskLink taskId={data.implementation_active} /></div>}{note && <div className="text-[12px]" style={{ color: "var(--text-secondary)" }}>{note}</div>}{error && <ErrorNote message={error} />}
     {creating && admin && <CreateForm repos={repos} knownTypes={knownTypes} defaultRepo={discoveryRepo} onRepoChange={setDiscoveryRepo} onCreated={() => { setCreating(false); setNote("Issue created."); reload(); }} onCancel={() => setCreating(false)} />}
-    {admin && selected.size > 0 && <div className="sticky top-0 z-[5] flex flex-wrap items-center gap-2 rounded-md border p-3" style={{ borderColor: "var(--accent)", background: "var(--surface-1)" }}><span className="text-[12px] font-semibold">{selected.size} selected</span>{(["approve", "deny", "refine"] as const).map((action) => <IconButton key={action} onClick={() => bulk(action)} disabled={busy} title={action} borderColor={action === "approve" ? "var(--status-good)" : action === "deny" ? "var(--status-critical)" : "var(--accent)"} color={action === "approve" ? "var(--status-good)" : action === "deny" ? "var(--status-serious)" : "var(--accent)"}>{action === "approve" ? <CheckIcon /> : action === "deny" ? <XIcon /> : <RefreshIcon />}</IconButton>)}{implementable.length > 0 && <ConfirmIconButton onConfirm={() => bulk("implement")} disabled={implementDisabled} title="implement" label={`Implement ${implementable.length} issue${implementable.length === 1 ? "" : "s"} now?`} borderColor="var(--status-good)" color="var(--status-good)"><RocketIcon /></ConfirmIconButton>}{deletable.length > 0 && <ConfirmIconButton onConfirm={() => bulk("delete")} disabled={busy} title="delete" label={`Delete ${deletable.length} issue${deletable.length === 1 ? "" : "s"}?`} borderColor="var(--status-critical)" color="var(--status-serious)"><TrashIcon /></ConfirmIconButton>}<button onClick={() => setSelected(new Set())} className="text-[11px]" style={{ color: "var(--text-muted)" }}>clear</button></div>}
+    {admin && selected.size > 0 && <div className="sticky top-0 z-[5] flex flex-wrap items-center gap-2 rounded-md border p-3" style={{ borderColor: "var(--accent)", background: "var(--surface-1)" }}><span className="text-[12px] font-semibold">{selected.size} selected</span>{(["approve", "deny"] as const).map((action) => <IconButton key={action} onClick={() => bulk(action)} disabled={busy} title={action} borderColor={action === "approve" ? "var(--status-good)" : "var(--status-critical)"} color={action === "approve" ? "var(--status-good)" : "var(--status-serious)"}>{action === "approve" ? <CheckIcon /> : <XIcon />}</IconButton>)}{refinable.length > 0 && <IconButton onClick={() => bulk("refine")} disabled={busy} title="refine" borderColor="var(--accent)" color="var(--accent)"><RefreshIcon /></IconButton>}{implementable.length > 0 && <ConfirmIconButton onConfirm={() => bulk("implement")} disabled={implementDisabled} title="implement" label={`Implement ${implementable.length} issue${implementable.length === 1 ? "" : "s"} now?`} borderColor="var(--status-good)" color="var(--status-good)"><RocketIcon /></ConfirmIconButton>}{deletable.length > 0 && <ConfirmIconButton onConfirm={() => bulk("delete")} disabled={busy} title="delete" label={`Delete ${deletable.length} issue${deletable.length === 1 ? "" : "s"}?`} borderColor="var(--status-critical)" color="var(--status-serious)"><TrashIcon /></ConfirmIconButton>}<button onClick={() => setSelected(new Set())} className="text-[11px]" style={{ color: "var(--text-muted)" }}>clear</button></div>}
     <IssueTable title="In progress" rows={rows.filter((row) => row.status === "in_review" || row.status === "in_progress")} loaded={data != null} empty="nothing in progress" tableKey="in-review" showRank={false} {...{ admin, busy, selected, setSelected, decide, refine, remove, implement, implementDisabled, openIssueId, onToggle: toggleIssue }} />
     <IssueTable title="Active" rows={rows.filter((row) => ACTIVE_STATUSES.includes(row.status))} loaded={data != null} empty={effectiveRepos.length ? "no active issues" : "select at least one repo"} tableKey="active" showRank {...{ admin, busy, selected, setSelected, decide, refine, remove, implement, implementDisabled, openIssueId, onToggle: toggleIssue }} />
-    <IssueTable title="Done / Denied" rows={rows.filter((row) => ARCHIVE_STATUSES.includes(row.status))} loaded={data != null} empty="nothing finished or denied" tableKey="archive" showRank={false} {...{ admin, busy, selected, setSelected, decide, refine, remove, implement, implementDisabled, openIssueId, onToggle: toggleIssue }} />
+    <IssueTable title="Done / Denied / Failed" rows={rows.filter((row) => ARCHIVE_STATUSES.includes(row.status))} loaded={data != null} empty="nothing finished, denied, or failed" tableKey="archive" showRank={false} {...{ admin, busy, selected, setSelected, decide, refine, remove, implement, implementDisabled, openIssueId, onToggle: toggleIssue }} />
     <DetailPane open={openIssueId != null} issueId={openIssueId} admin={admin} email={email} busy={busy} decide={decide} refine={refine} remove={remove} implement={implement} implementDisabled={implementDisabled} reload={reload} setNote={setNote} onClose={closeIssue} />
   </div>;
 }
@@ -333,7 +333,7 @@ function ExpandedIssue({ issueId, admin, email, busy, decide, refine, remove, im
   const [priority, setPriority] = useState<number | null>(null);
   if (!detail) return detailError ? <ErrorNote message={detailError} /> : <div className="rounded-md border p-4 text-[12px]" style={{ borderColor: "var(--hairline)", color: "var(--text-muted)" }}>loading discussion…</div>;
   const issue = detail.issue;
-  const editable = admin && ["proposed", "approved"].includes(issue.status);
+  const editable = admin && EDITABLE_STATUSES.includes(issue.status);
   const startEditing = () => { setSummary(issue.summary); setDescription(issue.details); setEditing(true); };
   const saveDetails = async () => { try { await api.updateIssue(issueId, { summary: summary.trim(), details: description.trim() }); await reloadDetail(); setEditing(false); reloadList(); } catch (reason) { setNote((reason as Error).message); } };
   const displayPriority = priority ?? issue.priority;

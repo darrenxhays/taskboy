@@ -1,10 +1,63 @@
 import asyncio
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from taskboy.main import serve_slack
+from taskboy.main import serve_slack, startup_aws_check
+
+
+@pytest.mark.asyncio
+async def test_startup_aws_check_reports_denied_environments(monkeypatch):
+    statuses = {"production": "AccessDenied: not authorized", "staging": "ok"}
+    monkeypatch.setattr("taskboy.adapters.aws_read.check_environments", lambda role_arns: statuses)
+    system_error = AsyncMock()
+    notifier = SimpleNamespace(debug=SimpleNamespace(system_error=system_error))
+
+    result = await startup_aws_check({"production": "arn:production", "staging": "arn:staging"}, notifier)
+
+    assert result == statuses
+    system_error.assert_awaited_once()
+    component, message = system_error.await_args.args
+    assert component == "aws"
+    assert "production" in message
+    assert "AccessDenied" in message
+    assert "staging" not in message
+
+
+@pytest.mark.asyncio
+async def test_startup_aws_check_does_not_report_all_ok(monkeypatch):
+    monkeypatch.setattr("taskboy.adapters.aws_read.check_environments", lambda role_arns: {"production": "ok"})
+    system_error = AsyncMock()
+    notifier = SimpleNamespace(debug=SimpleNamespace(system_error=system_error))
+
+    assert await startup_aws_check({"production": "arn:production"}, notifier) == {"production": "ok"}
+    system_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_aws_check_without_debug_notifier(monkeypatch):
+    statuses = {"production": "AccessDenied: not authorized"}
+    monkeypatch.setattr("taskboy.adapters.aws_read.check_environments", lambda role_arns: statuses)
+
+    assert await startup_aws_check({"production": "arn:production"}, SimpleNamespace()) == statuses
+
+
+@pytest.mark.asyncio
+async def test_startup_aws_check_times_out_quickly(monkeypatch):
+    release_worker = Event()
+
+    def slow_check(role_arns):
+        release_worker.wait()
+        return {"production": "ok"}
+
+    monkeypatch.setattr("taskboy.adapters.aws_read.check_environments", slow_check)
+
+    try:
+        assert await startup_aws_check({"production": "arn:production"}, SimpleNamespace(), timeout_seconds=0.05) == {}
+    finally:
+        release_worker.set()
 
 
 class _HangingHandler:

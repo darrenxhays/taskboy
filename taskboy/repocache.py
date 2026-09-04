@@ -5,6 +5,7 @@ import base64
 import logging
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 
 from taskboy.redact import redactor
@@ -12,6 +13,15 @@ from taskboy.redact import redactor
 logger = logging.getLogger("taskboy.repocache")
 
 MIN_FREE_GB = 10
+
+
+@dataclass(frozen=True)
+class RefreshResult:
+    """outcome of a single mirror refresh attempt; existed is true iff a mirror predated this attempt."""
+
+    ok: bool
+    existed: bool
+    error: str | None = None
 
 
 def mirror_path(repos_root, repo) -> Path:
@@ -36,14 +46,15 @@ async def refresh_all(store, broker, repos_root, approved_repos) -> dict:
     result: dict = {"pruned": prune_removed(root, approved_repos)}
     for repo in approved_repos:
         try:
-            result[repo] = await refresh_one(broker, root, repo)
+            result[repo] = (await refresh_one(broker, root, repo)).ok
         except Exception:
             logger.exception("repo mirror refresh failed for %s", repo)
             result[repo] = False
     return result
 
 
-async def refresh_one(broker, repos_root, repo, timeout=300) -> bool:
+async def refresh_one(broker, repos_root, repo, timeout=300) -> RefreshResult:
+    """refresh (or first-create) a repo's mirror; `timeout` bounds a `fetch --prune`, a first-time `clone --mirror` always gets 300s."""
     path = mirror_path(repos_root, repo)
     path.parent.mkdir(parents=True, exist_ok=True)
     token, _ = await broker.read_token([repo])
@@ -64,16 +75,24 @@ async def refresh_one(broker, repos_root, repo, timeout=300) -> bool:
             if existed:
                 await _run_git(["-C", str(path), "fetch", "--prune"], env=env, timeout=timeout)
             else:
-                await _run_git(["clone", "--mirror", f"https://github.com/{repo}.git", str(path)], env=env, timeout=timeout)
-            return True
-        except Exception:
+                await _run_git(["clone", "--mirror", f"https://github.com/{repo}.git", str(path)], env=env, timeout=300)
+            return RefreshResult(ok=True, existed=existed)
+        except Exception as exc:
             logger.exception("repo mirror refresh failed for %s", repo)
             if not existed and path.exists():
                 shutil.rmtree(path)
-            return False
+            return RefreshResult(ok=False, existed=existed, error=str(exc))
     finally:
         redactor.unregister(basic)
         redactor.unregister(token)
+
+
+def mirror_last_fetch(repos_root, repo) -> float | None:
+    """mtime (epoch seconds) of a mirror's FETCH_HEAD (its last successful fetch), or None if unknown."""
+    try:
+        return (mirror_path(repos_root, repo) / "FETCH_HEAD").stat().st_mtime
+    except OSError:
+        return None
 
 
 def prune_removed(repos_root, approved_repos) -> int:
