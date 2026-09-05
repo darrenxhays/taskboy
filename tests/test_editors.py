@@ -79,7 +79,11 @@ def test_help_missing_path_is_not_a_target():
 # -- conventions doc is editable --------------------------------------------
 
 
-def test_conventions_is_editable_when_configured(tmp_path):
+def test_conventions_is_editable_when_configured(tmp_path, monkeypatch):
+    from taskboy import settings
+
+    # the file sits outside the config directory, so the repo path falls back to the basename
+    monkeypatch.setattr(settings, "CONFIG_PATH", str(tmp_path / "elsewhere" / "config.yaml"))
     conventions_file = tmp_path / "conventions.md"
     conventions_file.write_text("# house rules")
     config = make_config(conventions_path=str(conventions_file))
@@ -97,6 +101,24 @@ def test_conventions_missing_path_is_not_a_target():
     config = make_config()
     with pytest.raises(EditorError):
         target_for(config, "conventions", None)
+
+
+def test_nested_config_files_keep_their_subdirectory_in_repo_path(tmp_path, monkeypatch):
+    from taskboy import settings
+
+    # a deploy ships the shell repo's config/ tree verbatim, so an edit committed to config/<basename>
+    # would be clobbered by the untouched config/<subdir>/<basename> at the next release
+    monkeypatch.setattr(settings, "CONFIG_PATH", str(tmp_path / "config.yaml"))
+    conventions_file = tmp_path / "conventions" / "house.md"
+    conventions_file.parent.mkdir()
+    conventions_file.write_text("# house rules")
+    personality_file = tmp_path / "personas" / "agent.md"
+    personality_file.parent.mkdir()
+    personality_file.write_text("dry and direct")
+    config = make_config(conventions_path=str(conventions_file), personality_path=str(personality_file))
+
+    assert target_for(config, "conventions", None) == (conventions_file, "config/conventions/house.md", "Engineering conventions")
+    assert target_for(config, "personality", None) == (personality_file, "config/personas/agent.md", "Personality")
 
 
 # -- per-service config files are editable -----------------------------------

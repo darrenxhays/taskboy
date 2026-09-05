@@ -18,6 +18,8 @@ trap 'rm -rf "$workdir"' EXIT
 
 echo "== installing $pip_spec =="
 /opt/taskboy/.venv/bin/pip install -q --upgrade "$pip_spec"
+# ci runs this as root; the service user must own the venv so the off-peak cli_update pip upgrade keeps working
+chown -R taskboy:taskboy /opt/taskboy/.venv
 
 if [ -n "$config_url" ]; then
   echo "== syncing config from $config_url =="
