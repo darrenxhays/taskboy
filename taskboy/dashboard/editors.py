@@ -31,6 +31,16 @@ def content_hash(content: str) -> str:
     return hashlib.sha256(content.encode()).hexdigest()
 
 
+def _repo_path(live_path: str) -> str:
+    """config files are shipped from the shell repo's config/ tree; mirror their position under it, not just the basename."""
+    path = Path(live_path).resolve()
+    config_dir = Path(settings.CONFIG_PATH).resolve().parent
+    try:
+        return f"config/{path.relative_to(config_dir).as_posix()}"
+    except ValueError:  # configured outside the config directory (unusual): best effort, keep the old behaviour
+        return f"config/{path.name}"
+
+
 def target_for(config: Config, kind: str, name: str | None) -> tuple[Path, str, str]:
     """returns (live_path, repo_path, title). repo layout keeps config files under config/ and skills under skills/."""
     if kind == "config":
@@ -40,15 +50,15 @@ def target_for(config: Config, kind: str, name: str | None) -> tuple[Path, str, 
         if live.is_file():  # legacy configs keep service sections inline in config.yaml and get no per-service editor
             return live, f"config/services/{name}.yaml", f"{name} service"
     if kind == "personality" and config.personality_path:
-        return Path(config.personality_path), f"config/{Path(config.personality_path).name}", "Personality"
+        return Path(config.personality_path), _repo_path(config.personality_path), "Personality"
     if kind == "reviewer_personality" and config.reviewer.personality_path:
-        return Path(config.reviewer.personality_path), f"config/{Path(config.reviewer.personality_path).name}", "Reviewer personality"
+        return Path(config.reviewer.personality_path), _repo_path(config.reviewer.personality_path), "Reviewer personality"
     if kind == "help" and config.help_path:
-        return Path(config.help_path), f"config/{Path(config.help_path).name}", "Help"
+        return Path(config.help_path), _repo_path(config.help_path), "Help"
     if kind == "started" and config.slack.task_started_messages_path:
-        return Path(config.slack.task_started_messages_path), f"config/{Path(config.slack.task_started_messages_path).name}", "Task Started messages"
+        return Path(config.slack.task_started_messages_path), _repo_path(config.slack.task_started_messages_path), "Task Started messages"
     if kind == "conventions" and config.conventions_path:
-        return Path(config.conventions_path), f"config/{Path(config.conventions_path).name}", "Engineering conventions"
+        return Path(config.conventions_path), _repo_path(config.conventions_path), "Engineering conventions"
     if kind == "skill" and name and name in skills.available(settings.SKILLS_ROOT):
         return Path(settings.SKILLS_ROOT) / name / "SKILL.md", f"skills/{name}/SKILL.md", f"Skill /{name}"
     raise EditorError("editable target not found")
