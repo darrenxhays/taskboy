@@ -36,7 +36,9 @@ def create_app(store, config, notifier, secrets, orchestrator=None, ui_dist: str
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        if request.url.path.startswith("/api/"):
+        if request.url.path.startswith("/api/avatar/") and response.status_code == 200:
+            response.headers["Cache-Control"] = "private, max-age=86400"  # the url embeds the file's mtime, so a new picture is a new url
+        elif request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
         return response
 

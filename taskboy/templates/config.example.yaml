@@ -17,11 +17,13 @@ orchestrator:
 agent: # the main agent's identity
   name: Agent # display name used in slack, prompts, PR/Jira text, and the dashboard
   personality_file: "" # e.g. personality_agent.md, relative to this config file; empty = neutral voice; configured files must exist at startup
+  avatar_file: "" # e.g. avatar_agent.png, relative to this config file; empty = the packaged default picture shown in the dashboard. png/jpg/jpeg/webp/gif, at most 1 MiB; must exist at startup
 
 reviewer: # optional second GitHub-only persona that reviews the main agent's PRs (needs its own GitHub App)
   enabled: false
   name: Reviewer
   personality_file: "" # e.g. personality_reviewer.md; configured files must exist at startup
+  avatar_file: "" # e.g. avatar_reviewer.png; same rules as agent.avatar_file; empty = the packaged default reviewer picture
   review_agent_prs: true # auto-review PRs authored by the main agent
   commit_name: "" # git author on the reviewer's commits; empty = defaults to reviewer name
   # GitHub derives the commit avatar from this email; verify it on a GitHub account to give the reviewer a custom avatar (operator-side setup)

@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,8 +11,8 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from taskboy import settings
-from taskboy.config import DashboardConfig
+from taskboy import assets, settings
+from taskboy.config import DashboardConfig, ReviewerConfig
 from taskboy.dashboard import create_app
 from taskboy.models import FAILED, QUEUED, RECEIVED, REFUSED, RUNNING
 from taskboy.secrets import Secrets
@@ -128,8 +129,58 @@ async def test_empty_expected_alb_arn_fails_closed(dashboard):
 @pytest.mark.asyncio
 async def test_me_reports_admin_flag(dashboard):
     client, _, _ = dashboard
-    assert (await client.get("/api/me", headers=identity(VIEWER))).json() == {"email": VIEWER, "admin": False, "bot_name": "Agent", "reviewer_name": "Reviewer"}
-    assert (await client.get("/api/me", headers=identity(ADMIN))).json() == {"email": ADMIN, "admin": True, "bot_name": "Agent", "reviewer_name": "Reviewer"}
+    viewer_me = (await client.get("/api/me", headers=identity(VIEWER))).json()
+    admin_me = (await client.get("/api/me", headers=identity(ADMIN))).json()
+    assert {key: viewer_me[key] for key in ("email", "admin", "bot_name", "reviewer_name")} == {"email": VIEWER, "admin": False, "bot_name": "Agent", "reviewer_name": "Reviewer"}
+    assert {key: admin_me[key] for key in ("email", "admin", "bot_name", "reviewer_name")} == {"email": ADMIN, "admin": True, "bot_name": "Agent", "reviewer_name": "Reviewer"}
+    # the packaged defaults are always there, so both urls are present even with nothing configured
+    assert re.fullmatch(r"/api/avatar/agent\?v=\d+", viewer_me["agent_avatar_url"])
+    assert re.fullmatch(r"/api/avatar/reviewer\?v=\d+", viewer_me["reviewer_avatar_url"])
+
+
+FAKE_PNG = b"\x89PNG\r\n\x1a\n" + b"agent pixels"
+FAKE_WEBP = b"RIFF\x00\x00\x00\x00WEBP reviewer pixels"
+
+
+@pytest.mark.asyncio
+async def test_avatar_endpoint_serves_the_configured_pictures(dashboard, tmp_path):
+    client, config, _ = dashboard
+    agent_png = tmp_path / "faces" / "agent.png"
+    agent_png.parent.mkdir()
+    agent_png.write_bytes(FAKE_PNG)
+    reviewer_webp = tmp_path / "reviewer.webp"
+    reviewer_webp.write_bytes(FAKE_WEBP)
+    config.avatar_path = str(agent_png)
+    config.reviewer = ReviewerConfig(enabled=True, avatar_path=str(reviewer_webp), commit_email="reviewer@example.com")
+
+    me = (await client.get("/api/me", headers=identity(VIEWER))).json()
+    assert me["agent_avatar_url"] == f"/api/avatar/agent?v={agent_png.stat().st_mtime_ns}"
+    assert me["reviewer_avatar_url"] == f"/api/avatar/reviewer?v={reviewer_webp.stat().st_mtime_ns}"
+
+    agent = await client.get(me["agent_avatar_url"], headers=identity(VIEWER))
+    reviewer = await client.get(me["reviewer_avatar_url"], headers=identity(VIEWER))
+    assert agent.status_code == 200 and agent.headers["content-type"] == "image/png" and agent.content == FAKE_PNG
+    assert reviewer.status_code == 200 and reviewer.headers["content-type"] == "image/webp" and reviewer.content == FAKE_WEBP
+    # the one cacheable api response: the url changes with the file
+    assert agent.headers["cache-control"].startswith("private") and reviewer.headers["cache-control"].startswith("private")
+
+
+@pytest.mark.asyncio
+async def test_avatar_endpoint_serves_the_packaged_defaults_when_nothing_is_configured(dashboard):
+    client, _, _ = dashboard
+    agent = await client.get("/api/avatar/agent", headers=identity(VIEWER))
+    reviewer = await client.get("/api/avatar/reviewer", headers=identity(VIEWER))  # reviewer disabled in this fixture: historical reviewer tasks still render
+    assert agent.status_code == 200 and agent.headers["content-type"] == "image/png" and agent.content == assets.DEFAULT_AGENT_AVATAR.read_bytes()
+    assert reviewer.status_code == 200 and reviewer.headers["content-type"] == "image/png" and reviewer.content == assets.DEFAULT_REVIEWER_AVATAR.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_avatar_endpoint_is_viewer_gated_and_rejects_unknown_personas(dashboard):
+    client, _, _ = dashboard
+    assert (await client.get("/api/avatar/agent")).status_code == 401
+    response = await client.get("/api/avatar/other", headers=identity(VIEWER))
+    assert response.status_code == 404 and response.json() == {"detail": "unknown persona"}
+    assert response.headers["cache-control"] == "no-store"  # only a served picture is cacheable
 
 
 @pytest.mark.asyncio
