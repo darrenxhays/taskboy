@@ -14,6 +14,10 @@ TEMPLATES_ROOT = PACKAGE_ROOT / "templates"
 DEPLOY_ROOT = PACKAGE_ROOT / "deploy"
 UI_DIST = PACKAGE_ROOT / "ui_dist"
 GIT_CRED_HELPER = DEPLOY_ROOT / "git-cred-helper.py"
+# profile pictures the dashboard shows for each persona until an operator configures their own
+AVATARS_ROOT = TEMPLATES_ROOT / "avatars"
+DEFAULT_AGENT_AVATAR = AVATARS_ROOT / "agent.png"
+DEFAULT_REVIEWER_AVATAR = AVATARS_ROOT / "reviewer.png"
 
 EXTRACTABLE = {"templates": TEMPLATES_ROOT, "deploy": DEPLOY_ROOT}
 

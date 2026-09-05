@@ -2,7 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from taskboy.config import ConfigError, Role, load_config, role_for
+from taskboy import assets
+from taskboy.config import AVATAR_MAX_BYTES, ConfigError, Role, load_config, role_for
 
 VALID = """
 orchestrator:
@@ -30,6 +31,7 @@ def test_example_config_is_valid():
     example = Path(__file__).parents[1] / "taskboy" / "templates" / "config.example.yaml"
     config = load_config(str(example))
     assert config.max_concurrency >= 1
+    assert (config.avatar_path, config.reviewer.avatar_path) == (str(assets.DEFAULT_AGENT_AVATAR), str(assets.DEFAULT_REVIEWER_AVATAR))  # avatar_file ships empty
     assert "models" in config.raw
     assert "routing" in config.raw
     for profile in config.raw["profiles"].values():
@@ -545,4 +547,56 @@ def test_non_boolean_enabled_fails(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text(VALID + "\nsentry: {enabled: definitely}\n")
     with pytest.raises(ConfigError, match="sentry.enabled must be a boolean"):
+        load_config(str(path))
+
+
+# -- dashboard profile pictures ----------------------------------------------
+
+FAKE_PNG = b"\x89PNG\r\n\x1a\n" + b"not really pixels"
+
+
+def test_avatar_files_resolve_relative_to_config(tmp_path):
+    (tmp_path / "faces").mkdir()
+    agent_png = tmp_path / "faces" / "agent.PNG"
+    agent_png.write_bytes(FAKE_PNG)
+    reviewer_webp = tmp_path / "reviewer.webp"
+    reviewer_webp.write_bytes(b"RIFF\x00\x00\x00\x00WEBP")
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID + "\nagent: {avatar_file: faces/agent.PNG}\nreviewer: {avatar_file: reviewer.webp}\n")
+    config = load_config(str(path))
+    assert config.avatar_path == str(agent_png.resolve())  # the suffix check is case-insensitive
+    assert config.reviewer.avatar_path == str(reviewer_webp.resolve())  # validated even while the reviewer is disabled
+
+
+@pytest.mark.parametrize("section", ["", '\nagent: {avatar_file: ""}\nreviewer: {avatar_file: ""}\n'])
+def test_avatar_absent_or_empty_uses_the_packaged_default(tmp_path, section):
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID + section)
+    config = load_config(str(path))
+    assert config.avatar_path == str(assets.DEFAULT_AGENT_AVATAR)
+    assert config.reviewer.avatar_path == str(assets.DEFAULT_REVIEWER_AVATAR)
+
+
+@pytest.mark.parametrize(
+    "section,match",
+    [
+        ("agent: {avatar_file: 12}", "agent.avatar_file must be a string"),
+        ("agent: {avatar_file: missing.png}", "agent.avatar_file not found"),
+        ("agent: {avatar_file: face.svg}", "agent.avatar_file must be a png, jpg, jpeg, webp, or gif image, got '.svg'"),
+        ("agent: {avatar_file: face.txt}", "agent.avatar_file must be a png, jpg, jpeg, webp, or gif image, got '.txt'"),
+        ("agent: {avatar_file: big.png}", "agent.avatar_file is larger than 1 MiB"),
+        ("reviewer: {avatar_file: 12}", "reviewer.avatar_file must be a string"),
+        ("reviewer: {avatar_file: missing.png}", "reviewer.avatar_file not found"),
+        ("reviewer: {avatar_file: face.svg}", "reviewer.avatar_file must be a png, jpg, jpeg, webp, or gif image, got '.svg'"),
+        ("reviewer: {avatar_file: face.txt}", "reviewer.avatar_file must be a png, jpg, jpeg, webp, or gif image, got '.txt'"),
+        ("reviewer: {avatar_file: big.png}", "reviewer.avatar_file is larger than 1 MiB"),
+    ],
+)
+def test_invalid_avatar_config_fails_clearly(tmp_path, section, match):
+    (tmp_path / "face.svg").write_text("<svg/>")
+    (tmp_path / "face.txt").write_text("not an image")
+    (tmp_path / "big.png").write_bytes(FAKE_PNG + b"\x00" * (AVATAR_MAX_BYTES + 1 - len(FAKE_PNG)))
+    path = tmp_path / "config.yaml"
+    path.write_text(VALID + "\n" + section + "\n")
+    with pytest.raises(ConfigError, match=match):
         load_config(str(path))

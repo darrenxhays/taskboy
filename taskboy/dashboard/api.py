@@ -10,11 +10,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 
 from taskboy import memory, settings, skills
 from taskboy.adapters import aws_read
-from taskboy.config import KNOWN_SERVICES, ConfigError
+from taskboy.config import AVATAR_SUFFIXES, KNOWN_SERVICES, ConfigError
 from taskboy.dashboard import gitops
 from taskboy.dashboard.auth import Viewer, require_admin, require_viewer, require_viewer_write
 from taskboy.dashboard.editors import EDITABLE_KINDS, atomic_write, contains_secret_submission, content_hash, target_for, unified_diff, validate
@@ -36,6 +36,8 @@ RANKED_STATUSES = ("proposed", "approved", "in_progress")
 # issues in these statuses can still be refined/edited; anything else is locked (running, terminal, etc.)
 EDITABLE_STATUSES = ("proposed", "approved")
 MAX_ISSUE_UPLOAD_BYTES = 5 * 1024 * 1024
+# the two personas with a dashboard profile picture; the file behind each comes from config or the package, never from the request
+AVATAR_PERSONAS = ("agent", "reviewer")
 
 
 def _put_object(bucket: str, key: str, body: bytes, content_type: str | None) -> None:
@@ -64,6 +66,15 @@ def _now() -> datetime:
 
 def _iso(moment: datetime) -> str:
     return moment.isoformat(timespec="seconds")
+
+
+def _avatar_url(persona: str, path: str) -> str:
+    # the file's mtime is the cache-buster: a swapped picture gets a new url at the next restart
+    try:
+        version = Path(path).stat().st_mtime_ns
+    except OSError:
+        version = 0
+    return f"/api/avatar/{persona}?v={version}"
 
 
 def _slim(store, task: Task, names: dict[str, str | None]) -> dict:
@@ -95,7 +106,24 @@ def _slim(store, task: Task, names: dict[str, str | None]) -> dict:
 @router.get("/api/me")
 async def me(request: Request, viewer: Viewer = Depends(require_viewer)) -> dict:
     config = request.app.state.config
-    return {"email": viewer.email, "admin": viewer.admin, "bot_name": config.agent_name, "reviewer_name": config.reviewer.name}
+    return {
+        "email": viewer.email,
+        "admin": viewer.admin,
+        "bot_name": config.agent_name,
+        "reviewer_name": config.reviewer.name,
+        "agent_avatar_url": _avatar_url("agent", config.avatar_path),
+        "reviewer_avatar_url": _avatar_url("reviewer", config.reviewer.avatar_path),
+    }
+
+
+@router.get("/api/avatar/{persona}")
+async def avatar(request: Request, persona: str, viewer: Viewer = Depends(require_viewer)) -> FileResponse:
+    if persona not in AVATAR_PERSONAS:
+        raise HTTPException(status_code=404, detail="unknown persona")
+    config = request.app.state.config
+    # a known persona always has a file (configured or packaged), even when the reviewer is disabled: historical reviewer tasks still render
+    path = Path(config.avatar_path if persona == "agent" else config.reviewer.avatar_path)
+    return FileResponse(path, media_type=AVATAR_SUFFIXES[path.suffix.lower()])
 
 
 @router.get("/api/overview")

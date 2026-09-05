@@ -1,6 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { STATE_COLORS, modelColor, modelLabel } from "../api";
+import { useBranding } from "../branding";
 
 export function CheckIcon() {
   return <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M3 8.5L6.5 12L13 4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>;
@@ -85,9 +86,16 @@ export function StatusBadge({ state, pulse = false }: { state: string; pulse?: b
 }
 
 export function AgentAvatar({ persona, botName = "Agent", reviewerName = "Reviewer" }: { persona: string | null | undefined; botName?: string; reviewerName?: string }) {
-  // initials avatar: accent circle for the main agent, neutral for the reviewer persona
+  const { agentAvatarUrl, reviewerAvatarUrl } = useBranding();
+  const [broken, setBroken] = useState(false);
   const reviewer = persona === "reviewer";
   const name = reviewer ? reviewerName : botName;
+  const url = reviewer ? reviewerAvatarUrl : agentAvatarUrl;
+  // the persona's picture (configured or packaged) once /api/me has resolved; a broken image must never show
+  if (url && !broken) {
+    return <img src={url} alt={name} title={name} className="h-5 w-5 shrink-0 rounded-full border object-cover" style={{ borderColor: "var(--hairline)", background: "#fff" }} onError={() => setBroken(true)} />;
+  }
+  // initials fallback: accent circle for the main agent, neutral for the reviewer persona
   return (
     <span
       title={name}

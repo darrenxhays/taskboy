@@ -277,8 +277,8 @@ def test_content_step_fills_help_placeholders_in_the_seeded_file(tmp_path, monke
     monkeypatch.setattr(setup_wizard, "CONFIG_PATH", tmp_path / "config" / "config.yaml")
     setup_wizard.seed_content_files()
     data = {"agent": {"name": "Scout"}, "dashboard": {"public_url": "https://dash.example.com"}, "reviewer": {}}
-    # conventions: no, personality: no, help: yes
-    monkeypatch.setattr(setup_wizard, "ask_yes", MagicMock(side_effect=[False, False, True]))
+    # conventions: no, personality: no, avatar: no, help: yes
+    monkeypatch.setattr(setup_wizard, "ask_yes", MagicMock(side_effect=[False, False, False, True]))
     monkeypatch.setattr(setup_wizard, "ask", MagicMock(return_value="help.md"))
 
     setup_wizard.step_content(data, {})
@@ -287,3 +287,17 @@ def test_content_step_fills_help_placeholders_in_the_seeded_file(tmp_path, monke
     assert "{{agent_name}}" not in content and "{{dashboard_url}}" not in content
     assert "@Scout" in content and "https://dash.example.com" in content
     assert data["help"]["file"] == "help.md"
+
+
+def test_content_step_records_avatar_files_for_both_personas(tmp_path, monkeypatch):
+    monkeypatch.setattr(setup_wizard, "CONFIG_PATH", tmp_path / "config" / "config.yaml")
+    data = {"agent": {"name": "Scout"}, "reviewer": {"enabled": True}}
+    # conventions: no, agent personality: no, agent avatar: yes, reviewer personality: no, reviewer avatar: yes, help: no
+    monkeypatch.setattr(setup_wizard, "ask_yes", MagicMock(side_effect=[False, False, True, False, True, False]))
+    monkeypatch.setattr(setup_wizard, "ask", MagicMock(side_effect=["faces/agent.png", "faces/reviewer.png"]))
+
+    setup_wizard.step_content(data, {})
+
+    assert data["agent"]["avatar_file"] == "faces/agent.png"
+    assert data["reviewer"]["avatar_file"] == "faces/reviewer.png"
+    assert not (tmp_path / "config").exists()  # the wizard never copies an image; the operator drops it in

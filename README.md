@@ -59,6 +59,7 @@ This repository is the **application** — a versioned package published to PyPI
 
 - `config/config.yaml` is your operator policy. The application itself is a versioned pip package; your instance directory holds only config, personalities, skills, and secrets — commit those to a private repo if you want them version-controlled (the dashboard's auto-commit feature expects that). Most changes apply on restart.
 - Personalities, task-started message pools, conventions, and skills are separate operator-editable files, re-read per task and editable live from the dashboard.
+- Profile pictures for the agent and reviewer in the dashboard — sensible defaults ship in the package; override with `agent.avatar_file` / `reviewer.avatar_file` (png/jpg/jpeg/webp/gif, at most 1 MiB, relative to `config.yaml`).
 - All free-text persistence and Slack delivery pass through redaction. The GitHub credential broker mints repository-scoped installation tokens per task; sessions never see private keys.
 - AWS diagnostics are read-only at both the adapter and IAM layers.
 - Releases are green `vX.Y.Z` tags; restarts reconcile in-flight tasks.

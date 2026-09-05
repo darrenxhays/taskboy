@@ -531,12 +531,17 @@ def step_content(data, env) -> None:
         if not target.exists():
             shutil.copyfile(TEMPLATES_ROOT / "personality_agent.example.md", target)
         agent["personality_file"] = ask("Personality file", str(agent.get("personality_file") or "personality_agent.md"))
+    if ask_yes("Use your own profile picture for the agent in the dashboard? (no = the packaged default)", default=bool(agent.get("avatar_file"))):
+        agent["avatar_file"] = ask("Avatar file (png/jpg/webp/gif, relative to config.yaml)", str(agent.get("avatar_file") or "avatar_agent.png"))
+        say("  drop the image next to config.yaml yourself (it must exist at startup); `taskboy assets templates <dir>` extracts the packaged defaults as a starting point.")
     reviewer = data.setdefault("reviewer", {})
     if reviewer.get("enabled") and ask_yes("Give the reviewer a personality file?", default=bool(reviewer.get("personality_file"))):
         target = CONFIG_PATH.parent / "personality_reviewer.md"
         if not target.exists():
             shutil.copyfile(TEMPLATES_ROOT / "personality_reviewer.example.md", target)
         reviewer["personality_file"] = ask("Reviewer personality file", str(reviewer.get("personality_file") or "personality_reviewer.md"))
+    if reviewer.get("enabled") and ask_yes("Use your own profile picture for the reviewer in the dashboard? (no = the packaged default)", default=bool(reviewer.get("avatar_file"))):
+        reviewer["avatar_file"] = ask("Reviewer avatar file (png/jpg/webp/gif, relative to config.yaml)", str(reviewer.get("avatar_file") or "avatar_reviewer.png"))
     help_section = data.setdefault("help", {})
     if ask_yes("Set up a curated /help reply? (answered instantly in Slack, no task created)", default=bool(help_section.get("file"))):
         target = CONFIG_PATH.parent / "help.md"
